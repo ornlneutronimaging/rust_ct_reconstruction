@@ -13,7 +13,7 @@ use crate::tof::{self, Detector, FolderScan, ImageFolder, PreprocessResult, Prep
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -84,6 +84,10 @@ struct TofView {
     pc_bounds: (f64, f64),
     /// Which slider handle the current drag moves (`true` = upper).
     pc_drag_upper: Option<bool>,
+    /// Runs manually removed from the next step (by run name), on top of the
+    /// proton-charge band filter.
+    removed_sample: HashSet<String>,
+    removed_ob: HashSet<String>,
 }
 
 impl TofView {
@@ -118,6 +122,8 @@ impl TofView {
             pc_range: None,
             pc_bounds: (0.0, 1.0),
             pc_drag_upper: None,
+            removed_sample: HashSet::new(),
+            removed_ob: HashSet::new(),
         }
     }
 }
@@ -949,6 +955,8 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             logger::log(format!("Detector: {}", view.detector.label()));
             logger::log("preprocessing: rejecting empty runs, reading proton charges from NeXus…");
             view.preprocessed = None;
+            view.removed_sample.clear();
+            view.removed_ob.clear();
             view.preprocess = Some(PreprocessScan::start(
                 sample_folders.iter().map(ImageFolder::summary).collect(),
                 view.ob
@@ -1025,8 +1033,105 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
     if view.preprocessed.is_some() {
         ui.separator();
         ui.add_space(6.0);
-        preprocess_summary_ui(ui, view.preprocessed.as_ref().unwrap());
-        proton_charge_section(ui, view);
+        egui::CollapsingHeader::new(RichText::new("Proton charge selection").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                preprocess_summary_ui(ui, view.preprocessed.as_ref().unwrap());
+                proton_charge_section(ui, view);
+            });
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(RichText::new("Runs going to the next step").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                runs_selection_ui(ui, view);
+            });
+    }
+}
+
+/// The sample and OB runs surviving the proton-charge band, each removable
+/// (and restorable) from the next step with its checkbox.
+fn runs_selection_ui(ui: &mut egui::Ui, view: &mut TofView) {
+    let Some(result) = &view.preprocessed else {
+        return;
+    };
+    let Some(range) = view.pc_range else {
+        ui.label(RichText::new("no proton charge selection").weak());
+        return;
+    };
+    let removed_sample = &mut view.removed_sample;
+    let removed_ob = &mut view.removed_ob;
+    ui.columns(2, |cols| {
+        run_list_column(&mut cols[0], "sample", &result.sample, range, removed_sample);
+        run_list_column(&mut cols[1], "ob", &result.ob, range, removed_ob);
+    });
+}
+
+fn run_list_column(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    runs: &[RunInfo],
+    range: (f64, f64),
+    removed: &mut HashSet<String>,
+) {
+    let surviving: Vec<&RunInfo> = runs.iter().filter(|r| pc_in_range(r, range)).collect();
+    let kept = surviving
+        .iter()
+        .filter(|r| !removed.contains(&r.name))
+        .count();
+    let heading = format!("{label} — {kept} run(s)");
+    if kept == 0 {
+        ui.colored_label(Color32::from_rgb(240, 180, 60), heading);
+    } else {
+        ui.label(RichText::new(heading).strong());
+    }
+    egui::ScrollArea::vertical()
+        .id_salt((label, "next_step_runs"))
+        .max_height(220.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for run in &surviving {
+                ui.horizontal(|ui| {
+                    let mut keep = !removed.contains(&run.name);
+                    if ui
+                        .checkbox(&mut keep, "")
+                        .on_hover_text("uncheck to remove this run from the next step")
+                        .changed()
+                    {
+                        if keep {
+                            logger::log(format!("restored {label} run: {}", run.name));
+                            removed.remove(&run.name);
+                        } else {
+                            logger::log(format!("manually removed {label} run: {}", run.name));
+                            removed.insert(run.name.clone());
+                        }
+                    }
+                    let pc = run
+                        .proton_charge_c
+                        .map(|pc| format!("{pc:.3} C"))
+                        .unwrap_or_else(|| "?".to_owned());
+                    let text = format!("{} — {pc} — {} images", run.name, run.n_images);
+                    let text = RichText::new(text).size(12.0);
+                    if keep {
+                        ui.label(text);
+                    } else {
+                        ui.label(text.weak().strikethrough());
+                    }
+                });
+            }
+        });
+    let removed_here = surviving
+        .iter()
+        .filter(|r| removed.contains(&r.name))
+        .count();
+    if removed_here > 0
+        && ui
+            .button(format!("↩ Restore the {removed_here} removed {label} run(s)"))
+            .clicked()
+    {
+        logger::log(format!("restored all {removed_here} removed {label} runs"));
+        for run in &surviving {
+            removed.remove(&run.name);
+        }
     }
 }
 
