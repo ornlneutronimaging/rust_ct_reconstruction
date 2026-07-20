@@ -9,7 +9,7 @@ use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 pub use crate::session::{Mode, Session};
-use crate::tof::{self, Detector, FolderScan, ImageFolder};
+use crate::tof::{self, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan, RunInfo};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -69,6 +69,21 @@ struct TofView {
     detector: Detector,
     sample: FolderPick,
     ob: FolderPick,
+    /// The (sample, OB) pair whose selection summary was already written to
+    /// the log, so the summary is logged (and preprocessing started) once per
+    /// completed pair.
+    summary_logged: Option<(PathBuf, PathBuf)>,
+    /// Preprocessing pass in flight (empty-run rejection + proton charges).
+    preprocess: Option<PreprocessScan>,
+    preprocessed: Option<PreprocessResult>,
+    /// Proton-charge selection band [min, max] in C — runs outside it are
+    /// excluded from the next step. Defaults to median ±10% once
+    /// preprocessing finishes.
+    pc_range: Option<(f64, f64)>,
+    /// Fixed value scale of the range slider, derived from the data.
+    pc_bounds: (f64, f64),
+    /// Which slider handle the current drag moves (`true` = upper).
+    pc_drag_upper: Option<bool>,
 }
 
 impl TofView {
@@ -97,6 +112,12 @@ impl TofView {
             detector,
             sample,
             ob,
+            summary_logged: None,
+            preprocess: None,
+            preprocessed: None,
+            pc_range: None,
+            pc_bounds: (0.0, 1.0),
+            pc_drag_upper: None,
         }
     }
 }
@@ -273,6 +294,10 @@ pub struct CtApp {
     filter: String,
     manual: String,
     manual_error: Option<String>,
+    /// Scroll the IPTS list to the selected entry on the next frame it is
+    /// shown — set when the selection comes from outside the list (manual
+    /// entry, debug config), which may leave it outside the visible window.
+    scroll_to_selected: bool,
 
     // Admin section (bottom of the setup screen).
     admin_unlocked: bool,
@@ -313,6 +338,7 @@ impl CtApp {
             filter: String::new(),
             manual: String::new(),
             manual_error: None,
+            scroll_to_selected: false,
             admin_unlocked: false,
             admin_password: String::new(),
             admin_error: None,
@@ -481,6 +507,7 @@ impl CtApp {
 
         let mut clicked: Option<IptsEntry> = None;
         let mut manual_requested = false;
+        let mut scrolled = false;
         let scan = self.scans.get(&self.instrument);
 
         ui.group(|ui| {
@@ -528,7 +555,12 @@ impl CtApp {
                                 for entry in shown {
                                     let is_selected =
                                         self.selected.as_ref().is_some_and(|s| s.name == entry.name);
-                                    if ui.selectable_label(is_selected, &entry.name).clicked() {
+                                    let response = ui.selectable_label(is_selected, &entry.name);
+                                    if is_selected && self.scroll_to_selected {
+                                        response.scroll_to_me(Some(Align::Center));
+                                        scrolled = true;
+                                    }
+                                    if response.clicked() {
                                         clicked = Some(entry.clone());
                                     }
                                 }
@@ -553,6 +585,9 @@ impl CtApp {
             });
         });
 
+        if scrolled {
+            self.scroll_to_selected = false;
+        }
         if let Some(entry) = clicked {
             logger::log(format!("IPTS selected: {} ({})", entry.name, entry.path.display()));
             self.selected = Some(entry);
@@ -568,6 +603,7 @@ impl CtApp {
                     ));
                     self.selected = Some(entry);
                     self.manual_error = None;
+                    self.scroll_to_selected = true;
                 }
                 Err(e) => {
                     logger::error(format!("manual IPTS entry rejected: {e}"));
@@ -655,6 +691,7 @@ impl CtApp {
                     Ok(entry) => {
                         self.selected = Some(entry);
                         self.debug_error = None;
+                        self.scroll_to_selected = true;
                     }
                     Err(e) => {
                         logger::error(format!("debug config IPTS rejected: {e}"));
@@ -892,6 +929,62 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
     view.sample.poll(&ctx);
     view.ob.poll(&ctx);
 
+    // Both selections made and inventoried: log the selection summary, once
+    // per (sample, OB) pair.
+    if let (Some(sample_folders), Some(sample_path), Some(ob_path)) = (
+        view.sample.folders.as_ref(),
+        view.sample.selected.as_ref(),
+        view.ob.selected.as_ref(),
+    ) && view.ob.folders.is_some()
+    {
+        let pair = (sample_path.clone(), ob_path.clone());
+        if view.summary_logged.as_ref() != Some(&pair) {
+            logger::log(format!("Number of projections: {}", sample_folders.len()));
+            logger::log(format!("Sample folder: {}", pair.0.display()));
+            logger::log(format!("OB folder: {}", pair.1.display()));
+            logger::log(format!(
+                "Nexus folder: {}",
+                session.ipts.path.join("nexus").display()
+            ));
+            logger::log(format!("Detector: {}", view.detector.label()));
+            logger::log("preprocessing: rejecting empty runs, reading proton charges from NeXus…");
+            view.preprocessed = None;
+            view.preprocess = Some(PreprocessScan::start(
+                sample_folders.iter().map(ImageFolder::summary).collect(),
+                view.ob
+                    .folders
+                    .as_ref()
+                    .map(|f| f.iter().map(ImageFolder::summary).collect())
+                    .unwrap_or_default(),
+                session.ipts.path.join("nexus"),
+                session.instrument.name().to_owned(),
+            ));
+            view.summary_logged = Some(pair);
+        }
+    }
+
+    // Fold a finished preprocessing pass into the view, logging its findings
+    // and defaulting the proton-charge selection to median ±10%.
+    if let Some(scan) = &mut view.preprocess {
+        if let Some(result) = scan.poll() {
+            log_preprocess_result(&result);
+            if let Some((range, bounds)) = default_pc_selection(&result) {
+                logger::log(format!(
+                    "proton charge selection default (sample median ±10%): {:.3} – {:.3} C",
+                    range.0, range.1
+                ));
+                view.pc_range = Some(range);
+                view.pc_bounds = bounds;
+            } else {
+                view.pc_range = None;
+            }
+            view.preprocessed = Some(result);
+            view.preprocess = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
     // Detector — it decides where the sample and OB folders are looked for,
     // so changing it rebuilds both pickers.
     ui.horizontal(|ui| {
@@ -917,6 +1010,280 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
         view.sample.ui(&mut cols[0]);
         view.ob.ui(&mut cols[1]);
     });
+
+    ui.add_space(10.0);
+    if let Some(scan) = &view.preprocess {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(format!(
+                "preprocessing: reading NeXus proton charges… {}/{}",
+                scan.done, scan.total
+            ));
+        });
+    }
+    if view.preprocessed.is_some() {
+        ui.separator();
+        ui.add_space(6.0);
+        preprocess_summary_ui(ui, view.preprocessed.as_ref().unwrap());
+        proton_charge_section(ui, view);
+    }
+}
+
+/// Selection band defaulted to the median of the SAMPLE proton charges ±10%,
+/// and the slider scale enclosing both the band and every measured value
+/// (sample and OB, with a small margin).
+fn default_pc_selection(result: &PreprocessResult) -> Option<((f64, f64), (f64, f64))> {
+    let mut sample_pcs: Vec<f64> = result
+        .sample
+        .iter()
+        .filter(|r| !r.rejected_empty)
+        .filter_map(|r| r.proton_charge_c)
+        .collect();
+    if sample_pcs.is_empty() {
+        return None;
+    }
+    sample_pcs.sort_by(f64::total_cmp);
+    let median = if sample_pcs.len() % 2 == 0 {
+        (sample_pcs[sample_pcs.len() / 2 - 1] + sample_pcs[sample_pcs.len() / 2]) / 2.0
+    } else {
+        sample_pcs[sample_pcs.len() / 2]
+    };
+    let range = (median * 0.9, median * 1.1);
+    let all_pcs = result
+        .sample
+        .iter()
+        .chain(&result.ob)
+        .filter(|r| !r.rejected_empty)
+        .filter_map(|r| r.proton_charge_c);
+    let (mut low, mut high) = range;
+    for pc in all_pcs {
+        low = low.min(pc);
+        high = high.max(pc);
+    }
+    let pad = ((high - low) * 0.05).max(high.abs() * 1e-3).max(1e-9);
+    Some(((range.0, range.1), (low - pad, high + pad)))
+}
+
+fn pc_in_range(run: &RunInfo, range: (f64, f64)) -> bool {
+    !run.rejected_empty
+        && run
+            .proton_charge_c
+            .is_some_and(|pc| pc >= range.0 && pc <= range.1)
+}
+
+/// One line per data type: how many runs survive, plus rejections and runs
+/// whose proton charge could not be read.
+fn preprocess_summary_ui(ui: &mut egui::Ui, result: &PreprocessResult) {
+    for (label, runs) in [("sample", &result.sample), ("ob", &result.ob)] {
+        let empty = runs.iter().filter(|r| r.rejected_empty).count();
+        let kept = runs.len() - empty;
+        let missing_pc = runs
+            .iter()
+            .filter(|r| !r.rejected_empty && r.proton_charge_c.is_none())
+            .count();
+        let mut line = format!("{label}: {kept} runs");
+        if empty > 0 {
+            line.push_str(&format!(" — {empty} empty folder(s) rejected"));
+        }
+        if missing_pc > 0 {
+            line.push_str(&format!(" — {missing_pc} without proton charge"));
+        }
+        if empty > 0 || missing_pc > 0 {
+            ui.colored_label(Color32::from_rgb(240, 180, 60), line);
+        } else {
+            ui.label(line);
+        }
+    }
+}
+
+/// Sample and OB proton charges (C) against run number on one plot, with the
+/// vertical range slider that selects which runs continue to the next step.
+fn proton_charge_section(ui: &mut egui::Ui, view: &mut TofView) {
+    const PLOT_HEIGHT: f32 = 240.0;
+    let Some(result) = &view.preprocessed else {
+        return;
+    };
+    let Some(range) = &mut view.pc_range else {
+        ui.label(RichText::new("no proton charge values to plot").weak());
+        return;
+    };
+
+    fn points(runs: &[RunInfo], keep: impl Fn(&RunInfo) -> bool) -> Vec<[f64; 2]> {
+        runs.iter()
+            .filter(|r| !r.rejected_empty && keep(r))
+            .filter_map(|r| Some([r.run_number? as f64, r.proton_charge_c?]))
+            .collect()
+    }
+    let selection = *range;
+    let sample_in = points(&result.sample, |r| pc_in_range(r, selection));
+    let sample_out = points(&result.sample, |r| !pc_in_range(r, selection));
+    let ob_in = points(&result.ob, |r| pc_in_range(r, selection));
+    let ob_out = points(&result.ob, |r| !pc_in_range(r, selection));
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Proton charge per run (C)").strong());
+    let mut released = false;
+    ui.horizontal(|ui| {
+        released = vertical_range_slider(
+            ui,
+            range,
+            view.pc_bounds,
+            PLOT_HEIGHT,
+            &mut view.pc_drag_upper,
+        );
+        let band = Color32::from_rgb(120, 200, 120);
+        egui_plot::Plot::new("proton_charge_plot")
+            .height(PLOT_HEIGHT)
+            .x_axis_label("run number")
+            .y_axis_label("proton charge (C)")
+            .legend(egui_plot::Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.hline(egui_plot::HLine::new("selection", selection.0).color(band).width(1.0));
+                plot_ui.hline(egui_plot::HLine::new("selection", selection.1).color(band).width(1.0));
+                plot_ui.points(
+                    egui_plot::Points::new("sample", sample_in)
+                        .radius(3.5)
+                        .color(Color32::from_rgb(100, 170, 255)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("ob", ob_in)
+                        .radius(3.5)
+                        .color(Color32::from_rgb(255, 160, 70)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("excluded", sample_out)
+                        .radius(3.0)
+                        .color(Color32::from_gray(110)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("excluded", ob_out)
+                        .radius(3.0)
+                        .color(Color32::from_gray(110)),
+                );
+            });
+    });
+
+    let selection = *view.pc_range.as_ref().unwrap();
+    let kept = |runs: &[RunInfo]| runs.iter().filter(|r| pc_in_range(r, selection)).count();
+    let (s_kept, s_all) = (kept(&result.sample), result.sample.len());
+    let (o_kept, o_all) = (kept(&result.ob), result.ob.len());
+    let line = format!(
+        "selection: {:.3} – {:.3} C — keeping {s_kept}/{s_all} sample and {o_kept}/{o_all} ob runs",
+        selection.0, selection.1
+    );
+    if released {
+        logger::log(format!("proton charge selection changed: {line}"));
+    }
+    if s_kept == 0 || o_kept == 0 {
+        ui.colored_label(
+            Color32::from_rgb(240, 180, 60),
+            format!("{line} — the next step needs at least one of each!"),
+        );
+    } else {
+        ui.label(line);
+    }
+}
+
+/// A custom-painted vertical two-handle range slider; returns `true` when a
+/// drag ends (so changes can be logged once). `active` remembers which handle
+/// the drag moves across frames.
+fn vertical_range_slider(
+    ui: &mut egui::Ui,
+    selection: &mut (f64, f64),
+    bounds: (f64, f64),
+    height: f32,
+    active: &mut Option<bool>,
+) -> bool {
+    use egui::{Pos2, Sense, Stroke, vec2};
+    const WIDTH: f32 = 34.0;
+    const HANDLE_R: f32 = 7.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(WIDTH, height), Sense::click_and_drag());
+    let span = (bounds.1 - bounds.0).max(f64::EPSILON);
+    let inner_top = rect.top() + HANDLE_R;
+    let inner_height = (rect.height() - 2.0 * HANDLE_R).max(1.0);
+    let to_y = |v: f64| inner_top + (((bounds.1 - v) / span) as f32) * inner_height;
+    let to_v = |y: f32| bounds.1 - f64::from((y - inner_top) / inner_height).clamp(0.0, 1.0) * span;
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        if response.drag_started() || (response.clicked() && active.is_none()) {
+            // Grab whichever handle is closer to the press.
+            let upper = (pos.y - to_y(selection.1)).abs() < (pos.y - to_y(selection.0)).abs();
+            *active = Some(upper);
+        }
+        if let Some(upper) = *active {
+            let v = to_v(pos.y);
+            if upper {
+                selection.1 = v.max(selection.0);
+            } else {
+                selection.0 = v.min(selection.1);
+            }
+        }
+    }
+    let released = active.is_some() && response.drag_stopped();
+    if released {
+        *active = None;
+    }
+
+    let painter = ui.painter();
+    let cx = rect.center().x;
+    // Track, selected band, handles.
+    painter.line_segment(
+        [Pos2::new(cx, inner_top), Pos2::new(cx, inner_top + inner_height)],
+        Stroke::new(4.0, Color32::from_gray(70)),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(cx, to_y(selection.1)),
+            Pos2::new(cx, to_y(selection.0)),
+        ],
+        Stroke::new(6.0, Color32::from_rgb(120, 200, 120)),
+    );
+    for v in [selection.0, selection.1] {
+        painter.circle_filled(Pos2::new(cx, to_y(v)), HANDLE_R, Color32::from_gray(230));
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    released
+}
+
+fn log_preprocess_result(result: &PreprocessResult) {
+    for (label, runs) in [("sample", &result.sample), ("ob", &result.ob)] {
+        let rejected: Vec<&str> = runs
+            .iter()
+            .filter(|r| r.rejected_empty)
+            .map(|r| r.name.as_str())
+            .collect();
+        let missing_pc: Vec<&str> = runs
+            .iter()
+            .filter(|r| !r.rejected_empty && r.proton_charge_c.is_none())
+            .map(|r| r.name.as_str())
+            .collect();
+        let with_pc = runs
+            .iter()
+            .filter(|r| r.proton_charge_c.is_some())
+            .count();
+        logger::log(format!(
+            "preprocessing {label}: {} runs, {} with proton charge",
+            runs.len() - rejected.len(),
+            with_pc
+        ));
+        if !rejected.is_empty() {
+            logger::log(format!(
+                "rejected {} empty {label} runs: {:?}",
+                rejected.len(),
+                rejected
+            ));
+        }
+        if !missing_pc.is_empty() {
+            logger::error(format!(
+                "proton charge not found for {} {label} runs: {:?}",
+                missing_pc.len(),
+                missing_pc
+            ));
+        }
+    }
 }
 
 impl eframe::App for CtApp {

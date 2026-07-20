@@ -44,6 +44,16 @@ selecting one inventories, on a background thread with progress, the images
 (full paths) of each subfolder — one per projection angle for a sample, one
 per run for open beams — and shows the per-folder and total counts.
 
+Once both are selected, the selection summary (number of projections, sample
+/ OB / nexus folders, detector) is logged and a preprocessing pass runs in
+the background: empty run folders are rejected, and each run's proton charge
+is read from its NeXus file (`<ipts>/nexus/<instrument>_<run>.nxs.h5`,
+dataset `entry/proton_charge`, pC → C — same rules as the Python pipeline,
+run number parsed from the `Run_<n>` part of the folder name). The sample
+and OB proton charges are then drawn on one plot (charge in C vs run number)
+so mismatched beam conditions stand out; rejections and missing proton
+charges are flagged in the UI and the log.
+
 Note: the until-July-2025 tpx1 layout currently maps to the same folders as
 the post-August one (adjust `Detector::images_subdir` in `src/tof.rs` when
 its real structure is pinned down). The White Beam screen is not implemented

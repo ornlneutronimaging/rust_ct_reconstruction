@@ -8,6 +8,7 @@ description = "GUI for neutron CT reconstruction on VENUS and MARS (white beam a
 chrono = "0.4"
 eframe = "0.35"
 egui = "0.35"
+egui_plot = "0.36"
 hdf5-metno = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.17"

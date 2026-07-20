@@ -183,9 +183,174 @@ fn scan_thread(root: PathBuf, tx: Sender<ScanMsg>) {
     let _ = tx.send(ScanMsg::Done(result));
 }
 
+/// Lightweight description of an [`ImageFolder`] (no image list), enough for
+/// the preprocessing pass.
+#[derive(Clone, Debug)]
+pub struct FolderSummary {
+    pub name: String,
+    pub path: PathBuf,
+    pub n_images: usize,
+}
+
+impl ImageFolder {
+    pub fn summary(&self) -> FolderSummary {
+        FolderSummary {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            n_images: self.images.len(),
+        }
+    }
+}
+
+/// The run number embedded in a run folder name, e.g.
+/// `20260418_Run_19085_01_cell_..._Ang_000_000_1` → `19085` (same
+/// `Run_(\d+)` rule as the Python pipeline).
+pub fn run_number(folder_name: &str) -> Option<u32> {
+    let start = folder_name.find("Run_")? + "Run_".len();
+    let digits: String = folder_name[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// `<nexus_dir>/<instrument>_<run>.nxs.h5`, e.g.
+/// `/SNS/VENUS/IPTS-37118/nexus/VENUS_19085.nxs.h5`.
+pub fn nexus_file_path(nexus_dir: &Path, instrument: &str, run: u32) -> PathBuf {
+    nexus_dir.join(format!("{instrument}_{run}.nxs.h5"))
+}
+
+/// Proton charge of a run in Coulombs: `entry/proton_charge[0]` in the NeXus
+/// file is in picocoulombs (same conversion as the Python pipeline).
+pub fn read_proton_charge_c(nexus: &Path) -> Result<f64, String> {
+    let file = hdf5_metno::File::open(nexus)
+        .map_err(|e| format!("cannot open {}: {e}", nexus.display()))?;
+    let values: Vec<f64> = file
+        .dataset("entry/proton_charge")
+        .and_then(|ds| ds.read_raw())
+        .map_err(|e| format!("cannot read proton charge from {}: {e}", nexus.display()))?;
+    values
+        .first()
+        .map(|pc| pc / 1e12)
+        .ok_or_else(|| format!("empty proton charge in {}", nexus.display()))
+}
+
+/// One run after preprocessing: empty-folder rejection and NeXus lookup.
+#[derive(Clone, Debug)]
+pub struct RunInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub n_images: usize,
+    pub run_number: Option<u32>,
+    pub nexus: Option<PathBuf>,
+    pub proton_charge_c: Option<f64>,
+    /// `true` when the folder holds no images and is excluded from processing.
+    pub rejected_empty: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PreprocessResult {
+    pub sample: Vec<RunInfo>,
+    pub ob: Vec<RunInfo>,
+}
+
+enum PreprocessMsg {
+    Progress { done: usize, total: usize },
+    Done(PreprocessResult),
+}
+
+/// The preprocessing pass on a background thread: reject empty run folders
+/// and read each remaining run's proton charge from its NeXus file (one HDF5
+/// open per run on the network filesystem).
+pub struct PreprocessScan {
+    rx: Receiver<PreprocessMsg>,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl PreprocessScan {
+    pub fn start(
+        sample: Vec<FolderSummary>,
+        ob: Vec<FolderSummary>,
+        nexus_dir: PathBuf,
+        instrument: String,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let total = sample.len() + ob.len();
+            let mut done = 0;
+            let mut inspect = |folders: Vec<FolderSummary>| -> Vec<RunInfo> {
+                folders
+                    .into_iter()
+                    .map(|f| {
+                        let rejected_empty = f.n_images == 0;
+                        let run = run_number(&f.name);
+                        let nexus = run.map(|n| nexus_file_path(&nexus_dir, &instrument, n));
+                        let proton_charge_c = if rejected_empty {
+                            None
+                        } else {
+                            nexus.as_deref().and_then(|p| read_proton_charge_c(p).ok())
+                        };
+                        done += 1;
+                        let _ = tx.send(PreprocessMsg::Progress { done, total });
+                        RunInfo {
+                            name: f.name,
+                            path: f.path,
+                            n_images: f.n_images,
+                            run_number: run,
+                            nexus,
+                            proton_charge_c,
+                            rejected_empty,
+                        }
+                    })
+                    .collect()
+            };
+            let result = PreprocessResult {
+                sample: inspect(sample),
+                ob: inspect(ob),
+            };
+            let _ = tx.send(PreprocessMsg::Done(result));
+        });
+        Self { rx, done: 0, total: 0 }
+    }
+
+    /// Drain progress messages; `Some` once the pass has finished.
+    pub fn poll(&mut self) -> Option<PreprocessResult> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(PreprocessMsg::Progress { done, total }) => {
+                    self.done = done;
+                    self.total = total;
+                }
+                Ok(PreprocessMsg::Done(result)) => return Some(result),
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_number_from_folder_name() {
+        assert_eq!(
+            run_number("20260418_Run_19085_01_cell_nCT_5_260C_5_200AngsMin_Ang_000_000_1"),
+            Some(19085)
+        );
+        assert_eq!(run_number("20250911_Run_12157_beetle_Ang_0_000_1"), Some(12157));
+        assert_eq!(run_number("no_run_here"), None);
+        assert_eq!(run_number("Run_"), None);
+    }
+
+    #[test]
+    fn nexus_path_format() {
+        assert_eq!(
+            nexus_file_path(Path::new("/SNS/VENUS/IPTS-37118/nexus"), "VENUS", 19085),
+            Path::new("/SNS/VENUS/IPTS-37118/nexus/VENUS_19085.nxs.h5")
+        );
+    }
 
     #[test]
     fn detector_roots() {
