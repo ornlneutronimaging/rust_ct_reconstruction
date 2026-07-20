@@ -20,6 +20,11 @@ use std::time::{Duration, Instant};
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const LOG_REFRESH_EVERY: Duration = Duration::from_secs(2);
 
+/// Development convenience: start with the admin debug mode already on, so
+/// the setup screen opens prefilled from the default config
+/// (`config/config_jean.h5`). Set to `false` for production.
+const START_WITH_DEBUG_ON: bool = true;
+
 /// SHA-256 of the admin password; the plaintext is never stored, the typed
 /// password is hashed and compared.
 const ADMIN_PASSWORD_SHA256: &str =
@@ -100,7 +105,7 @@ impl Default for CtApp {
 
 impl CtApp {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             screen: Screen::Setup,
             instrument: Instrument::Venus,
             scans: HashMap::new(),
@@ -122,7 +127,12 @@ impl CtApp {
             log_text: String::new(),
             log_last_read: None,
             log_error: None,
+        };
+        if START_WITH_DEBUG_ON {
+            app.debug_mode = true;
+            app.enable_debug();
         }
+        app
     }
 
     /// Make sure a scan exists for the current instrument and fold a finished
