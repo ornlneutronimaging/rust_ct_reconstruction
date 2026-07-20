@@ -402,16 +402,14 @@ impl CtApp {
         });
     }
 
-    /// `Next ➡` in the bottom-right corner, enabled once the instrument, the
+    /// `Next` in the bottom-right corner, enabled once the instrument, the
     /// experiment and the mode are all selected; returns `true` when clicked.
     fn next_button(&mut self, ui: &mut egui::Ui) -> bool {
         let mut go = false;
         let ready = self.selected.is_some() && self.mode.is_some();
         ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
             ui.add_space(8.0);
-            let button = egui::Button::new(RichText::new("Next  ➡").size(20.0).strong())
-                .min_size(egui::vec2(160.0, 48.0));
-            if ui.add_enabled(ready, button).clicked() {
+            if next_button_widget(ui, ready).clicked() {
                 go = true;
             }
             if !ready {
@@ -560,6 +558,51 @@ impl CtApp {
                 }
             }
         });
+    }
+}
+
+/// The custom-painted `Next` button: a rounded accent pill with a
+/// double-chevron arrow, grayed out while the selection is incomplete.
+fn next_button_widget(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    use egui::{Align2, CursorIcon, FontId, Pos2, Sense, Stroke, vec2};
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(190.0, 56.0),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let (fill, content) = if !enabled {
+        (Color32::from_gray(45), Color32::from_gray(110))
+    } else if response.is_pointer_button_down_on() {
+        (Color32::from_rgb(0, 86, 160), Color32::WHITE)
+    } else if response.hovered() {
+        (Color32::from_rgb(36, 140, 235), Color32::WHITE)
+    } else {
+        (Color32::from_rgb(0, 110, 200), Color32::WHITE)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 14.0, fill);
+    painter.text(
+        rect.center() + vec2(-18.0, 0.0),
+        Align2::CENTER_CENTER,
+        "Next",
+        FontId::proportional(22.0),
+        content,
+    );
+    // Double chevron » to the right of the label.
+    let stroke = Stroke::new(3.0, content);
+    let h = 9.0;
+    for dx in [0.0, 13.0] {
+        let x = rect.center().x + 32.0 + dx;
+        let y = rect.center().y;
+        painter.line_segment([Pos2::new(x, y - h), Pos2::new(x + h, y)], stroke);
+        painter.line_segment([Pos2::new(x + h, y), Pos2::new(x, y + h)], stroke);
+    }
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
     }
 }
 
