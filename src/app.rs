@@ -9,6 +9,7 @@ use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 pub use crate::session::{Mode, Session};
+use crate::tof::{self, Detector, FolderScan, ImageFolder};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -52,7 +53,205 @@ fn password_matches(input: &str) -> bool {
 
 enum Screen {
     Setup,
-    Workflow(Session),
+    Workflow { session: Session, view: WorkflowView },
+}
+
+/// Mode-specific state and UI of the workflow screen.
+enum WorkflowView {
+    WhiteBeam,
+    Tof(TofView),
+}
+
+/// The TOF workflow: detector choice drives where the sample and open-beam
+/// folders are looked for; selecting a folder inventories the images of each
+/// of its subfolders (one per projection / OB run).
+struct TofView {
+    detector: Detector,
+    sample: FolderPick,
+    ob: FolderPick,
+}
+
+impl TofView {
+    fn new(session: &Session) -> Self {
+        Self::with_detector(Detector::Tpx1FromAugust2025, session)
+    }
+
+    fn with_detector(detector: Detector, session: &Session) -> Self {
+        let sample = FolderPick::new("sample", detector.ct_root(&session.ipts.path));
+        let ob = FolderPick::new("open beam", detector.ob_root(&session.ipts.path));
+        logger::log(format!(
+            "TOF detector: {} — sample root {} ({}), OB root {} ({})",
+            detector.label(),
+            sample.root.display(),
+            match &sample.candidates {
+                Ok(dirs) => format!("{} folders", dirs.len()),
+                Err(_) => "unreadable".to_owned(),
+            },
+            ob.root.display(),
+            match &ob.candidates {
+                Ok(dirs) => format!("{} folders", dirs.len()),
+                Err(_) => "unreadable".to_owned(),
+            },
+        ));
+        Self {
+            detector,
+            sample,
+            ob,
+        }
+    }
+}
+
+/// Selection of one folder (sample or open beam) under a fixed root, plus the
+/// background inventory of the images inside each of its subfolders.
+struct FolderPick {
+    /// "sample" or "open beam" — used in headings and log lines.
+    kind: &'static str,
+    root: PathBuf,
+    candidates: Result<Vec<PathBuf>, String>,
+    selected: Option<PathBuf>,
+    scan: Option<FolderScan>,
+    folders: Option<Vec<ImageFolder>>,
+    error: Option<String>,
+}
+
+impl FolderPick {
+    fn new(kind: &'static str, root: PathBuf) -> Self {
+        let candidates = tof::list_subdirs(&root);
+        Self {
+            kind,
+            root,
+            candidates,
+            selected: None,
+            scan: None,
+            folders: None,
+            error: None,
+        }
+    }
+
+    fn select(&mut self, path: PathBuf) {
+        logger::log(format!("{} folder selected: {}", self.kind, path.display()));
+        self.selected = Some(path.clone());
+        self.folders = None;
+        self.error = None;
+        self.scan = Some(FolderScan::start(path));
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &mut self.scan else { return };
+        match scan.poll() {
+            Some(Ok(folders)) => {
+                let images: usize = folders.iter().map(|f| f.images.len()).sum();
+                logger::log(format!(
+                    "{} inventory of {}: {} folders, {} images",
+                    self.kind,
+                    scan.root.display(),
+                    folders.len(),
+                    images
+                ));
+                self.folders = Some(folders);
+                self.scan = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("{} inventory failed: {e}", self.kind));
+                self.error = Some(e);
+                self.scan = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(200)),
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let heading = match self.kind {
+            "sample" => "Sample (projections)",
+            _ => "Open beam",
+        };
+        ui.label(RichText::new(heading).size(16.0).strong());
+        ui.label(RichText::new(self.root.display().to_string()).weak().size(11.0));
+        ui.add_space(4.0);
+
+        let mut clicked = None;
+        match &self.candidates {
+            Err(e) => {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            Ok(dirs) if dirs.is_empty() => {
+                ui.label(RichText::new("no folders found").weak());
+            }
+            Ok(dirs) => {
+                egui::ScrollArea::vertical()
+                    .id_salt((self.kind, "candidates"))
+                    .max_height(150.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                            for dir in dirs {
+                                let name = dir
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| dir.display().to_string());
+                                let is_selected = self.selected.as_deref() == Some(dir);
+                                if ui.selectable_label(is_selected, name).clicked() {
+                                    clicked = Some(dir.clone());
+                                }
+                            }
+                        });
+                    });
+            }
+        }
+        if let Some(dir) = clicked {
+            self.select(dir);
+        }
+
+        if ui.button("📂 Browse…").clicked() {
+            let mut dialog = rfd::FileDialog::new().set_title(format!("Select the {} folder", self.kind));
+            let start = if self.root.is_dir() {
+                Some(self.root.clone())
+            } else {
+                self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
+            };
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(path) = dialog.pick_folder() {
+                self.select(path);
+            }
+        }
+
+        ui.add_space(6.0);
+        if let Some(scan) = &self.scan {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("inventorying folders… {}/{}", scan.done, scan.total));
+            });
+        }
+        if let Some(e) = &self.error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        if let Some(folders) = &self.folders {
+            let images: usize = folders.iter().map(|f| f.images.len()).sum();
+            ui.label(
+                RichText::new(format!("{} folders — {} images", folders.len(), images))
+                    .strong(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt((self.kind, "inventory"))
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for folder in folders {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} — {} images",
+                                folder.name,
+                                folder.images.len()
+                            ))
+                            .weak()
+                            .size(12.0),
+                        );
+                    }
+                });
+        }
+    }
 }
 
 /// State of the IPTS discovery for one instrument.
@@ -264,6 +463,11 @@ impl CtApp {
                     self.selected = None;
                     self.filter.clear();
                     self.manual_error = None;
+                    // MARS is not a TOF instrument.
+                    if inst == Instrument::Mars && self.mode != Some(Mode::WhiteBeam) {
+                        logger::log("mode forced to White Beam (TOF not available on MARS)");
+                        self.mode = Some(Mode::WhiteBeam);
+                    }
                 }
             }
         });
@@ -401,10 +605,14 @@ impl CtApp {
             ui.spacing_mut().item_spacing.x = GAP;
             ui.add_space(((ui.available_width() - (2.0 * W + GAP)) / 2.0).max(0.0));
             for mode in [Mode::WhiteBeam, Mode::Tof] {
+                let available = mode != Mode::Tof || self.instrument != Instrument::Mars;
                 let button = egui::Button::new(RichText::new(mode.label()).size(26.0).strong())
                     .min_size(egui::vec2(W, H))
                     .selected(self.mode == Some(mode));
-                if ui.add(button).clicked() && self.mode != Some(mode) {
+                let response = ui
+                    .add_enabled(available, button)
+                    .on_disabled_hover_text("TOF is not available on MARS");
+                if response.clicked() && self.mode != Some(mode) {
                     logger::log(format!("mode selected: {}", mode.label()));
                     self.mode = Some(mode);
                 }
@@ -455,6 +663,10 @@ impl CtApp {
                     }
                 }
                 self.mode = Some(cfg.mode);
+                if cfg.instrument == Instrument::Mars && cfg.mode == Mode::Tof {
+                    logger::error("debug config asks for TOF on MARS — forcing White Beam");
+                    self.mode = Some(Mode::WhiteBeam);
+                }
                 logger::log(format!(
                     "debug mode ON — prefilled from {}: {} / {} / {}",
                     path.display(),
@@ -629,11 +841,12 @@ fn top_right_bar(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>, log_open
     });
 }
 
-/// Placeholder for the per-mode workflow screens; returns `true` when the user
-/// wants to go back to the setup screen.
+/// The workflow screen: shared header, then the mode-specific view; returns
+/// `true` when the user wants to go back to the setup screen.
 fn workflow_ui(
     ui: &mut egui::Ui,
     session: &Session,
+    view: &mut WorkflowView,
     logo: Option<&egui::TextureHandle>,
     log_open: &mut bool,
 ) -> bool {
@@ -644,7 +857,7 @@ fn workflow_ui(
         }
         top_right_bar(ui, logo, log_open);
     });
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     ui.vertical_centered(|ui| {
         ui.label(
             RichText::new(format!(
@@ -653,22 +866,57 @@ fn workflow_ui(
                 session.ipts.name,
                 session.mode.label()
             ))
-            .size(26.0)
+            .size(24.0)
             .strong(),
         );
-        ui.add_space(8.0);
-        ui.label(format!("Experiment folder: {}", session.ipts.path.display()));
-        ui.add_space(32.0);
-        ui.label(
-            RichText::new(format!(
-                "The {} workflow is not implemented yet.",
-                session.mode.label()
-            ))
-            .weak()
-            .size(16.0),
-        );
     });
+    ui.add_space(12.0);
+    match view {
+        WorkflowView::WhiteBeam => {
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.label(
+                    RichText::new("The White Beam workflow is not implemented yet.")
+                        .weak()
+                        .size(16.0),
+                );
+            });
+        }
+        WorkflowView::Tof(tof_view) => tof_ui(ui, session, tof_view),
+    }
     back
+}
+
+fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
+    let ctx = ui.ctx().clone();
+    view.sample.poll(&ctx);
+    view.ob.poll(&ctx);
+
+    // Detector — it decides where the sample and OB folders are looked for,
+    // so changing it rebuilds both pickers.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Detector:").strong());
+        let mut detector = view.detector;
+        egui::ComboBox::from_id_salt("tof_detector")
+            .selected_text(detector.label())
+            .show_ui(ui, |ui| {
+                for d in Detector::ALL {
+                    ui.selectable_value(&mut detector, d, d.label());
+                }
+            });
+        if detector != view.detector {
+            logger::log(format!("TOF detector changed: {}", detector.label()));
+            *view = TofView::with_detector(detector, session);
+        }
+    });
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    ui.columns(2, |cols| {
+        view.sample.ui(&mut cols[0]);
+        view.ob.ui(&mut cols[1]);
+    });
 }
 
 impl eframe::App for CtApp {
@@ -694,17 +942,22 @@ impl eframe::App for CtApp {
                     self.instrument.name(),
                     ipts.name
                 ));
-                self.screen = Screen::Workflow(Session {
+                let session = Session {
                     instrument: self.instrument,
                     ipts,
                     mode,
-                });
+                };
+                let view = match mode {
+                    Mode::WhiteBeam => WorkflowView::WhiteBeam,
+                    Mode::Tof => WorkflowView::Tof(TofView::new(&session)),
+                };
+                self.screen = Screen::Workflow { session, view };
             }
         } else {
             let mut back = false;
             egui::CentralPanel::default().show(ui, |ui| {
-                if let Screen::Workflow(session) = &self.screen {
-                    back = workflow_ui(ui, session, self.logo.as_ref(), &mut self.log_view_open);
+                if let Screen::Workflow { session, view } = &mut self.screen {
+                    back = workflow_ui(ui, session, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
             });
             if back {

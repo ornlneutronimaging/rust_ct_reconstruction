@@ -30,7 +30,24 @@ The application opens on a setup screen that drives the rest of the UI:
    mode are all selected. It hands the session (instrument + IPTS + mode) to
    the corresponding workflow screen.
 
-The workflow screens themselves are not implemented yet.
+## TOF workflow
+
+The TOF screen starts with the **detector** (`tpx1 - until July 2025`,
+`tpx1 - from August 2025` — the default — or `tpx3`), which decides where
+the data is looked for under the experiment:
+
+- sample (projections): `<ipts>/shared/autoreduce/images/<detector>/raw/ct/`
+- open beam: `<ipts>/shared/autoreduce/images/<detector>/ob/`
+
+Both sections list the folders found at their root (with a Browse fallback);
+selecting one inventories, on a background thread with progress, the images
+(full paths) of each subfolder — one per projection angle for a sample, one
+per run for open beams — and shows the per-folder and total counts.
+
+Note: the until-July-2025 tpx1 layout currently maps to the same folders as
+the post-August one (adjust `Detector::images_subdir` in `src/tof.rs` when
+its real structure is pinned down). The White Beam screen is not implemented
+yet.
 
 ## Admin section
 
