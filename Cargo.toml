@@ -1,0 +1,11 @@
+[package]
+name = "ct_reconstruction"
+version = "0.1.0"
+edition = "2024"
+description = "GUI for neutron CT reconstruction on VENUS and MARS (white beam and TOF workflows)"
+
+[dependencies]
+eframe = "0.35"
+egui = "0.35"
+hdf5-metno = "0.10"
+sha2 = "0.10"
