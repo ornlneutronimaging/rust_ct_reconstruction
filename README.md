@@ -24,9 +24,11 @@ The application opens on a setup screen that drives the rest of the UI:
    discovered in the background and listed newest-first (an experiment counts
    as readable when its directory can be listed, which honors the ACLs).
    An IPTS number can also be typed manually (`IPTS-36967` or `36967`).
-3. **Acquisition mode** — two large buttons, **White Beam** and **TOF**,
-   enabled once an experiment is selected. The chosen instrument + IPTS + mode
-   form the session handed to the corresponding workflow screen.
+3. **Acquisition mode** — two large buttons, **White Beam** and **TOF**;
+   clicking one selects the mode (it does not navigate).
+4. **Next ➡** — bottom-right, enabled only once instrument, experiment and
+   mode are all selected. It hands the session (instrument + IPTS + mode) to
+   the corresponding workflow screen.
 
 The workflow screens themselves are not implemented yet.
 

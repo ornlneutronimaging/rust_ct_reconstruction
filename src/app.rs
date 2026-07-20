@@ -59,6 +59,8 @@ pub struct CtApp {
     /// first time the instrument is shown.
     scans: HashMap<Instrument, Scan>,
     selected: Option<IptsEntry>,
+    /// Acquisition mode picked with the two large buttons; `Next` needs it.
+    mode: Option<Mode>,
     filter: String,
     manual: String,
     manual_error: Option<String>,
@@ -71,8 +73,6 @@ pub struct CtApp {
     /// Config file the debug mode reads; starts at the default
     /// (`config/config_jean.h5`) and can be changed with the Browse button.
     config_path: PathBuf,
-    /// Mode read from the debug config; highlights the matching mode button.
-    debug_config_mode: Option<Mode>,
     debug_info: Option<String>,
     debug_error: Option<String>,
 
@@ -93,6 +93,7 @@ impl CtApp {
             instrument: Instrument::Venus,
             scans: HashMap::new(),
             selected: None,
+            mode: None,
             filter: String::new(),
             manual: String::new(),
             manual_error: None,
@@ -101,7 +102,6 @@ impl CtApp {
             admin_error: None,
             debug_mode: false,
             config_path: config::default_config_path(),
-            debug_config_mode: None,
             debug_info: None,
             debug_error: None,
             logo: None,
@@ -124,8 +124,7 @@ impl CtApp {
         }
     }
 
-    fn setup_ui(&mut self, ui: &mut egui::Ui) -> Option<Mode> {
-        let mut chosen = None;
+    fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
         show_logo(ui, self.logo.as_ref());
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
@@ -141,9 +140,9 @@ impl CtApp {
             ui.add_space(20.0);
             self.ipts_section(ui);
             ui.add_space(28.0);
-            chosen = self.mode_buttons(ui);
+            self.mode_buttons(ui);
         });
-        chosen
+        self.next_button(ui)
     }
 
     fn instrument_row(&mut self, ui: &mut egui::Ui) {
@@ -286,32 +285,48 @@ impl CtApp {
         }
     }
 
-    fn mode_buttons(&mut self, ui: &mut egui::Ui) -> Option<Mode> {
+    /// The two large acquisition-mode buttons; clicking selects the mode, it
+    /// does not navigate — that is what the `Next` button is for.
+    fn mode_buttons(&mut self, ui: &mut egui::Ui) {
         const W: f32 = 260.0;
         const H: f32 = 110.0;
         const GAP: f32 = 40.0;
-        let mut chosen = None;
-        let enabled = self.selected.is_some();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             ui.add_space(((ui.available_width() - (2.0 * W + GAP)) / 2.0).max(0.0));
             for mode in [Mode::WhiteBeam, Mode::Tof] {
-                let from_config = self.debug_mode && self.debug_config_mode == Some(mode);
                 let button = egui::Button::new(RichText::new(mode.label()).size(26.0).strong())
                     .min_size(egui::vec2(W, H))
-                    .selected(from_config);
-                if ui.add_enabled(enabled, button).clicked() {
-                    chosen = Some(mode);
+                    .selected(self.mode == Some(mode));
+                if ui.add(button).clicked() {
+                    self.mode = Some(mode);
                 }
             }
         });
-        ui.add_space(8.0);
-        if !enabled {
-            ui.label(RichText::new("Select an experiment to continue").weak());
-        } else if self.debug_mode && self.debug_config_mode.is_some() {
-            ui.label(RichText::new("Highlighted mode comes from the debug config").weak());
-        }
-        chosen
+    }
+
+    /// `Next ➡` in the bottom-right corner, enabled once the instrument, the
+    /// experiment and the mode are all selected; returns `true` when clicked.
+    fn next_button(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut go = false;
+        let ready = self.selected.is_some() && self.mode.is_some();
+        ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
+            ui.add_space(8.0);
+            let button = egui::Button::new(RichText::new("Next  ➡").size(20.0).strong())
+                .min_size(egui::vec2(160.0, 48.0));
+            if ui.add_enabled(ready, button).clicked() {
+                go = true;
+            }
+            if !ready {
+                let missing = match (self.selected.is_some(), self.mode.is_some()) {
+                    (false, false) => "select an experiment and a mode",
+                    (false, true) => "select an experiment",
+                    _ => "select a mode",
+                };
+                ui.label(RichText::new(missing).weak().size(12.0));
+            }
+        });
+        go
     }
 
     /// Load the debug config and prefill the setup screen from it. Turns the
@@ -333,7 +348,7 @@ impl CtApp {
                         self.debug_error = Some(e);
                     }
                 }
-                self.debug_config_mode = Some(cfg.mode);
+                self.mode = Some(cfg.mode);
                 self.debug_info = Some(format!(
                     "{} → {} / {} / {}",
                     path.display(),
@@ -351,7 +366,6 @@ impl CtApp {
     }
 
     fn disable_debug(&mut self) {
-        self.debug_config_mode = None;
         self.debug_info = None;
         self.debug_error = None;
     }
@@ -492,14 +506,14 @@ impl eframe::App for CtApp {
         }
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
-            let mut chosen = None;
+            let mut next = false;
             egui::Panel::bottom("admin").show(ui, |ui| {
                 self.admin_panel(ui);
             });
             egui::CentralPanel::default().show(ui, |ui| {
-                chosen = self.setup_ui(ui);
+                next = self.setup_ui(ui);
             });
-            if let (Some(mode), Some(ipts)) = (chosen, self.selected.clone()) {
+            if next && let (Some(mode), Some(ipts)) = (self.mode, self.selected.clone()) {
                 self.screen = Screen::Workflow(Session {
                     instrument: self.instrument,
                     ipts,
