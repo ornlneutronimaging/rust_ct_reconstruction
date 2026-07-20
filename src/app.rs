@@ -9,7 +9,10 @@ use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 pub use crate::session::{Mode, Session};
-use crate::tof::{self, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan, RunInfo};
+use crate::tof::{
+    self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
+    RunInfo, ViewerJob,
+};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -88,6 +91,10 @@ struct TofView {
     /// proton-charge band filter.
     removed_sample: HashSet<String>,
     removed_ob: HashSet<String>,
+    /// TOF Profile Viewer session in flight (combine-range selection).
+    combine_job: Option<ViewerJob>,
+    combine_spec: Option<CombineSpec>,
+    combine_error: Option<String>,
 }
 
 impl TofView {
@@ -124,7 +131,21 @@ impl TofView {
             pc_drag_upper: None,
             removed_sample: HashSet::new(),
             removed_ob: HashSet::new(),
+            combine_job: None,
+            combine_spec: None,
+            combine_error: None,
         }
+    }
+
+    /// The first sample run going to the next step (band + manual filters),
+    /// used to visualize the TOF profile.
+    fn first_kept_sample_run(&self) -> Option<&RunInfo> {
+        let result = self.preprocessed.as_ref()?;
+        let range = self.pc_range?;
+        result
+            .sample
+            .iter()
+            .find(|r| pc_in_range(r, range) && !self.removed_sample.contains(&r.name))
     }
 }
 
@@ -1045,6 +1066,156 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             .show(ui, |ui| {
                 runs_selection_ui(ui, view);
             });
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(RichText::new("Combine images (TOF range)").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                combine_section_ui(ui, &ctx, view);
+            });
+    }
+}
+
+/// Choosing how the TOF images are combined (file index / TOF / lambda /
+/// energy ranges): the first kept sample projection is opened in the TOF
+/// Profile Viewer, whose exported selections come back here.
+fn combine_section_ui(ui: &mut egui::Ui, ctx: &egui::Context, view: &mut TofView) {
+    // Fold a finished viewer session into the view.
+    if let Some(job) = &mut view.combine_job {
+        match job.poll() {
+            Some(Ok(Some(json))) => {
+                match tof::parse_selections(&json) {
+                    Ok(spec) => {
+                        log_combine_spec(&spec);
+                        view.combine_spec = Some(spec);
+                        view.combine_error = None;
+                    }
+                    Err(e) => {
+                        logger::error(format!("TOF combine selections rejected: {e}"));
+                        view.combine_error = Some(e);
+                    }
+                }
+                view.combine_job = None;
+            }
+            Some(Ok(None)) => {
+                logger::log("TOF Profile Viewer closed without exporting selections");
+                view.combine_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("TOF Profile Viewer failed: {e}"));
+                view.combine_error = Some(e);
+                view.combine_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+
+    let first_run = view.first_kept_sample_run().cloned();
+    match (&view.combine_job, &first_run) {
+        (Some(_), _) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    "TOF Profile Viewer is open — make the selections there and press its \
+                     export button to bring them back",
+                );
+            });
+        }
+        (None, None) => {
+            ui.label(
+                RichText::new("no sample run left to visualize — adjust the selection above")
+                    .weak(),
+            );
+        }
+        (None, Some(run)) => {
+            let label = if view.combine_spec.is_some() {
+                "📈 Reopen the TOF Profile Viewer"
+            } else {
+                "📈 Open the TOF Profile Viewer (first projection)"
+            };
+            if ui.button(label).clicked() {
+                logger::log(format!(
+                    "opening TOF Profile Viewer on first projection: {}",
+                    run.path.display()
+                ));
+                view.combine_error = None;
+                // The previous session's document restores its TOF ranges
+                // and manual bins in the reopened viewer — but only a
+                // document with either is accepted by --selections.
+                view.combine_job = Some(ViewerJob::launch(
+                    run.path.clone(),
+                    view.combine_spec
+                        .as_ref()
+                        .filter(|s| s.has_bins || s.ranges.iter().any(|r| r.tof_us.is_some()))
+                        .map(|s| s.raw.as_str()),
+                ));
+            }
+            ui.label(
+                RichText::new(format!("first projection: {}", run.name))
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    }
+
+    if let Some(e) = &view.combine_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+    if let Some(spec) = &view.combine_spec {
+        ui.add_space(4.0);
+        let enabled: Vec<&tof::CombineRange> =
+            spec.ranges.iter().filter(|r| r.enabled).collect();
+        ui.label(
+            RichText::new(format!("{} combine range(s) selected", enabled.len())).strong(),
+        );
+        for (i, range) in enabled.iter().enumerate() {
+            ui.label(RichText::new(format!("#{}: {}", i + 1, combine_range_text(range))).size(12.0));
+        }
+        if spec.has_bins {
+            ui.label(
+                RichText::new("a manual binning table is included in the selections")
+                    .weak()
+                    .size(12.0),
+            );
+        }
+    }
+}
+
+/// One selection on every axis the viewer could express it in, e.g.
+/// `file index 120 – 240 | TOF 2000.0 – 4000.0 µs | λ 3.960 – 7.920 Å`.
+fn combine_range_text(range: &tof::CombineRange) -> String {
+    let mut parts = Vec::new();
+    if let Some((a, b)) = range.file_index {
+        parts.push(format!("file index {:.0} – {:.0}", a, b));
+    }
+    if let Some((a, b)) = range.tof_us {
+        parts.push(format!("TOF {a:.1} – {b:.1} µs"));
+    }
+    if let Some((a, b)) = range.lambda_angstrom {
+        parts.push(format!("λ {a:.3} – {b:.3} Å"));
+    }
+    if let Some((a, b)) = range.energy_ev {
+        parts.push(format!("E {a:.4} – {b:.4} eV"));
+    }
+    if parts.is_empty() {
+        "no usable axis values".to_owned()
+    } else {
+        parts.join("  |  ")
+    }
+}
+
+fn log_combine_spec(spec: &CombineSpec) {
+    let enabled: Vec<&tof::CombineRange> = spec.ranges.iter().filter(|r| r.enabled).collect();
+    logger::log(format!(
+        "TOF combine selections received: {} enabled range(s) (of {}) from {}",
+        enabled.len(),
+        spec.ranges.len(),
+        spec.folder
+    ));
+    for (i, range) in enabled.iter().enumerate() {
+        logger::log(format!("combine range #{}: {}", i + 1, combine_range_text(range)));
+    }
+    if spec.has_bins {
+        logger::log("combine selections include a manual binning table");
     }
 }
 

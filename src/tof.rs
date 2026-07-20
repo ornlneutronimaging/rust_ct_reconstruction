@@ -329,9 +329,158 @@ impl PreprocessScan {
     }
 }
 
+/// The TOF Profile Viewer application (sibling repo), used to choose how the
+/// TOF images are combined. Its `--called-from-marimo` mode prints the
+/// selections as JSON on stdout and closes.
+pub const TOF_PROFILE_VIEWER_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_tof_profile_viewer/target/release/tof_profile_viewer";
+
+/// One selection exported by the TOF Profile Viewer: the same range on every
+/// axis it could express it in (an axis is `None` when no TOF spectra were
+/// available to convert to it).
+#[derive(Clone, Debug)]
+pub struct CombineRange {
+    pub enabled: bool,
+    pub file_index: Option<(f64, f64)>,
+    pub tof_us: Option<(f64, f64)>,
+    pub lambda_angstrom: Option<(f64, f64)>,
+    pub energy_ev: Option<(f64, f64)>,
+}
+
+/// The parsed selections document, plus the raw JSON for the combine step.
+#[derive(Clone, Debug)]
+pub struct CombineSpec {
+    pub folder: String,
+    pub distance_m: Option<f64>,
+    pub ranges: Vec<CombineRange>,
+    pub has_bins: bool,
+    pub raw: String,
+}
+
+pub fn parse_selections(json: &str) -> Result<CombineSpec, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid selections JSON: {e}"))?;
+    let selections = doc
+        .get("selections")
+        .and_then(|v| v.as_array())
+        .ok_or("no \"selections\" array in the viewer output")?;
+    let pair = |sel: &serde_json::Value, key: &str| -> Option<(f64, f64)> {
+        let arr = sel.get(key)?.as_array()?;
+        Some((arr.first()?.as_f64()?, arr.get(1)?.as_f64()?))
+    };
+    let ranges = selections
+        .iter()
+        .map(|sel| CombineRange {
+            enabled: sel.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            file_index: pair(sel, "file_index"),
+            tof_us: pair(sel, "tof_us"),
+            lambda_angstrom: pair(sel, "lambda_angstrom"),
+            energy_ev: pair(sel, "energy_ev"),
+        })
+        .collect();
+    // Only a bins table with segments counts: it is what `--selections` can
+    // hand back to the viewer, which rejects a document without segments.
+    let has_bins = doc
+        .get("bins")
+        .and_then(|b| b.get("segments"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|a| !a.is_empty());
+    Ok(CombineSpec {
+        folder: doc
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        distance_m: doc.get("distance_m").and_then(|v| v.as_f64()),
+        ranges,
+        has_bins,
+        raw: json.to_owned(),
+    })
+}
+
+/// A TOF Profile Viewer session on a background thread; resolves to the JSON
+/// it printed on export, or `Ok(None)` when it was closed without exporting.
+pub struct ViewerJob {
+    rx: Receiver<Result<Option<String>, String>>,
+}
+
+impl ViewerJob {
+    pub fn launch(folder: PathBuf, previous_selections: Option<&str>) -> Self {
+        let (tx, rx) = channel();
+        // Manual bins of the previous session are handed back via a temp
+        // file (`--selections` imports only the bins table).
+        let selections_file = previous_selections.and_then(|json| {
+            let path = std::env::temp_dir().join(format!(
+                "ct_reconstruction_tof_selections_{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, json).ok().map(|()| path)
+        });
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new(TOF_PROFILE_VIEWER_BIN);
+            cmd.arg("--called-from-marimo").arg(&folder);
+            if let Some(path) = &selections_file {
+                cmd.arg("--selections").arg(path);
+            }
+            let result = match cmd.output() {
+                Err(e) => Err(format!("cannot launch {TOF_PROFILE_VIEWER_BIN}: {e}")),
+                Ok(out) if !out.status.success() => Err(format!(
+                    "tof_profile_viewer failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                    Ok((!stdout.is_empty()).then_some(stdout))
+                }
+            };
+            if let Some(path) = &selections_file {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = tx.send(result);
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<Option<String>, String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_selections_document() {
+        let json = r#"{
+            "folder": "/data/run1",
+            "distance_m": 25.0,
+            "selections": [
+                {"enabled": true, "file_index": [10, 20], "tof_us": [2000, 4000],
+                 "lambda_angstrom": [3.9, 7.9], "energy_ev": null},
+                {"enabled": false, "file_index": null, "tof_us": [100, 200],
+                 "lambda_angstrom": null, "energy_ev": [0.1, 0.4]}
+            ],
+            "bins": {"axis": "tof",
+                     "segments": [{"min": 0, "max": 10, "step": 1}]}
+        }"#;
+        let spec = parse_selections(json).unwrap();
+        assert_eq!(spec.folder, "/data/run1");
+        assert_eq!(spec.distance_m, Some(25.0));
+        assert_eq!(spec.ranges.len(), 2);
+        assert!(spec.ranges[0].enabled);
+        assert_eq!(spec.ranges[0].file_index, Some((10.0, 20.0)));
+        assert_eq!(spec.ranges[0].energy_ev, None);
+        assert!(!spec.ranges[1].enabled);
+        assert!(spec.has_bins);
+        assert!(parse_selections("{}").is_err());
+        assert!(parse_selections("not json").is_err());
+        // No bins / empty segments: nothing --selections could hand back.
+        let no_bins = r#"{"selections": [], "bins": {"axis": "tof", "segments": []}}"#;
+        assert!(!parse_selections(no_bins).unwrap().has_bins);
+        assert!(!parse_selections(r#"{"selections": []}"#).unwrap().has_bins);
+    }
 
     #[test]
     fn run_number_from_folder_name() {
