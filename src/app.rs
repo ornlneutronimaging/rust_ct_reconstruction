@@ -12,12 +12,27 @@ pub use crate::session::{Mode, Session};
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// SHA-256 of the admin password; the plaintext is never stored, the typed
 /// password is hashed and compared.
 const ADMIN_PASSWORD_SHA256: &str =
     "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
+
+/// Imaging team logo, embedded in the binary and shown in the top-right
+/// corner (same asset and placement as the jupyter notebooks portal).
+const LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
+const LOGO_MAX_HEIGHT: f32 = 64.0;
+
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(LOGO_BYTES).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    Some(ctx.load_texture("imaging_logo", color_image, egui::TextureOptions::LINEAR))
+}
 
 fn password_matches(input: &str) -> bool {
     let digest = Sha256::digest(input.as_bytes());
@@ -53,10 +68,16 @@ pub struct CtApp {
     admin_password: String,
     admin_error: Option<String>,
     debug_mode: bool,
+    /// Config file the debug mode reads; starts at the default
+    /// (`config/config_jean.h5`) and can be changed with the Browse button.
+    config_path: PathBuf,
     /// Mode read from the debug config; highlights the matching mode button.
     debug_config_mode: Option<Mode>,
     debug_info: Option<String>,
     debug_error: Option<String>,
+
+    /// Loaded lazily on the first frame (needs the egui context).
+    logo: Option<egui::TextureHandle>,
 }
 
 impl Default for CtApp {
@@ -79,9 +100,11 @@ impl CtApp {
             admin_password: String::new(),
             admin_error: None,
             debug_mode: false,
+            config_path: config::default_config_path(),
             debug_config_mode: None,
             debug_info: None,
             debug_error: None,
+            logo: None,
         }
     }
 
@@ -103,6 +126,7 @@ impl CtApp {
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> Option<Mode> {
         let mut chosen = None;
+        show_logo(ui, self.logo.as_ref());
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
             ui.label(RichText::new("CT Reconstruction").size(32.0).strong());
@@ -293,7 +317,7 @@ impl CtApp {
     /// Load the debug config and prefill the setup screen from it. Turns the
     /// toggle back off when the config file itself cannot be read.
     fn enable_debug(&mut self) {
-        let path = config::default_config_path();
+        let path = self.config_path.clone();
         match config::read(&path) {
             Ok(cfg) => {
                 self.instrument = cfg.instrument;
@@ -378,6 +402,31 @@ impl CtApp {
                         self.admin_error = None;
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Config:");
+                    let name = self
+                        .config_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| self.config_path.display().to_string());
+                    ui.label(RichText::new(name).monospace())
+                        .on_hover_text(self.config_path.display().to_string());
+                    if ui.button("📂 Browse…").clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("HDF5 config", &["h5", "hdf5"])
+                            .set_title("Select a debug config file");
+                        if let Some(dir) = self.config_path.parent().filter(|d| d.is_dir()) {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            self.config_path = path;
+                            // A new file while debug is on takes effect right away.
+                            if self.debug_mode {
+                                self.enable_debug();
+                            }
+                        }
+                    }
+                });
                 if let Some(info) = &self.debug_info {
                     ui.label(RichText::new(info).weak().size(12.0));
                 }
@@ -389,14 +438,24 @@ impl CtApp {
     }
 }
 
+/// Imaging team logo in the top-right corner of the current row.
+fn show_logo(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        if let Some(tex) = logo {
+            ui.add(egui::Image::from_texture(tex).max_height(LOGO_MAX_HEIGHT));
+        }
+    });
+}
+
 /// Placeholder for the per-mode workflow screens; returns `true` when the user
 /// wants to go back to the setup screen.
-fn workflow_ui(ui: &mut egui::Ui, session: &Session) -> bool {
+fn workflow_ui(ui: &mut egui::Ui, session: &Session, logo: Option<&egui::TextureHandle>) -> bool {
     let mut back = false;
     ui.horizontal(|ui| {
         if ui.button("← Back to setup").clicked() {
             back = true;
         }
+        show_logo(ui, logo);
     });
     ui.add_space(12.0);
     ui.vertical_centered(|ui| {
@@ -428,6 +487,9 @@ fn workflow_ui(ui: &mut egui::Ui, session: &Session) -> bool {
 impl eframe::App for CtApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.logo.is_none() {
+            self.logo = load_logo(&ctx);
+        }
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
             let mut chosen = None;
@@ -448,7 +510,7 @@ impl eframe::App for CtApp {
             let mut back = false;
             egui::CentralPanel::default().show(ui, |ui| {
                 if let Screen::Workflow(session) = &self.screen {
-                    back = workflow_ui(ui, session);
+                    back = workflow_ui(ui, session, self.logo.as_ref());
                 }
             });
             if back {

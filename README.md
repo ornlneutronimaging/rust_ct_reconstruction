@@ -39,7 +39,9 @@ mode** toggle: when on, the setup screen is prefilled from an HDF5 config
 file — instrument and IPTS are selected automatically and the configured mode
 button is highlighted.
 
-The config file lives at `config/config_jean.h5` and holds three scalar
+The active config defaults to `config/config_jean.h5`; a **Browse…** button
+in the unlocked admin section selects a different `.h5` file (taking effect
+immediately when debug mode is already on). A config file holds three scalar
 string datasets: `instrument` (`VENUS`/`MARS`), `ipts` (e.g. `IPTS-36202`)
 and `mode` (`White Beam`/`TOF`). Regenerate or write variants with:
 
