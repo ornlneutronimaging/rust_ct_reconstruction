@@ -95,6 +95,8 @@ struct TofView {
     combine_job: Option<ViewerJob>,
     combine_spec: Option<CombineSpec>,
     combine_error: Option<String>,
+    /// `true`: combine every image of each run, no TOF range selection.
+    combine_all: bool,
 }
 
 impl TofView {
@@ -134,6 +136,7 @@ impl TofView {
             combine_job: None,
             combine_spec: None,
             combine_error: None,
+            combine_all: false,
         }
     }
 
@@ -1109,6 +1112,34 @@ fn combine_section_ui(ui: &mut egui::Ui, ctx: &egui::Context, view: &mut TofView
         }
     }
 
+    // Combine everything, or select TOF range(s) in the profile viewer.
+    let mut combine_all = view.combine_all;
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut combine_all, false, "Select TOF range(s)");
+        ui.radio_value(
+            &mut combine_all,
+            true,
+            "Combine all images (no TOF selection)",
+        );
+    });
+    if combine_all != view.combine_all {
+        logger::log(if combine_all {
+            "combine mode: all images (no TOF selection)"
+        } else {
+            "combine mode: selected TOF range(s)"
+        });
+        view.combine_all = combine_all;
+    }
+    if view.combine_all {
+        ui.label(
+            RichText::new("every image of each run will be combined")
+                .weak()
+                .size(12.0),
+        );
+        return;
+    }
+    ui.add_space(4.0);
+
     let first_run = view.first_kept_sample_run().cloned();
     match (&view.combine_job, &first_run) {
         (Some(_), _) => {
@@ -1133,9 +1164,16 @@ fn combine_section_ui(ui: &mut egui::Ui, ctx: &egui::Context, view: &mut TofView
                 "📈 Open the TOF Profile Viewer (first projection)"
             };
             if ui.button(label).clicked() {
+                let offset_us = view
+                    .preprocessed
+                    .as_ref()
+                    .and_then(|r| r.detector_offset_us);
                 logger::log(format!(
-                    "opening TOF Profile Viewer on first projection: {}",
-                    run.path.display()
+                    "opening TOF Profile Viewer on first projection: {} (detector offset: {})",
+                    run.path.display(),
+                    offset_us
+                        .map(|o| format!("{o:.1} µs"))
+                        .unwrap_or_else(|| "not found".to_owned())
                 ));
                 view.combine_error = None;
                 // The previous session's document restores its TOF ranges
@@ -1143,14 +1181,21 @@ fn combine_section_ui(ui: &mut egui::Ui, ctx: &egui::Context, view: &mut TofView
                 // document with either is accepted by --selections.
                 view.combine_job = Some(ViewerJob::launch(
                     run.path.clone(),
+                    offset_us,
                     view.combine_spec
                         .as_ref()
                         .filter(|s| s.has_bins || s.ranges.iter().any(|r| r.tof_us.is_some()))
                         .map(|s| s.raw.as_str()),
                 ));
             }
+            let offset_note = view
+                .preprocessed
+                .as_ref()
+                .and_then(|r| r.detector_offset_us)
+                .map(|o| format!(" — detector offset {o:.1} µs from its NeXus"))
+                .unwrap_or_default();
             ui.label(
-                RichText::new(format!("first projection: {}", run.name))
+                RichText::new(format!("first projection: {}{offset_note}", run.name))
                     .weak()
                     .size(11.0),
             );
@@ -1545,6 +1590,12 @@ fn log_preprocess_result(result: &PreprocessResult) {
             runs.len() - rejected.len(),
             with_pc
         ));
+        if label == "sample" {
+            match result.detector_offset_us {
+                Some(offset) => logger::log(format!("detector offset: {offset:.1} µs")),
+                None => logger::error("detector offset not found in the first sample NeXus"),
+            }
+        }
         if !rejected.is_empty() {
             logger::log(format!(
                 "rejected {} empty {label} runs: {:?}",

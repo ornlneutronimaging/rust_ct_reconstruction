@@ -252,6 +252,47 @@ pub struct RunInfo {
 pub struct PreprocessResult {
     pub sample: Vec<RunInfo>,
     pub ob: Vec<RunInfo>,
+    /// Detector offset in µs from the first usable sample run's NeXus file
+    /// (`entry/DASlogs/BL10:Det:TH:DSPT1:TIDelay/average_value`), handed to
+    /// the TOF Profile Viewer as its time offset.
+    pub detector_offset_us: Option<f64>,
+}
+
+/// Detector offset of a run in µs, whatever unit its NeXus file uses.
+pub fn read_detector_offset_us(nexus: &Path) -> Result<f64, String> {
+    let file = hdf5_metno::File::open(nexus)
+        .map_err(|e| format!("cannot open {}: {e}", nexus.display()))?;
+    let ds = file
+        .dataset("entry/DASlogs/BL10:Det:TH:DSPT1:TIDelay/average_value")
+        .map_err(|e| format!("no detector offset in {}: {e}", nexus.display()))?;
+    let values: Vec<f64> = ds
+        .read_raw()
+        .map_err(|e| format!("cannot read detector offset from {}: {e}", nexus.display()))?;
+    let value = *values
+        .first()
+        .ok_or_else(|| format!("empty detector offset in {}", nexus.display()))?;
+    // The units attribute is a fixed-length ASCII string ("us" on VENUS).
+    let units = ds
+        .attr("units")
+        .and_then(|a| a.read_scalar::<hdf5_metno::types::FixedAscii<64>>())
+        .map(|s| s.as_str().to_owned())
+        .unwrap_or_else(|_| "us".to_owned());
+    Ok(offset_to_microseconds(value, &units))
+}
+
+fn offset_to_microseconds(value: f64, units: &str) -> f64 {
+    let u = units.trim().to_ascii_lowercase();
+    if u.starts_with("micro") || u == "us" || u == "µs" {
+        value
+    } else if u.starts_with("milli") || u == "ms" {
+        value * 1e3
+    } else if u.starts_with("nano") || u == "ns" {
+        value * 1e-3
+    } else if u.starts_with("second") || u == "s" || u == "sec" {
+        value * 1e6
+    } else {
+        value
+    }
 }
 
 enum PreprocessMsg {
@@ -305,9 +346,17 @@ impl PreprocessScan {
                     })
                     .collect()
             };
+            let sample = inspect(sample);
+            let ob = inspect(ob);
+            let detector_offset_us = sample
+                .iter()
+                .find(|r| !r.rejected_empty)
+                .and_then(|r| r.nexus.as_deref())
+                .and_then(|nexus| read_detector_offset_us(nexus).ok());
             let result = PreprocessResult {
-                sample: inspect(sample),
-                ob: inspect(ob),
+                sample,
+                ob,
+                detector_offset_us,
             };
             let _ = tx.send(PreprocessMsg::Done(result));
         });
@@ -405,7 +454,11 @@ pub struct ViewerJob {
 }
 
 impl ViewerJob {
-    pub fn launch(folder: PathBuf, previous_selections: Option<&str>) -> Self {
+    pub fn launch(
+        folder: PathBuf,
+        time_offset_us: Option<f64>,
+        previous_selections: Option<&str>,
+    ) -> Self {
         let (tx, rx) = channel();
         // Manual bins of the previous session are handed back via a temp
         // file (`--selections` imports only the bins table).
@@ -419,6 +472,9 @@ impl ViewerJob {
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new(TOF_PROFILE_VIEWER_BIN);
             cmd.arg("--called-from-marimo").arg(&folder);
+            if let Some(offset) = time_offset_us {
+                cmd.arg("--time-offset").arg(offset.to_string());
+            }
             if let Some(path) = &selections_file {
                 cmd.arg("--selections").arg(path);
             }
@@ -480,6 +536,16 @@ mod tests {
         let no_bins = r#"{"selections": [], "bins": {"axis": "tof", "segments": []}}"#;
         assert!(!parse_selections(no_bins).unwrap().has_bins);
         assert!(!parse_selections(r#"{"selections": []}"#).unwrap().has_bins);
+    }
+
+    #[test]
+    fn offset_unit_conversion() {
+        assert_eq!(offset_to_microseconds(32861.7, "us"), 32861.7);
+        assert_eq!(offset_to_microseconds(1.5, "microsecond"), 1.5);
+        assert_eq!(offset_to_microseconds(2.0, "ms"), 2000.0);
+        assert_eq!(offset_to_microseconds(0.5, "second"), 500_000.0);
+        assert_eq!(offset_to_microseconds(1500.0, "ns"), 1.5);
+        assert_eq!(offset_to_microseconds(7.0, "furlong"), 7.0);
     }
 
     #[test]
