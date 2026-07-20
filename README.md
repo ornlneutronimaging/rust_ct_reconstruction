@@ -53,6 +53,20 @@ cargo run --release --bin gen_config -- other.h5
 h5dump config/config_jean.h5                    # inspect
 ```
 
+## Logging
+
+Most user actions (instrument/IPTS/mode selections, scans, admin unlocks,
+debug-config loads, navigation) are appended to
+`/SNS/VENUS/shared/log/rust_ct_reconstruction_<user>.log`, following the
+`<tool>_<user>.log` naming and line format of the other imaging tools that
+log there. Logging is best-effort: the GUI keeps working if the file cannot
+be opened.
+
+A **📜 Log** toggle in the top-right corner opens a resizable side panel
+showing the tail of the log, with a manual **⟳ Refresh** button and an
+**auto** checkbox (on by default, refreshes every 2 s and sticks to the
+bottom).
+
 ## Development
 
 ```bash

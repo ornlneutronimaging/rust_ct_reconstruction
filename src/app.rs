@@ -7,13 +7,18 @@
 use crate::config;
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
+use crate::logger;
 pub use crate::session::{Mode, Session};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How much of the log file the viewer shows, and how often it auto-refreshes.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+const LOG_REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// SHA-256 of the admin password; the plaintext is never stored, the typed
 /// password is hashed and compared.
@@ -78,6 +83,13 @@ pub struct CtApp {
 
     /// Loaded lazily on the first frame (needs the egui context).
     logo: Option<egui::TextureHandle>,
+
+    // Log viewer (right side panel).
+    log_view_open: bool,
+    log_auto_refresh: bool,
+    log_text: String,
+    log_last_read: Option<Instant>,
+    log_error: Option<String>,
 }
 
 impl Default for CtApp {
@@ -105,6 +117,11 @@ impl CtApp {
             debug_info: None,
             debug_error: None,
             logo: None,
+            log_view_open: false,
+            log_auto_refresh: true,
+            log_text: String::new(),
+            log_last_read: None,
+            log_error: None,
         }
     }
 
@@ -117,15 +134,84 @@ impl CtApp {
             .or_insert_with(|| Scan::Running(IptsScan::start(self.instrument)));
         if let Scan::Running(job) = scan {
             match job.try_finish() {
-                Some(Ok(entries)) => *scan = Scan::Done(entries),
-                Some(Err(e)) => *scan = Scan::Failed(e),
+                Some(Ok(entries)) => {
+                    logger::log(format!(
+                        "IPTS scan of {}: {} readable experiments",
+                        self.instrument.root(),
+                        entries.len()
+                    ));
+                    *scan = Scan::Done(entries);
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("IPTS scan failed: {e}"));
+                    *scan = Scan::Failed(e);
+                }
                 None => ctx.request_repaint_after(Duration::from_millis(150)),
             }
         }
     }
 
+    /// The log viewer: a resizable right panel showing the tail of the log
+    /// file, refreshed manually or automatically every couple of seconds.
+    fn log_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.log_view_open {
+            return;
+        }
+        if self.log_auto_refresh {
+            if self
+                .log_last_read
+                .is_none_or(|t| t.elapsed() >= LOG_REFRESH_EVERY)
+            {
+                self.refresh_log();
+            }
+            ctx.request_repaint_after(LOG_REFRESH_EVERY);
+        } else if self.log_last_read.is_none() {
+            self.refresh_log();
+        }
+        egui::Panel::right("log_panel")
+            .resizable(true)
+            .default_size(420.0)
+            .min_size(280.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Application log").strong());
+                    if ui.button("⟳ Refresh").clicked() {
+                        self.refresh_log();
+                    }
+                    ui.checkbox(&mut self.log_auto_refresh, "auto");
+                });
+                ui.label(
+                    RichText::new(logger::log_path().display().to_string())
+                        .weak()
+                        .size(11.0),
+                );
+                ui.separator();
+                if let Some(e) = &self.log_error {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                egui::ScrollArea::both()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&self.log_text).monospace().size(11.0));
+                    });
+            });
+    }
+
+    fn refresh_log(&mut self) {
+        self.log_last_read = Some(Instant::now());
+        match logger::read_tail(LOG_TAIL_BYTES) {
+            Ok(text) => {
+                self.log_text = text;
+                self.log_error = None;
+            }
+            Err(e) => self.log_error = Some(e),
+        }
+    }
+
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
-        show_logo(ui, self.logo.as_ref());
+        top_right_bar(ui, self.logo.as_ref(), &mut self.log_view_open);
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
             ui.label(RichText::new("CT Reconstruction").size(32.0).strong());
@@ -163,6 +249,7 @@ impl CtApp {
                 if ui.add(button).clicked() && !selected {
                     // The IPTS list and selection belong to the previous
                     // instrument — drop them, keep its scan cached.
+                    logger::log(format!("instrument selected: {}", inst.name()));
                     self.instrument = inst;
                     self.selected = None;
                     self.filter.clear();
@@ -253,16 +340,25 @@ impl CtApp {
         });
 
         if let Some(entry) = clicked {
+            logger::log(format!("IPTS selected: {} ({})", entry.name, entry.path.display()));
             self.selected = Some(entry);
             self.manual_error = None;
         }
         if manual_requested {
             match ipts::manual_entry(self.instrument, &self.manual) {
                 Ok(entry) => {
+                    logger::log(format!(
+                        "IPTS selected manually: {} ({})",
+                        entry.name,
+                        entry.path.display()
+                    ));
                     self.selected = Some(entry);
                     self.manual_error = None;
                 }
-                Err(e) => self.manual_error = Some(e),
+                Err(e) => {
+                    logger::error(format!("manual IPTS entry rejected: {e}"));
+                    self.manual_error = Some(e);
+                }
             }
         }
 
@@ -298,7 +394,8 @@ impl CtApp {
                 let button = egui::Button::new(RichText::new(mode.label()).size(26.0).strong())
                     .min_size(egui::vec2(W, H))
                     .selected(self.mode == Some(mode));
-                if ui.add(button).clicked() {
+                if ui.add(button).clicked() && self.mode != Some(mode) {
+                    logger::log(format!("mode selected: {}", mode.label()));
                     self.mode = Some(mode);
                 }
             }
@@ -344,11 +441,19 @@ impl CtApp {
                         self.debug_error = None;
                     }
                     Err(e) => {
+                        logger::error(format!("debug config IPTS rejected: {e}"));
                         self.selected = None;
                         self.debug_error = Some(e);
                     }
                 }
                 self.mode = Some(cfg.mode);
+                logger::log(format!(
+                    "debug mode ON — prefilled from {}: {} / {} / {}",
+                    path.display(),
+                    cfg.instrument.name(),
+                    cfg.ipts,
+                    cfg.mode.label()
+                ));
                 self.debug_info = Some(format!(
                     "{} → {} / {} / {}",
                     path.display(),
@@ -358,6 +463,7 @@ impl CtApp {
                 ));
             }
             Err(e) => {
+                logger::error(format!("debug config load failed: {e}"));
                 self.debug_mode = false;
                 self.debug_info = None;
                 self.debug_error = Some(e);
@@ -366,6 +472,7 @@ impl CtApp {
     }
 
     fn disable_debug(&mut self) {
+        logger::log("debug mode OFF");
         self.debug_info = None;
         self.debug_error = None;
     }
@@ -384,9 +491,11 @@ impl CtApp {
                         edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Unlock").clicked() || entered {
                         if password_matches(&self.admin_password) {
+                            logger::log("admin section unlocked");
                             self.admin_unlocked = true;
                             self.admin_error = None;
                         } else {
+                            logger::error("admin unlock failed (wrong password)");
                             self.admin_error = Some("wrong password".to_owned());
                         }
                         self.admin_password.clear();
@@ -412,6 +521,7 @@ impl CtApp {
                         }
                     }
                     if ui.button("🔒 Lock").clicked() {
+                        logger::log("admin section locked");
                         self.admin_unlocked = false;
                         self.admin_error = None;
                     }
@@ -433,6 +543,7 @@ impl CtApp {
                             dialog = dialog.set_directory(dir);
                         }
                         if let Some(path) = dialog.pick_file() {
+                            logger::log(format!("debug config changed: {}", path.display()));
                             self.config_path = path;
                             // A new file while debug is on takes effect right away.
                             if self.debug_mode {
@@ -452,24 +563,33 @@ impl CtApp {
     }
 }
 
-/// Imaging team logo in the top-right corner of the current row.
-fn show_logo(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
+/// Top-right corner of the current row: the imaging team logo and the toggle
+/// that opens/closes the log viewer side panel.
+fn top_right_bar(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>, log_open: &mut bool) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         if let Some(tex) = logo {
             ui.add(egui::Image::from_texture(tex).max_height(LOGO_MAX_HEIGHT));
+        }
+        if ui.selectable_label(*log_open, "📜 Log").clicked() {
+            *log_open = !*log_open;
         }
     });
 }
 
 /// Placeholder for the per-mode workflow screens; returns `true` when the user
 /// wants to go back to the setup screen.
-fn workflow_ui(ui: &mut egui::Ui, session: &Session, logo: Option<&egui::TextureHandle>) -> bool {
+fn workflow_ui(
+    ui: &mut egui::Ui,
+    session: &Session,
+    logo: Option<&egui::TextureHandle>,
+    log_open: &mut bool,
+) -> bool {
     let mut back = false;
     ui.horizontal(|ui| {
         if ui.button("← Back to setup").clicked() {
             back = true;
         }
-        show_logo(ui, logo);
+        top_right_bar(ui, logo, log_open);
     });
     ui.add_space(12.0);
     ui.vertical_centered(|ui| {
@@ -504,6 +624,7 @@ impl eframe::App for CtApp {
         if self.logo.is_none() {
             self.logo = load_logo(&ctx);
         }
+        self.log_panel(ui, &ctx);
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
             let mut next = false;
@@ -514,6 +635,12 @@ impl eframe::App for CtApp {
                 next = self.setup_ui(ui);
             });
             if next && let (Some(mode), Some(ipts)) = (self.mode, self.selected.clone()) {
+                logger::log(format!(
+                    "next → {} workflow: {} / {}",
+                    mode.label(),
+                    self.instrument.name(),
+                    ipts.name
+                ));
                 self.screen = Screen::Workflow(Session {
                     instrument: self.instrument,
                     ipts,
@@ -524,10 +651,11 @@ impl eframe::App for CtApp {
             let mut back = false;
             egui::CentralPanel::default().show(ui, |ui| {
                 if let Screen::Workflow(session) = &self.screen {
-                    back = workflow_ui(ui, session, self.logo.as_ref());
+                    back = workflow_ui(ui, session, self.logo.as_ref(), &mut self.log_view_open);
                 }
             });
             if back {
+                logger::log("returned to setup screen");
                 self.screen = Screen::Setup;
             }
         }

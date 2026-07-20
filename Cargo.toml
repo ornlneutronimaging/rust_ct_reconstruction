@@ -5,6 +5,7 @@ edition = "2024"
 description = "GUI for neutron CT reconstruction on VENUS and MARS (white beam and TOF workflows)"
 
 [dependencies]
+chrono = "0.4"
 eframe = "0.35"
 egui = "0.35"
 hdf5-metno = "0.10"

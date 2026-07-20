@@ -29,6 +29,11 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    if let Err(e) = ct_reconstruction::logger::init() {
+        // The GUI stays usable without logging; the log viewer explains why.
+        eprintln!("Warning: logging disabled: {e}");
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
