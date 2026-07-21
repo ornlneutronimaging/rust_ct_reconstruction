@@ -14,6 +14,7 @@ use crate::crop::{CropJob, CropRect};
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
+use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
@@ -96,6 +97,15 @@ struct StackView {
     /// Histograms of the summed images: key (stack, is_ob, bins, range
     /// fingerprint — 0 for the data's own min/max).
     hist_cache: Vec<((usize, bool, usize, u64), (f64, f64, Vec<u64>))>,
+
+    // Normalization (mandatory).
+    norm_settings: NormSettings,
+    roi_job: Option<RoiJob>,
+    norm_job: Option<NormJob>,
+    normalized: bool,
+    norm_summary: Option<String>,
+    norm_error: Option<String>,
+    visualize_job: Option<VisualizeJob>,
 }
 
 impl StackView {
@@ -115,6 +125,13 @@ impl StackView {
             sum_cache: Vec::new(),
             sum_jobs: Vec::new(),
             hist_cache: Vec::new(),
+            norm_settings: NormSettings::default(),
+            roi_job: None,
+            norm_job: None,
+            normalized: false,
+            norm_summary: None,
+            norm_error: None,
+            visualize_job: None,
         }
     }
 
@@ -1491,8 +1508,9 @@ fn stack_ui(
                 .size(15.0)
                 .strong(),
         );
-        let busy = view.crop_job.is_some() || view.clean_job.is_some();
-        let touched = view.crop.is_some() || view.clean_stats.is_some();
+        let busy =
+            view.crop_job.is_some() || view.clean_job.is_some() || view.norm_job.is_some();
+        let touched = view.crop.is_some() || view.clean_stats.is_some() || view.normalized;
         if ui
             .add_enabled(!busy && touched, egui::Button::new("🔄 Reset to the loaded data"))
             .on_hover_text(
@@ -1510,6 +1528,10 @@ fn stack_ui(
             view.sum_cache.clear();
             view.sum_jobs.clear();
             view.hist_cache.clear();
+            view.normalized = false;
+            view.norm_summary = None;
+            view.norm_error = None;
+            view.norm_settings.roi = None;
         }
         top_right_bar(ui, logo, log_open, 28.0);
     });
@@ -1556,6 +1578,12 @@ fn stack_ui(
         .default_open(true)
         .show(ui, |ui| {
             clean_section_ui(ui, view);
+        });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Normalization (mandatory)").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            normalization_section_ui(ui, view);
         });
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
@@ -1882,6 +1910,196 @@ fn stack_histogram_ui(
         });
 }
 
+/// Normalization — the mandatory step: NeuNorm division by the (mean) open
+/// beam, with an optional shared ROI powering the beam-fluctuation
+/// correction and/or the sample-ROI median anchor.
+fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    // Fold finished background work into the view.
+    if let Some(job) = &mut view.roi_job {
+        match job.poll() {
+            Some(Ok(Some(rect))) => {
+                logger::log(format!(
+                    "normalization ROI selected: x={}, y={}, {}x{}",
+                    rect.x, rect.y, rect.width, rect.height
+                ));
+                view.norm_settings.roi = Some(rect);
+                view.norm_error = None;
+                view.roi_job = None;
+            }
+            Some(Ok(None)) => {
+                logger::log("ROI selector closed without saving a selection");
+                view.roi_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("ROI selection failed: {e}"));
+                view.norm_error = Some(e);
+                view.roi_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        "ROI selector is open — draw a region AWAY from the sample and \
+                         press its save/return button",
+                    );
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+    if let Some(job) = &mut view.norm_job {
+        match job.poll() {
+            Some(Ok((normalized, summary))) => {
+                logger::log(format!("normalization done: {summary}"));
+                view.stack = std::sync::Arc::new(normalized);
+                view.normalized = true;
+                view.norm_summary = Some(summary);
+                view.norm_error = None;
+                view.norm_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("normalization failed: {e}"));
+                view.norm_error = Some(e);
+                view.norm_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("NeuNorm is running…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+
+    if view.stack.ob.is_empty() && !view.normalized {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            "this stack has no open beam — normalization cannot run",
+        );
+        return;
+    }
+    if view.normalized {
+        if let Some(summary) = &view.norm_summary {
+            ui.label(
+                RichText::new(format!("normalized ✔ — {summary}"))
+                    .color(Color32::from_rgb(120, 200, 120)),
+            );
+        }
+        // Visualize the normalized data in the sibling TIFF viewer.
+        if let Some(job) = &mut view.visualize_job {
+            match job.poll() {
+                Some(Ok(())) => {
+                    logger::log("normalized-data viewer closed");
+                    view.visualize_job = None;
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("visualizing the normalized data failed: {e}"));
+                    view.norm_error = Some(e);
+                    view.visualize_job = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("TIFF viewer is open on the normalized images");
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+        if view.visualize_job.is_none()
+            && ui
+                .button("👁 Visualize the normalized data")
+                .on_hover_text(
+                    "opens the stack in rust_tiff_viewer, on the single-image view",
+                )
+                .clicked()
+        {
+            logger::log("opening the TIFF viewer on the normalized stack (single-image view)");
+            view.norm_error = None;
+            view.visualize_job = Some(VisualizeJob::start(std::sync::Arc::clone(&view.stack)));
+        }
+        ui.label(
+            RichText::new("use the Reset button in the header to normalize differently")
+                .weak()
+                .size(11.0),
+        );
+        if let Some(e) = &view.norm_error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        return;
+    }
+
+    ui.checkbox(
+        &mut view.norm_settings.beam_fluctuation,
+        "Use beam fluctuation correction (ROI)",
+    )
+    .on_hover_text(
+        "each sample and OB image is divided by the mean of its own ROI before the \
+         division — corrects the beam intensity varying between projections",
+    );
+
+    if view.norm_settings.needs_roi() {
+        ui.horizontal(|ui| {
+            let label = if view.norm_settings.roi.is_some() {
+                "🎯 Reselect the ROI…"
+            } else {
+                "🎯 Select the ROI…"
+            };
+            if ui.button(label).clicked() {
+                logger::log("opening the ROI selector on the integrated sample image");
+                view.norm_error = None;
+                view.roi_job = Some(RoiJob::start(std::sync::Arc::clone(&view.stack)));
+            }
+            match &view.norm_settings.roi {
+                Some(roi) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "ROI: x={}, y={}, {}x{}",
+                            roi.x, roi.y, roi.width, roi.height
+                        ))
+                        .strong(),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("select a region away from the sample (clear at every angle)")
+                            .weak(),
+                    );
+                }
+            }
+        });
+    }
+
+    let missing_roi = view.norm_settings.needs_roi() && view.norm_settings.roi.is_none();
+    let ready = !missing_roi && view.norm_job.is_none() && view.roi_job.is_none();
+    if ui
+        .add_enabled(ready, egui::Button::new("▶ Normalize (NeuNorm)"))
+        .clicked()
+    {
+        logger::log(format!(
+            "normalizing {} projections with {} ob image(s): {}",
+            view.stack.sample.len(),
+            view.stack.ob.len(),
+            view.norm_settings.describe()
+        ));
+        view.norm_error = None;
+        view.norm_job = Some(NormJob::start(
+            std::sync::Arc::clone(&view.stack),
+            view.norm_settings.clone(),
+        ));
+    }
+    if missing_roi {
+        ui.label(RichText::new("the checked corrections need a ROI first").weak());
+    }
+    if let Some(e) = &view.norm_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
 /// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
 /// handed over, and the returned region is applied to the sample AND the
 /// open beams.
@@ -1903,13 +2121,16 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.crop = Some(rect);
                 view.crop_error = None;
                 view.crop_job = None;
-                // Cleaning (and its previews) applied to the previous crop
-                // are void — the next run starts from this new crop.
+                // Cleaning and normalization applied to the previous crop
+                // are void — and the ROI coordinates no longer match.
                 view.uncleaned = None;
                 view.clean_stats = None;
                 view.sum_cache.clear();
                 view.sum_jobs.clear();
                 view.hist_cache.clear();
+                view.normalized = false;
+                view.norm_summary = None;
+                view.norm_settings.roi = None;
             }
             Some(Ok(None)) => {
                 logger::log("crop tool closed without saving a region");

@@ -12,6 +12,7 @@ pub mod crop;
 pub mod instrument;
 pub mod ipts;
 pub mod logger;
+pub mod normalize;
 pub mod session;
 pub mod tof;
 pub mod white_beam;

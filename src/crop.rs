@@ -50,28 +50,25 @@ pub fn subsample_indices(n: usize, fraction: f64, seed: u64) -> Vec<usize> {
     picked
 }
 
-/// Write projections as a NumPy `.npy` file (version 1.0 header, float32
-/// little-endian, shape `(n, height, width)`) — the 3-D-stack input form of
-/// the crop tool.
-pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String> {
+/// Write an f32 array of any shape as a NumPy `.npy` file (version 1.0
+/// header, float32 little-endian, C order). `planes` supplies the data in
+/// chunks (e.g. one projection at a time).
+pub fn write_npy<'a>(
+    path: &Path,
+    shape: &[usize],
+    planes: impl Iterator<Item = &'a [f32]>,
+) -> Result<(), String> {
     use std::io::Write;
-    let first = stack
-        .first()
-        .ok_or("cannot write an empty stack to .npy")?;
-    let (h, w) = (first.height, first.width);
-    if let Some(bad) = stack.iter().find(|p| (p.height, p.width) != (h, w)) {
-        return Err(format!(
-            "cannot write stack: {} is {}x{} while the first projection is {h}x{w}",
-            bad.name, bad.height, bad.width
-        ));
-    }
     let file =
         std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     let mut out = std::io::BufWriter::new(file);
-    let dict = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {h}, {w}), }}",
-        stack.len()
-    );
+    let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+    let shape_txt = if dims.len() == 1 {
+        format!("({},)", dims[0])
+    } else {
+        format!("({})", dims.join(", "))
+    };
+    let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_txt}, }}");
     // Header (magic + version + length + dict) padded to a multiple of 64
     // bytes, ending with a newline.
     let unpadded = 10 + dict.len() + 1;
@@ -86,18 +83,125 @@ pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String>
     write(dict.as_bytes())?;
     write(&vec![b' '; padding])?;
     write(b"\n")?;
-    let mut buffer = Vec::with_capacity(w * 4);
-    for projection in stack {
-        for row in projection.mean.chunks(w) {
-            buffer.clear();
-            for value in row {
-                buffer.extend_from_slice(&value.to_le_bytes());
-            }
-            write(&buffer)?;
+    let mut total = 0usize;
+    let mut buffer = Vec::new();
+    for plane in planes {
+        buffer.clear();
+        for value in plane {
+            buffer.extend_from_slice(&value.to_le_bytes());
         }
+        write(&buffer)?;
+        total += plane.len();
+    }
+    let expected: usize = shape.iter().product();
+    if total != expected {
+        return Err(format!(
+            "internal: wrote {total} values for shape {shape:?} ({expected})"
+        ));
     }
     out.flush()
         .map_err(|e| format!("flush {}: {e}", path.display()))
+}
+
+/// Write projections as a NumPy `.npy` file, shape `(n, height, width)` —
+/// the 3-D-stack input form of the crop tool.
+pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String> {
+    let first = stack
+        .first()
+        .ok_or("cannot write an empty stack to .npy")?;
+    let (h, w) = (first.height, first.width);
+    if let Some(bad) = stack.iter().find(|p| (p.height, p.width) != (h, w)) {
+        return Err(format!(
+            "cannot write stack: {} is {}x{} while the first projection is {h}x{w}",
+            bad.name, bad.height, bad.width
+        ));
+    }
+    write_npy(
+        path,
+        &[stack.len(), h, w],
+        stack.iter().map(|p| p.mean.as_slice()),
+    )
+}
+
+/// Read a `.npy` file into `(shape, f32 values)`. Supports the common
+/// little-endian numeric dtypes and C-order arrays (npy format 1.0/2.0).
+pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let bad = |what: &str| format!("{}: {what}", path.display());
+    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
+        return Err(bad("not a .npy file"));
+    }
+    let (header_start, header_len) = match bytes[6] {
+        1 => (10, u16::from_le_bytes([bytes[8], bytes[9]]) as usize),
+        2 => (
+            12,
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
+        ),
+        v => return Err(bad(&format!("unsupported .npy version {v}"))),
+    };
+    let header = String::from_utf8_lossy(
+        bytes
+            .get(header_start..header_start + header_len)
+            .ok_or_else(|| bad("truncated header"))?,
+    )
+    .into_owned();
+    let field = |key: &str| -> Option<String> {
+        let at = header.find(key)? + key.len();
+        let rest = header[at..].trim_start().trim_start_matches(':').trim_start();
+        Some(rest.to_owned())
+    };
+    let descr = field("'descr'")
+        .and_then(|r| {
+            let r = r.trim_start_matches(['\'', '"']);
+            r.split(['\'', '"']).next().map(str::to_owned)
+        })
+        .ok_or_else(|| bad("no descr in header"))?;
+    if field("'fortran_order'").is_some_and(|r| r.starts_with("True")) {
+        return Err(bad("fortran-order arrays are not supported"));
+    }
+    let shape_txt = field("'shape'").ok_or_else(|| bad("no shape in header"))?;
+    let inner = shape_txt
+        .trim_start_matches('(')
+        .split(')')
+        .next()
+        .unwrap_or_default();
+    let shape: Vec<usize> = inner
+        .split(',')
+        .filter_map(|t| {
+            let t = t.trim();
+            (!t.is_empty()).then(|| t.parse().ok()).flatten()
+        })
+        .collect();
+    let count: usize = shape.iter().product();
+    let data = &bytes[header_start + header_len..];
+    fn convert<const N: usize>(
+        data: &[u8],
+        count: usize,
+        f: impl Fn([u8; N]) -> f32,
+    ) -> Option<Vec<f32>> {
+        (data.len() >= count * N).then(|| {
+            data.chunks_exact(N)
+                .take(count)
+                .map(|c| f(c.try_into().expect("chunk size")))
+                .collect()
+        })
+    }
+    let values = match descr.as_str() {
+        "<f4" => convert::<4>(data, count, f32::from_le_bytes),
+        "<f8" => convert::<8>(data, count, |b| f64::from_le_bytes(b) as f32),
+        "|u1" | "<u1" => convert::<1>(data, count, |b| b[0] as f32),
+        "|i1" | "<i1" => convert::<1>(data, count, |b| b[0] as i8 as f32),
+        "<u2" => convert::<2>(data, count, |b| u16::from_le_bytes(b) as f32),
+        "<i2" => convert::<2>(data, count, |b| i16::from_le_bytes(b) as f32),
+        "<u4" => convert::<4>(data, count, |b| u32::from_le_bytes(b) as f32),
+        "<i4" => convert::<4>(data, count, |b| i32::from_le_bytes(b) as f32),
+        "<u8" => convert::<8>(data, count, |b| u64::from_le_bytes(b) as f32),
+        "<i8" => convert::<8>(data, count, |b| i64::from_le_bytes(b) as f32),
+        other => return Err(bad(&format!("unsupported dtype '{other}'"))),
+    };
+    values
+        .map(|v| (shape, v))
+        .ok_or_else(|| bad("data shorter than the header's shape"))
 }
 
 fn crop_projection(p: &Projection, rect: &CropRect) -> Result<Projection, String> {
