@@ -79,6 +79,7 @@ enum StackSection {
     Clean,
     Normalize,
     Rotate,
+    Sinogram,
 }
 
 struct StackView {
@@ -132,6 +133,12 @@ struct StackView {
     rot_frame: usize,
     /// Preview texture, keyed by (baseline, frame, quarters).
     rot_tex: Option<((usize, usize, usize), egui::TextureHandle)>,
+
+    // Sinogram view (after normalization).
+    /// Detector row (slice) whose sinogram is shown.
+    sino_row: usize,
+    /// Sinogram texture, keyed by (stack, row).
+    sino_tex: Option<((usize, usize), egui::TextureHandle)>,
 }
 
 impl StackView {
@@ -165,6 +172,8 @@ impl StackView {
             rotate_job: None,
             rot_frame: 0,
             rot_tex: None,
+            sino_row: 0,
+            sino_tex: None,
         }
     }
 
@@ -1639,6 +1648,9 @@ fn stack_ui(
         section(ui, view, StackSection::Rotate, "Rotate the data", &mut |ui, view| {
             rotation_section_ui(ui, view);
         });
+        section(ui, view, StackSection::Sinogram, "Sinogram", &mut |ui, view| {
+            sinogram_section_ui(ui, view);
+        });
     }
     if let Some(which) = clicked {
         view.open_section = if view.open_section == Some(which) {
@@ -2302,6 +2314,82 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             RichText::new("the preview matches what the stack currently is")
                 .weak()
                 .size(11.0),
+        );
+    }
+}
+
+/// The sinogram of one detector row of the current (normalized, possibly
+/// rotated) stack: one line per projection, in stack order (increasing
+/// angle), against the detector column.
+fn sinogram_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let stack = std::sync::Arc::clone(&view.stack);
+    let Some(first) = stack.sample.first() else {
+        return;
+    };
+    let (w, h, n) = (first.width, first.height, stack.sample.len());
+    if stack.sample.iter().any(|p| (p.width, p.height) != (w, h)) {
+        ui.colored_label(Color32::LIGHT_RED, "projections have inconsistent sizes");
+        return;
+    }
+
+    view.sino_row = view.sino_row.min(h - 1);
+    ui.horizontal(|ui| {
+        ui.add(egui::Slider::new(&mut view.sino_row, 0..=h - 1).text("slice (row)"));
+        ui.label(
+            RichText::new(format!("{n} projections × {w} columns"))
+                .weak()
+                .size(11.0),
+        );
+    });
+
+    let key = (std::sync::Arc::as_ptr(&stack) as usize, view.sino_row);
+    if view.sino_tex.as_ref().map(|(k, _)| *k) != Some(key) {
+        // One sinogram line per projection at the chosen row, columns
+        // stride-sampled so wide CCD frames stay a reasonable texture.
+        let stride = (w / 1024).max(1);
+        let sino_w = w.div_ceil(stride);
+        let mut values = Vec::with_capacity(n * sino_w);
+        for p in &stack.sample {
+            let row = &p.mean[view.sino_row * w..(view.sino_row + 1) * w];
+            for x in (0..w).step_by(stride) {
+                values.push(row[x]);
+            }
+        }
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for v in &values {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let span = (hi - lo).max(1e-6);
+        let pixels: Vec<Color32> = values
+            .iter()
+            .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+            .collect();
+        let image = egui::ColorImage {
+            size: [sino_w, n],
+            source_size: egui::vec2(sino_w as f32, n as f32),
+            pixels,
+        };
+        // Nearest-neighbor so individual projection rows stay crisp when the
+        // sinogram is stretched vertically (few projections).
+        let tex = ui
+            .ctx()
+            .load_texture("sinogram", image, egui::TextureOptions::NEAREST);
+        view.sino_tex = Some((key, tex));
+    }
+    if let Some((_, tex)) = &view.sino_tex {
+        let size = tex.size_vec2();
+        let width = (ui.available_width() - 16.0).clamp(400.0, 950.0).min(size.x * 4.0);
+        // Stretch small projection counts so every row stays readable.
+        let height = (size.y * 4.0).clamp(350.0, 620.0);
+        ui.add(egui::Image::from_texture(tex).fit_to_exact_size(egui::vec2(width, height)));
+        ui.label(
+            RichText::new(
+                "columns: detector x at the selected row — rows: projections, top to \
+                 bottom in increasing angle",
+            )
+            .weak()
+            .size(11.0),
         );
     }
 }
