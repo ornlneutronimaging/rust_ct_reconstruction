@@ -16,7 +16,7 @@ use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
     RunInfo, ViewerJob,
 };
-use crate::white_beam::{self, AngleSource, WbDetector};
+use crate::white_beam::{self, AngleSource, MetaAnglesScan, WbDetector};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -89,6 +89,26 @@ struct WhiteBeamView {
     ascii_error: Option<String>,
     /// Result of the metadata "test on first image" button.
     metadata_test: Option<Result<f64, String>>,
+
+    // Data to use.
+    use_percentage: bool,
+    /// 1–100, meaningful when `use_percentage` (same 50% default as the
+    /// Python pipeline).
+    percentage: u8,
+    meta_job: Option<MetaAnglesScan>,
+    /// Metadata angles cached per selection: (file count, first file) key.
+    meta_angles: Option<(usize, Option<PathBuf>, Vec<Result<f64, String>>)>,
+}
+
+/// The projection angles of the current sample selection, per the chosen
+/// retrieval method.
+enum AngleData {
+    /// Usable angles (in [0, 360)) and how many files yielded none.
+    Ready(Vec<f64>, usize),
+    /// Metadata read in progress: message to show next to the spinner.
+    Pending(String),
+    /// Not available yet: what the user still has to do.
+    Invalid(String),
 }
 
 impl WhiteBeamView {
@@ -125,6 +145,10 @@ impl WhiteBeamView {
             ascii_angles: None,
             ascii_error: None,
             metadata_test: None,
+            use_percentage: false,
+            percentage: 50,
+            meta_job: None,
+            meta_angles: None,
         }
     }
 
@@ -1238,6 +1262,234 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         .show(ui, |ui| {
             angle_source_ui(ui, view);
         });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Data to use").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            data_to_use_ui(ui, view);
+        });
+}
+
+/// The projection angles of every sample image per the chosen method —
+/// computed on the fly for the naming convention and the ASCII list, read on
+/// a background thread (and cached per selection) for the metadata.
+fn collect_angles(view: &mut WhiteBeamView, ctx: &egui::Context) -> AngleData {
+    let files: Vec<PathBuf> = view
+        .sample
+        .selected
+        .iter()
+        .flat_map(|(_, files)| files.iter().cloned())
+        .collect();
+    if files.is_empty() {
+        return AngleData::Invalid("select the sample folder(s) first".to_owned());
+    }
+    match view.angle_source {
+        AngleSource::NamingConvention => {
+            let picked: Vec<usize> = view
+                .nc_checked
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c)
+                .map(|(i, _)| i)
+                .collect();
+            let [i, j] = picked.as_slice() else {
+                return AngleData::Invalid(
+                    "set up the naming convention above (2 fields) first".to_owned(),
+                );
+            };
+            let mut angles = Vec::with_capacity(files.len());
+            let mut failed = 0;
+            for file in &files {
+                match white_beam::angle_from_fields(file, *i, *j) {
+                    Some(a) => angles.push(a.rem_euclid(360.0)),
+                    None => failed += 1,
+                }
+            }
+            if angles.is_empty() {
+                AngleData::Invalid("no file name yields an angle with those fields".to_owned())
+            } else {
+                AngleData::Ready(angles, failed)
+            }
+        }
+        AngleSource::AsciiFile => match &view.ascii_angles {
+            None => AngleData::Invalid("import the list of angles above first".to_owned()),
+            Some(angles) if angles.len() == files.len() => {
+                AngleData::Ready(angles.clone(), 0)
+            }
+            Some(angles) => AngleData::Invalid(format!(
+                "{} angles for {} images — fix the ASCII list first",
+                angles.len(),
+                files.len()
+            )),
+        },
+        AngleSource::Metadata => {
+            let key = (files.len(), files.first().cloned());
+            if let Some((n, first, results)) = &view.meta_angles
+                && (*n, first.clone()) == key
+            {
+                let angles: Vec<f64> = results
+                    .iter()
+                    .filter_map(|r| r.as_ref().ok())
+                    .map(|a| a.rem_euclid(360.0))
+                    .collect();
+                let failed = results.len() - angles.len();
+                return if angles.is_empty() {
+                    AngleData::Invalid("no image carries a metadata angle".to_owned())
+                } else {
+                    AngleData::Ready(angles, failed)
+                };
+            }
+            match &mut view.meta_job {
+                Some(job) => {
+                    if let Some(results) = job.poll() {
+                        for e in results.iter().filter_map(|r| r.as_ref().err()).take(3) {
+                            logger::error(format!("metadata angle: {e}"));
+                        }
+                        logger::log(format!(
+                            "metadata angles read: {}/{} images",
+                            results.iter().filter(|r| r.is_ok()).count(),
+                            results.len()
+                        ));
+                        view.meta_angles = Some((key.0, key.1.clone(), results));
+                        view.meta_job = None;
+                        ctx.request_repaint();
+                        AngleData::Pending("finalizing…".to_owned())
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                        AngleData::Pending(format!(
+                            "reading metadata angles… {}/{}",
+                            job.done(),
+                            job.total
+                        ))
+                    }
+                }
+                None => {
+                    logger::log(format!(
+                        "reading metadata angles of {} sample images…",
+                        files.len()
+                    ));
+                    view.meta_job = Some(MetaAnglesScan::start(files));
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                    AngleData::Pending("reading metadata angles…".to_owned())
+                }
+            }
+        }
+    }
+}
+
+/// Use everything, or down-select to a percentage with the coverage-first
+/// sampling (0° and 180° always kept), previewed on a polar plot.
+fn data_to_use_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
+    let ctx = ui.ctx().clone();
+    let mut use_percentage = view.use_percentage;
+    ui.radio_value(&mut use_percentage, false, "use all projections");
+    ui.radio_value(&mut use_percentage, true, "use percentage of the projections");
+    if use_percentage != view.use_percentage {
+        logger::log(if use_percentage {
+            format!("data to use: {}% of the projections", view.percentage)
+        } else {
+            "data to use: all projections".to_owned()
+        });
+        view.use_percentage = use_percentage;
+    }
+    if view.use_percentage {
+        let response = ui.add(
+            egui::Slider::new(&mut view.percentage, 1..=100)
+                .suffix("%")
+                .text("of the projections"),
+        );
+        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+            logger::log(format!("data to use: {}% of the projections", view.percentage));
+        }
+    }
+    ui.add_space(6.0);
+
+    match collect_angles(view, &ctx) {
+        AngleData::Invalid(msg) => {
+            ui.label(RichText::new(msg).weak());
+        }
+        AngleData::Pending(msg) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(msg);
+            });
+        }
+        AngleData::Ready(angles, failed) => {
+            if failed > 0 {
+                ui.colored_label(
+                    Color32::from_rgb(240, 180, 60),
+                    format!("{failed} image(s) without an angle value are ignored"),
+                );
+            }
+            if !view.use_percentage {
+                ui.label(
+                    RichText::new(format!("using all {} projections", angles.len())).strong(),
+                );
+                return;
+            }
+            let n = ((view.percentage as f64 / 100.0) * angles.len() as f64).round() as usize;
+            let n = n.max(5.min(angles.len()));
+            let used: Vec<f64> = white_beam::select_coverage(&angles, n)
+                .iter()
+                .map(|&i| angles[i])
+                .collect();
+            ui.label(
+                RichText::new(format!(
+                    "using {} of {} projections",
+                    used.len(),
+                    angles.len()
+                ))
+                .strong(),
+            );
+            ui.label(
+                RichText::new("coverage-first selection — 0° and 180° are always kept")
+                    .weak()
+                    .size(12.0),
+            );
+            polar_plot(ui, &angles, &used);
+        }
+    }
+}
+
+/// All angles (small, blue) and the ones that will be used (larger, green)
+/// at a fixed radius on a polar view — the coverage at a glance.
+fn polar_plot(ui: &mut egui::Ui, all: &[f64], used: &[f64]) {
+    use egui::{Align2, FontId, Pos2, Sense, Stroke, vec2};
+    const SIZE: f32 = 250.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(SIZE, SIZE), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = SIZE / 2.0 - 18.0;
+    let pos_at = |deg: f64, r: f32| {
+        let rad = deg.to_radians();
+        Pos2::new(
+            center.x + r * rad.cos() as f32,
+            center.y - r * rad.sin() as f32,
+        )
+    };
+    painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::from_gray(90)));
+    for deg in [0.0, 90.0, 180.0, 270.0] {
+        painter.line_segment(
+            [center, pos_at(deg, radius)],
+            Stroke::new(0.5, Color32::from_gray(60)),
+        );
+        painter.text(
+            pos_at(deg, radius + 11.0),
+            Align2::CENTER_CENTER,
+            format!("{deg:.0}°"),
+            FontId::proportional(10.0),
+            Color32::from_gray(160),
+        );
+    }
+    for &a in all {
+        painter.circle_filled(pos_at(a, radius * 0.8), 2.5, Color32::from_rgb(100, 170, 255));
+    }
+    for &a in used {
+        painter.circle_filled(pos_at(a, radius * 0.8), 4.0, Color32::from_rgb(120, 200, 120));
+    }
 }
 
 /// How the projection angle of each image is obtained: naming convention

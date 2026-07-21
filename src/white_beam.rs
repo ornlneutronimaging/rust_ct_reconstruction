@@ -7,6 +7,7 @@
 //! name, e.g. `20260604_Run_21775_Trex_CT_300_000s_2_800AngsMin_Ang_000_000_1.tiff`.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, channel};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WbDetector {
@@ -189,6 +190,109 @@ pub fn angles_from_ascii(path: &Path) -> Result<Vec<f64>, String> {
     Ok(angles)
 }
 
+/// Shortest angular distance between two angles on a circle of
+/// `max_coverage` degrees (360 for a full turn, 180 for a half turn).
+fn angular_distance(a: f64, b: f64, max_coverage: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(max_coverage - d)
+}
+
+/// Pick `n` projections maximizing angular coverage — the farthest-point
+/// sampling of the Python pipeline (start from the lowest angle, greedily add
+/// the candidate farthest from everything selected; wraparound at 180° or
+/// 360° depending on the data) — with the angles closest to 0° and 180°
+/// always kept. Returns indices into `angles`, sorted by angle.
+pub fn select_coverage(angles: &[f64], n: usize) -> Vec<usize> {
+    if angles.is_empty() {
+        return Vec::new();
+    }
+    let n = n.clamp(1, angles.len());
+    let mut order: Vec<usize> = (0..angles.len()).collect();
+    order.sort_by(|&a, &b| angles[a].total_cmp(&angles[b]));
+    if n >= angles.len() {
+        return order;
+    }
+    let max_coverage = if angles.iter().cloned().fold(f64::MIN, f64::max) > 180.0 {
+        360.0
+    } else {
+        180.0
+    };
+
+    // Farthest-point sampling over the sorted angles, seeded with the lowest
+    // one (the angle closest to 0°).
+    let mut selected: Vec<usize> = vec![order[0]];
+    let mut unselected: Vec<usize> = order[1..].to_vec();
+    while selected.len() < n && !unselected.is_empty() {
+        let (pos, _) = unselected
+            .iter()
+            .enumerate()
+            .map(|(pos, &candidate)| {
+                let min_dist = selected
+                    .iter()
+                    .map(|&sel| angular_distance(angles[candidate], angles[sel], max_coverage))
+                    .fold(f64::MAX, f64::min)
+                    // Tie-break on the raw distance to keep the result stable.
+                    - angles[candidate] * 1e-12;
+                (pos, min_dist)
+            })
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("unselected is not empty");
+        selected.push(unselected.swap_remove(pos));
+    }
+
+    // 180° must always survive the down-selection (0° is the seed).
+    if let Some(&at_180) = order
+        .iter()
+        .min_by(|&&a, &&b| (angles[a] - 180.0).abs().total_cmp(&(angles[b] - 180.0).abs()))
+        && !selected.contains(&at_180)
+    {
+        selected.push(at_180);
+    }
+    selected.sort_by(|&a, &b| angles[a].total_cmp(&angles[b]));
+    selected
+}
+
+/// Reading the metadata angle of every sample image on a background thread
+/// (one TIFF header per file on the network filesystem).
+pub struct MetaAnglesScan {
+    rx: Receiver<Vec<Result<f64, String>>>,
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub total: usize,
+}
+
+impl MetaAnglesScan {
+    pub fn start(files: Vec<PathBuf>) -> Self {
+        let (tx, rx) = channel();
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_progress = std::sync::Arc::clone(&progress);
+        let total = files.len();
+        std::thread::spawn(move || {
+            let results: Vec<Result<f64, String>> = files
+                .iter()
+                .map(|f| {
+                    let r = angle_from_tiff_metadata(f);
+                    thread_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    r
+                })
+                .collect();
+            let _ = tx.send(results);
+        });
+        Self {
+            rx,
+            progress,
+            total,
+        }
+    }
+
+    pub fn done(&self) -> usize {
+        self.progress.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn poll(&mut self) -> Option<Vec<Result<f64, String>>> {
+        self.rx.try_recv().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +337,24 @@ mod tests {
         let (i, j) = default_angle_fields(fields.len()).unwrap();
         assert_eq!(angle_from_fields(rev, i, j), Some(45.03));
         assert_eq!(default_angle_fields(2), None);
+    }
+
+    #[test]
+    fn coverage_selection_keeps_0_and_180() {
+        let angles: Vec<f64> = (0..181).map(|i| i as f64).collect();
+        let picked = select_coverage(&angles, 10);
+        let values: Vec<f64> = picked.iter().map(|&i| angles[i]).collect();
+        assert!(values.contains(&0.0));
+        assert!(values.contains(&180.0));
+        assert!(picked.len() >= 10);
+        // Sorted by angle, decent spread: no two picks closer than ~5°.
+        for pair in values.windows(2) {
+            assert!(pair[1] > pair[0]);
+            assert!(pair[1] - pair[0] >= 5.0, "{values:?}");
+        }
+        // Asking for everything returns everything.
+        assert_eq!(select_coverage(&angles, 500).len(), angles.len());
+        assert!(select_coverage(&[], 5).is_empty());
     }
 
     #[test]
