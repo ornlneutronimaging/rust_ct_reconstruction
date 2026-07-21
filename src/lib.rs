@@ -12,3 +12,4 @@ pub mod ipts;
 pub mod logger;
 pub mod session;
 pub mod tof;
+pub mod white_beam;

@@ -16,6 +16,7 @@ use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
     RunInfo, ViewerJob,
 };
+use crate::white_beam::WbDetector;
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -64,8 +65,47 @@ enum Screen {
 
 /// Mode-specific state and UI of the workflow screen.
 enum WorkflowView {
-    WhiteBeam,
+    WhiteBeam(WhiteBeamView),
     Tof(TofView),
+}
+
+/// The white-beam workflow: the CCD detector drives where the sample and
+/// open-beam folders are looked for; a sample folder holds one image per
+/// projection.
+struct WhiteBeamView {
+    detector: WbDetector,
+    sample: FolderPick,
+    ob: FolderPick,
+}
+
+impl WhiteBeamView {
+    fn new(session: &Session) -> Self {
+        Self::with_detector(WbDetector::IkonXl, session)
+    }
+
+    fn with_detector(detector: WbDetector, session: &Session) -> Self {
+        let sample = FolderPick::new("sample", detector.ct_root(&session.ipts.path));
+        let ob = FolderPick::new("open beam", detector.ob_root(&session.ipts.path));
+        logger::log(format!(
+            "white beam detector: {} — sample root {} ({}), OB root {} ({})",
+            detector.label(),
+            sample.root.display(),
+            match &sample.candidates {
+                Ok(dirs) => format!("{} folders", dirs.len()),
+                Err(_) => "unreadable".to_owned(),
+            },
+            ob.root.display(),
+            match &ob.candidates {
+                Ok(dirs) => format!("{} folders", dirs.len()),
+                Err(_) => "unreadable".to_owned(),
+            },
+        ));
+        Self {
+            detector,
+            sample,
+            ob,
+        }
+    }
 }
 
 /// The TOF workflow: detector choice drives where the sample and open-beam
@@ -962,15 +1002,11 @@ fn workflow_ui(
     });
     ui.add_space(6.0);
     match view {
-        WorkflowView::WhiteBeam => {
-            ui.vertical_centered(|ui| {
-                ui.add_space(24.0);
-                ui.label(
-                    RichText::new("The White Beam workflow is not implemented yet.")
-                        .weak()
-                        .size(16.0),
-                );
-            });
+        WorkflowView::WhiteBeam(wb_view) => {
+            egui::ScrollArea::vertical()
+                .id_salt("wb_workflow_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| white_beam_ui(ui, session, wb_view));
         }
         WorkflowView::Tof(tof_view) => {
             egui::ScrollArea::vertical()
@@ -980,6 +1016,43 @@ fn workflow_ui(
         }
     }
     back
+}
+
+fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
+    let ctx = ui.ctx().clone();
+    view.sample.poll(&ctx);
+    view.ob.poll(&ctx);
+
+    // Detector — it decides where the sample and OB folders are looked for,
+    // so changing it rebuilds both pickers.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Detector:").strong());
+        let mut detector = view.detector;
+        egui::ComboBox::from_id_salt("wb_detector")
+            .selected_text(detector.label())
+            .show_ui(ui, |ui| {
+                for d in WbDetector::ALL {
+                    ui.selectable_value(&mut detector, d, d.label());
+                }
+            });
+        if detector != view.detector {
+            logger::log(format!("white beam detector changed: {}", detector.label()));
+            *view = WhiteBeamView::with_detector(detector, session);
+        }
+        ui.label(
+            RichText::new("one image per projection")
+                .weak()
+                .size(11.0),
+        );
+    });
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    ui.columns(2, |cols| {
+        view.sample.ui(&mut cols[0]);
+        view.ob.ui(&mut cols[1]);
+    });
 }
 
 fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
@@ -1957,7 +2030,7 @@ impl eframe::App for CtApp {
                     mode,
                 };
                 let view = match mode {
-                    Mode::WhiteBeam => WorkflowView::WhiteBeam,
+                    Mode::WhiteBeam => WorkflowView::WhiteBeam(WhiteBeamView::new(&session)),
                     Mode::Tof => WorkflowView::Tof(TofView::new(&session)),
                 };
                 self.screen = Screen::Workflow { session, view };

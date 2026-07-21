@@ -11,7 +11,10 @@ use crate::session::Mode;
 use hdf5_metno::types::VarLenUnicode;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_CONFIG_NAME: &str = "config_jean.h5";
+/// The config debug mode loads at startup — the VENUS white-beam one while
+/// that workflow is being developed; the admin Browse button switches to any
+/// other (e.g. `config_venus_tof.h5`).
+pub const DEFAULT_CONFIG_NAME: &str = "config_venus_white_beam.h5";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DebugConfig {

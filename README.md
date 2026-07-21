@@ -56,8 +56,21 @@ charges are flagged in the UI and the log.
 
 Note: the until-July-2025 tpx1 layout currently maps to the same folders as
 the post-August one (adjust `Detector::images_subdir` in `src/tof.rs` when
-its real structure is pinned down). The White Beam screen is not implemented
-yet.
+its real structure is pinned down).
+
+## White Beam workflow
+
+The White Beam screen starts with the CCD **detector** (`IkonXL` — the
+default — `QHY` or `sCMOS`), which decides where the data is looked for:
+
+- sample (projections): `<ipts>/images/<detector>/raw/ct/`
+- open beam: `<ipts>/images/<detector>/ob/`
+
+(only the `ikonxl` location is confirmed; `qhy`/`scmos` are provisional —
+see `WbDetector::images_subdir` in `src/white_beam.rs`). Unlike TOF, a
+white-beam sample folder holds one TIFF per projection, with the run number
+and angle in the file name. Folder selection works like the TOF screen; the
+per-projection processing steps are next.
 
 ## Admin section
 
@@ -68,16 +81,18 @@ mode** toggle: when on, the setup screen is prefilled from an HDF5 config
 file — instrument and IPTS are selected automatically and the configured mode
 button is highlighted.
 
-The active config defaults to `config/config_jean.h5`; a **Browse…** button
+The active config defaults to `config/config_venus_white_beam.h5`
+(VENUS / IPTS-36573 / White Beam); `config/config_venus_tof.h5`
+(VENUS / IPTS-37118 / TOF) is also generated. A **Browse…** button
 in the unlocked admin section selects a different `.h5` file (taking effect
 immediately when debug mode is already on). A config file holds three scalar
 string datasets: `instrument` (`VENUS`/`MARS`), `ipts` (e.g. `IPTS-36202`)
 and `mode` (`White Beam`/`TOF`). Regenerate or write variants with:
 
 ```bash
-cargo run --release --bin gen_config            # default: VENUS / IPTS-36202 / TOF
+cargo run --release --bin gen_config            # writes both default configs
 cargo run --release --bin gen_config -- other.h5
-h5dump config/config_jean.h5                    # inspect
+h5dump config/config_venus_white_beam.h5        # inspect
 ```
 
 ## Logging
