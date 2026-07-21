@@ -7,6 +7,7 @@
 pub mod app;
 pub mod combine;
 pub mod config;
+pub mod crop;
 pub mod instrument;
 pub mod ipts;
 pub mod logger;

@@ -1,0 +1,366 @@
+//! Cropping the loaded stack with the sibling `rust_crop_tiff` application:
+//! the sample 3-D array is handed over as a NumPy `.npy` file, the tool
+//! returns the rectangle drawn by the user (JSON on stdout in
+//! `--called-from-app` mode), and the same crop is applied to the sample and
+//! open-beam stacks in memory.
+
+use crate::combine::{LoadedStack, Projection};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
+
+/// The crop tool of the sibling repo.
+pub const CROP_TIFF_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_crop_tiff/target/release/crop_tiff";
+
+/// A rectangular crop: top-left corner and size, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CropRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Evenly distributed random subset of about `fraction` of `n` projections:
+/// one random pick per stratum, so the subset covers the whole scan. At
+/// least 20 (or all when fewer exist) so the crop tool's projections stay
+/// meaningful.
+pub fn subsample_indices(n: usize, fraction: f64, seed: u64) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let target = ((n as f64 * fraction).ceil() as usize)
+        .max(20)
+        .clamp(1, n);
+    let mut state = seed | 1;
+    let mut random_below = |m: usize| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as usize) % m.max(1)
+    };
+    let mut picked = Vec::with_capacity(target);
+    for k in 0..target {
+        let lo = k * n / target;
+        let hi = (((k + 1) * n) / target).max(lo + 1);
+        picked.push(lo + random_below(hi - lo));
+    }
+    picked.dedup();
+    picked
+}
+
+/// Write projections as a NumPy `.npy` file (version 1.0 header, float32
+/// little-endian, shape `(n, height, width)`) — the 3-D-stack input form of
+/// the crop tool.
+pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String> {
+    use std::io::Write;
+    let first = stack
+        .first()
+        .ok_or("cannot write an empty stack to .npy")?;
+    let (h, w) = (first.height, first.width);
+    if let Some(bad) = stack.iter().find(|p| (p.height, p.width) != (h, w)) {
+        return Err(format!(
+            "cannot write stack: {} is {}x{} while the first projection is {h}x{w}",
+            bad.name, bad.height, bad.width
+        ));
+    }
+    let file =
+        std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    let dict = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {h}, {w}), }}",
+        stack.len()
+    );
+    // Header (magic + version + length + dict) padded to a multiple of 64
+    // bytes, ending with a newline.
+    let unpadded = 10 + dict.len() + 1;
+    let padding = (64 - unpadded % 64) % 64;
+    let header_len = (dict.len() + padding + 1) as u16;
+    let mut write = |bytes: &[u8]| -> Result<(), String> {
+        out.write_all(bytes)
+            .map_err(|e| format!("write {}: {e}", path.display()))
+    };
+    write(b"\x93NUMPY\x01\x00")?;
+    write(&header_len.to_le_bytes())?;
+    write(dict.as_bytes())?;
+    write(&vec![b' '; padding])?;
+    write(b"\n")?;
+    let mut buffer = Vec::with_capacity(w * 4);
+    for projection in stack {
+        for row in projection.mean.chunks(w) {
+            buffer.clear();
+            for value in row {
+                buffer.extend_from_slice(&value.to_le_bytes());
+            }
+            write(&buffer)?;
+        }
+    }
+    out.flush()
+        .map_err(|e| format!("flush {}: {e}", path.display()))
+}
+
+fn crop_projection(p: &Projection, rect: &CropRect) -> Result<Projection, String> {
+    if rect.x + rect.width > p.width || rect.y + rect.height > p.height {
+        return Err(format!(
+            "crop {},{} {}x{} does not fit in {} ({}x{})",
+            rect.x, rect.y, rect.width, rect.height, p.name, p.width, p.height
+        ));
+    }
+    let mut mean = Vec::with_capacity(rect.width * rect.height);
+    for row in rect.y..rect.y + rect.height {
+        let start = row * p.width + rect.x;
+        mean.extend_from_slice(&p.mean[start..start + rect.width]);
+    }
+    let sum: f64 = mean.iter().map(|v| f64::from(*v)).sum();
+    Ok(Projection {
+        name: p.name.clone(),
+        run_number: p.run_number,
+        angle_deg: p.angle_deg,
+        n_images_used: p.n_images_used,
+        height: rect.height,
+        width: rect.width,
+        mean,
+        total_counts: sum * p.n_images_used.max(1) as f64,
+    })
+}
+
+/// The stack with `rect` applied to every sample projection AND every open
+/// beam, with the crop recorded in the metadata.
+pub fn apply_crop(stack: &LoadedStack, rect: &CropRect) -> Result<LoadedStack, String> {
+    let sample: Result<Vec<Projection>, String> =
+        stack.sample.iter().map(|p| crop_projection(p, rect)).collect();
+    let ob: Result<Vec<Projection>, String> =
+        stack.ob.iter().map(|p| crop_projection(p, rect)).collect();
+    let mut metadata = stack.metadata.clone();
+    metadata.retain(|(name, _)| name != "crop");
+    metadata.push((
+        "crop".to_owned(),
+        format!("x={}, y={}, width={}, height={}", rect.x, rect.y, rect.width, rect.height),
+    ));
+    metadata.sort();
+    Ok(LoadedStack {
+        path: stack.path.clone(),
+        sample: sample?,
+        ob: ob?,
+        metadata,
+    })
+}
+
+/// One crop-tool session on a background thread: write the sample stack to a
+/// temp `.npy`, run the tool, apply the returned rectangle to sample and OB.
+/// Resolves to `Ok(None)` when the tool was closed without saving.
+pub struct CropJob {
+    rx: Receiver<Result<Option<(CropRect, LoadedStack)>, String>>,
+}
+
+impl CropJob {
+    pub fn start(stack: Arc<LoadedStack>, initial: Option<CropRect>) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_crop_tool(&stack, initial));
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<Option<(CropRect, LoadedStack)>, String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+fn run_crop_tool(
+    stack: &LoadedStack,
+    initial: Option<CropRect>,
+) -> Result<Option<(CropRect, LoadedStack)>, String> {
+    // Only an evenly distributed random subset (~10%) of the projections is
+    // handed to the crop tool — enough to check the region against the whole
+    // scan without writing (and having the tool load) many GB.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let indices = subsample_indices(stack.sample.len(), 0.10, seed);
+    let subset: Vec<&Projection> = indices.iter().map(|&i| &stack.sample[i]).collect();
+
+    // Scratch space next to the loaded HDF5 (a filesystem known to be big
+    // and writable), falling back to the system temp directory.
+    let base = stack
+        .path
+        .parent()
+        .filter(|p| p.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut dir = base.join(format!(".ct_recon_crop_{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        dir = std::env::temp_dir().join(format!("ct_recon_crop_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let npy = dir.join("sample_stack.npy");
+    let crop_file = dir.join("crop.json");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&npy);
+        let _ = std::fs::remove_file(&crop_file);
+        let _ = std::fs::remove_dir(&dir);
+    };
+
+    if let Err(first_error) = write_npy_stack(&npy, &subset) {
+        // One retry in the system temp directory (e.g. read-only h5 folder).
+        cleanup();
+        let fallback = std::env::temp_dir().join(format!("ct_recon_crop_{}", std::process::id()));
+        if std::fs::create_dir_all(&fallback).is_err()
+            || write_npy_stack(&fallback.join("sample_stack.npy"), &subset).is_err()
+        {
+            return Err(first_error);
+        }
+        return run_crop_tool_in(&fallback, stack, &subset, initial);
+    }
+    run_crop_tool_in(&dir, stack, &subset, initial)
+}
+
+fn run_crop_tool_in(
+    dir: &Path,
+    stack: &LoadedStack,
+    subset: &[&Projection],
+    initial: Option<CropRect>,
+) -> Result<Option<(CropRect, LoadedStack)>, String> {
+    let npy = dir.join("sample_stack.npy");
+    let crop_file = dir.join("crop.json");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&npy);
+        let _ = std::fs::remove_file(&crop_file);
+        let _ = std::fs::remove_dir(dir);
+    };
+    let mut cmd = std::process::Command::new(CROP_TIFF_BIN);
+    cmd.arg(&npy)
+        .arg("--called-from-app")
+        .arg("-o")
+        .arg(&crop_file)
+        .arg("--instructions")
+        .arg(format!(
+            "Draw the crop region for the CT reconstruction; it will also be applied to the \
+             open beams. Showing {} of {} projections (evenly sub-sampled).",
+            subset.len(),
+            stack.sample.len()
+        ));
+    if let Some(rect) = initial {
+        cmd.arg("-c")
+            .arg(format!("{},{},{},{}", rect.x, rect.y, rect.width, rect.height));
+    }
+    let result = cmd.output();
+    let output = match result {
+        Err(e) => {
+            cleanup();
+            return Err(format!("cannot launch {CROP_TIFF_BIN}: {e}"));
+        }
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            cleanup();
+            return Err(format!("crop_tiff failed ({}): {stderr}", out.status));
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+    };
+    cleanup();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let doc: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| format!("invalid crop JSON from crop_tiff: {e}"))?;
+    let field = |name: &str| -> Result<usize, String> {
+        doc.get(name)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .ok_or_else(|| format!("no \"{name}\" in the crop JSON"))
+    };
+    let rect = CropRect {
+        x: field("x")?,
+        y: field("y")?,
+        width: field("width")?,
+        height: field("height")?,
+    };
+    let cropped = apply_crop(stack, &rect)?;
+    Ok(Some((rect, cropped)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projection(name: &str, w: usize, h: usize) -> Projection {
+        Projection {
+            name: name.to_owned(),
+            run_number: None,
+            angle_deg: Some(1.0),
+            n_images_used: 1,
+            height: h,
+            width: w,
+            mean: (0..w * h).map(|i| i as f32).collect(),
+            total_counts: 0.0,
+        }
+    }
+
+    #[test]
+    fn crop_extracts_the_rectangle() {
+        let p = projection("p", 4, 3); // rows: 0..4, 4..8, 8..12
+        let rect = CropRect { x: 1, y: 1, width: 2, height: 2 };
+        let cropped = crop_projection(&p, &rect).unwrap();
+        assert_eq!(cropped.mean, vec![5.0, 6.0, 9.0, 10.0]);
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(cropped.total_counts, 30.0);
+        // Out of bounds is rejected.
+        let bad = CropRect { x: 3, y: 0, width: 2, height: 2 };
+        assert!(crop_projection(&p, &bad).is_err());
+    }
+
+    #[test]
+    fn apply_crop_covers_sample_and_ob_and_records_metadata() {
+        let stack = LoadedStack {
+            path: std::path::PathBuf::from("/x.h5"),
+            sample: vec![projection("s", 4, 3)],
+            ob: vec![projection("ob", 4, 3)],
+            metadata: vec![("method".to_owned(), "mean".to_owned())],
+        };
+        let rect = CropRect { x: 0, y: 0, width: 2, height: 3 };
+        let cropped = apply_crop(&stack, &rect).unwrap();
+        assert_eq!(cropped.sample[0].width, 2);
+        assert_eq!(cropped.ob[0].width, 2);
+        assert!(cropped
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "crop" && v.contains("width=2")));
+    }
+
+    #[test]
+    fn subsampling_is_even_and_covers_the_scan() {
+        let picked = subsample_indices(161, 0.10, 12345);
+        assert!(picked.len() >= 20, "{}", picked.len());
+        assert!(picked.len() <= 25);
+        // Strictly increasing, spread across the whole range.
+        for pair in picked.windows(2) {
+            assert!(pair[1] > pair[0]);
+        }
+        assert!(picked[0] < 10);
+        assert!(*picked.last().unwrap() >= 152);
+        // Small stacks are passed whole.
+        assert_eq!(subsample_indices(15, 0.10, 7), (0..15).collect::<Vec<_>>());
+        assert!(subsample_indices(0, 0.10, 7).is_empty());
+    }
+
+    #[test]
+    fn npy_header_and_data() {
+        let path = std::env::temp_dir().join(format!("ct_recon_npy_{}.npy", std::process::id()));
+        let (a, b) = (projection("a", 3, 2), projection("b", 3, 2));
+        write_npy_stack(&path, &[&a, &b]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(&bytes[..8], b"\x93NUMPY\x01\x00");
+        let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        assert_eq!((10 + header_len) % 64, 0);
+        let header = String::from_utf8_lossy(&bytes[10..10 + header_len]);
+        assert!(header.contains("'shape': (2, 2, 3)"));
+        assert_eq!(bytes.len(), 10 + header_len + 2 * 2 * 3 * 4);
+        // First data value is 0.0f32, second 1.0f32.
+        let at = 10 + header_len;
+        assert_eq!(&bytes[at..at + 4], &0.0f32.to_le_bytes());
+        assert_eq!(&bytes[at + 4..at + 8], &1.0f32.to_le_bytes());
+    }
+}

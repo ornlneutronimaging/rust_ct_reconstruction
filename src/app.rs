@@ -5,9 +5,11 @@
 //! decides which workflow screen the rest of the application shows.
 
 use crate::combine::{
-    CombineOutput, CombineScan, ImageSelection, RunToCombine, SaveJob, SaveMeta,
+    CombineOutput, CombineScan, ImageSelection, LoadJob, LoadedStack, RunToCombine, SaveJob,
+    SaveMeta,
 };
 use crate::config;
+use crate::crop::{CropJob, CropRect};
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
@@ -61,6 +63,34 @@ fn password_matches(input: &str) -> bool {
 enum Screen {
     Setup,
     Workflow { session: Session, view: WorkflowView },
+    /// Pre-processing of a stack of projections loaded from a previously
+    /// saved HDF5 file.
+    Stack(StackView),
+}
+
+struct StackView {
+    /// The stack as loaded — crops are always drawn on this one, so the
+    /// region can be widened again later.
+    original: std::sync::Arc<LoadedStack>,
+    /// The current stack (cropped when a crop is applied) — what the
+    /// pre-processing steps work on.
+    stack: std::sync::Arc<LoadedStack>,
+    crop: Option<CropRect>,
+    crop_job: Option<CropJob>,
+    crop_error: Option<String>,
+}
+
+impl StackView {
+    fn new(stack: LoadedStack) -> Self {
+        let stack = std::sync::Arc::new(stack);
+        Self {
+            original: std::sync::Arc::clone(&stack),
+            stack,
+            crop: None,
+            crop_job: None,
+            crop_error: None,
+        }
+    }
 }
 
 /// Mode-specific state and UI of the workflow screen.
@@ -111,6 +141,12 @@ struct WhiteBeamView {
     threshold_dragging: bool,
     /// Show the intensity plot with a log10 y axis.
     intensity_log: bool,
+
+    // Reading + stacking the final selection, and saving it to HDF5.
+    process: Option<CombineScan>,
+    processed: Option<std::sync::Arc<CombineOutput>>,
+    save_job: Option<SaveJob>,
+    save_status: Option<Result<String, String>>,
 }
 
 /// Integrated intensities cached per selection: the scan covers the used
@@ -182,7 +218,89 @@ impl WhiteBeamView {
             threshold_bounds: (0.0, 1.0),
             threshold_dragging: false,
             intensity_log: false,
+            process: None,
+            processed: None,
+            save_job: None,
+            save_status: None,
         }
+    }
+
+    /// The final sample selection: used files (highest revisions) that
+    /// survive the manual run exclusions and the intensity threshold, with
+    /// their angles, down-selected to the coverage percentage when that mode
+    /// is on. `Err` explains what is still missing.
+    fn final_selection(&self) -> Result<Vec<RunToCombine>, String> {
+        let files: Vec<PathBuf> = self
+            .sample
+            .selected
+            .iter()
+            .flat_map(|(_, files, _)| files.iter().cloned())
+            .collect();
+        if files.is_empty() {
+            return Err("select the sample folder(s) first".to_owned());
+        }
+        let angles = self
+            .per_file_angles(&files)
+            .ok_or("set up the projection angles first (and let the metadata read finish)")?;
+
+        // Exclusions: manual run numbers, then the intensity threshold when
+        // intensities were computed for this exact selection.
+        let thresholded: Option<&IntensityCache> = self
+            .intensities
+            .as_ref()
+            .filter(|c| c.kept_len == files.len() && c.first.as_ref() == files.first());
+        let mut candidates: Vec<usize> = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            let run = tof::run_number(&file.file_name().unwrap_or_default().to_string_lossy());
+            if run.is_some_and(|r| self.excluded_runs.contains(&r)) {
+                continue;
+            }
+            if let Some(cache) = thresholded
+                && let Some(Some(v)) = cache.values.get(index)
+                && v.intensity < self.threshold
+            {
+                continue;
+            }
+            candidates.push(index);
+        }
+        if candidates.is_empty() {
+            return Err("every image is excluded — nothing to save".to_owned());
+        }
+
+        // Coverage down-selection on what survived the exclusions.
+        let survivors: Vec<usize> = if self.use_percentage {
+            let candidate_angles: Vec<f64> = candidates
+                .iter()
+                .map(|&i| angles[i].unwrap_or(f64::MAX))
+                .collect();
+            let n = ((self.percentage as f64 / 100.0) * candidates.len() as f64).round()
+                as usize;
+            let n = n.max(5.min(candidates.len()));
+            white_beam::select_coverage(&candidate_angles, n)
+                .iter()
+                .map(|&pos| candidates[pos])
+                .collect()
+        } else {
+            candidates
+        };
+
+        Ok(survivors
+            .iter()
+            .map(|&i| {
+                let file = &files[i];
+                RunToCombine {
+                    name: file
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    run_number: tof::run_number(
+                        &file.file_name().unwrap_or_default().to_string_lossy(),
+                    ),
+                    images: vec![file.clone()],
+                    angle_deg: angles[i],
+                }
+            })
+            .collect())
     }
 
     /// The angle of each sample file (aligned with the flattened selection),
@@ -691,6 +809,11 @@ pub struct CtApp {
     /// Loaded lazily on the first frame (needs the egui context).
     logo: Option<egui::TextureHandle>,
 
+    /// Loading a previously saved HDF5 from the setup screen; jumps to the
+    /// pre-processing screen when it finishes.
+    load_job: Option<LoadJob>,
+    load_error: Option<String>,
+
     // Log viewer (right side panel).
     log_view_open: bool,
     log_auto_refresh: bool,
@@ -724,6 +847,8 @@ impl CtApp {
             config_path: config::default_config_path(),
             debug_info: None,
             debug_error: None,
+            load_job: None,
+            load_error: None,
             logo: None,
             log_view_open: false,
             log_auto_refresh: true,
@@ -840,8 +965,47 @@ impl CtApp {
             self.ipts_section(ui);
             ui.add_space(28.0);
             self.mode_buttons(ui);
+            ui.add_space(16.0);
+            self.load_stack_row(ui);
         });
         self.next_button(ui)
+    }
+
+    /// "— or —" load a previously saved HDF5 and jump straight to the
+    /// pre-processing screen.
+    fn load_stack_row(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("— or —").weak().size(12.0));
+        ui.add_space(4.0);
+        if let Some(_job) = &self.load_job {
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() / 2.0 - 120.0).max(0.0));
+                ui.spinner();
+                ui.label("loading the HDF5 stack…");
+            });
+            return;
+        }
+        if ui
+            .button("📂 Load a previously saved HDF5…")
+            .clicked()
+        {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Select a previously saved projections HDF5")
+                .add_filter("HDF5", &["h5", "hdf5"]);
+            if let Some(entry) = &self.selected {
+                let shared = entry.path.join("shared");
+                if shared.is_dir() {
+                    dialog = dialog.set_directory(shared);
+                }
+            }
+            if let Some(path) = dialog.pick_file() {
+                logger::log(format!("loading saved stack: {}", path.display()));
+                self.load_error = None;
+                self.load_job = Some(LoadJob::start(path));
+            }
+        }
+        if let Some(e) = &self.load_error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
     }
 
     fn instrument_row(&mut self, ui: &mut egui::Ui) {
@@ -1261,6 +1425,176 @@ fn top_right_bar(
     });
 }
 
+/// Pre-processing of a loaded stack of projections; returns `true` to go
+/// back to the setup screen.
+fn stack_ui(
+    ui: &mut egui::Ui,
+    view: &mut StackView,
+    logo: Option<&egui::TextureHandle>,
+    log_open: &mut bool,
+) -> bool {
+    let mut back = false;
+    let stack = &view.stack;
+    ui.horizontal(|ui| {
+        if ui.button("↩ Back").clicked() {
+            back = true;
+        }
+        ui.label(
+            RichText::new(format!(
+                "Pre-processing — {}",
+                stack
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ))
+            .size(15.0)
+            .strong(),
+        );
+        top_right_bar(ui, logo, log_open, 28.0);
+    });
+    ui.add_space(10.0);
+
+    let angles: Vec<f64> = stack.sample.iter().filter_map(|p| p.angle_deg).collect();
+    let dims = stack
+        .sample
+        .first()
+        .map(|p| format!("{}x{}", p.height, p.width))
+        .unwrap_or_default();
+    ui.label(
+        RichText::new(format!(
+            "{} projections ({dims}), angles {} — {} ob image(s)",
+            stack.sample.len(),
+            match (angles.first(), angles.last()) {
+                (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
+                _ => "unknown".to_owned(),
+            },
+            stack.ob.len()
+        ))
+        .strong(),
+    );
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(RichText::new("Provenance").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            for (name, value) in &stack.metadata {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    ui.label(RichText::new(value).size(12.0));
+                });
+            }
+        });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Crop").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            crop_section_ui(ui, view);
+        });
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new("The next pre-processing steps of the stack come after.")
+                .weak()
+                .size(15.0),
+        );
+    });
+    back
+}
+
+/// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
+/// handed over, and the returned region is applied to the sample AND the
+/// open beams.
+fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.crop_job {
+        match job.poll() {
+            Some(Ok(Some((rect, cropped)))) => {
+                logger::log(format!(
+                    "crop applied to sample and open beams: x={}, y={}, {}x{} (was {}x{})",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    view.original.sample.first().map(|p| p.width).unwrap_or(0),
+                    view.original.sample.first().map(|p| p.height).unwrap_or(0),
+                ));
+                view.stack = std::sync::Arc::new(cropped);
+                view.crop = Some(rect);
+                view.crop_error = None;
+                view.crop_job = None;
+            }
+            Some(Ok(None)) => {
+                logger::log("crop tool closed without saving a region");
+                view.crop_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("crop failed: {e}"));
+                view.crop_error = Some(e);
+                view.crop_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        "crop tool is open — draw the region and press \
+                         '↩ Return to main application'",
+                    );
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+
+    match &view.crop {
+        Some(rect) => {
+            let original = view.original.sample.first();
+            ui.label(
+                RichText::new(format!(
+                    "crop: x={}, y={}, {}x{} (original {}x{}) — applied to sample and open beams",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    original.map(|p| p.width).unwrap_or(0),
+                    original.map(|p| p.height).unwrap_or(0),
+                ))
+                .strong(),
+            );
+        }
+        None => {
+            ui.label(RichText::new("no crop applied — the full images are used").weak());
+        }
+    }
+    let label = if view.crop.is_some() {
+        "✂ Adjust the crop region…"
+    } else {
+        "✂ Select the crop region…"
+    };
+    if ui.button(label).clicked() {
+        logger::log(format!(
+            "opening the crop tool on the sample stack ({} projections)",
+            view.original.sample.len()
+        ));
+        view.crop_error = None;
+        view.crop_job = Some(CropJob::start(
+            std::sync::Arc::clone(&view.original),
+            view.crop,
+        ));
+    }
+    ui.label(
+        RichText::new(
+            "(an evenly sub-sampled ~10% of the projections is handed to the crop tool; \
+             the region comes back and is applied to the full sample stack and the open beams)",
+        )
+        .weak()
+        .size(11.0),
+    );
+    if let Some(e) = &view.crop_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
 /// The workflow screen: shared header, then the mode-specific view; returns
 /// `true` when the user wants to go back to the setup screen.
 fn workflow_ui(
@@ -1357,6 +1691,218 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         .show(ui, |ui| {
             exclude_images_ui(ui, view);
         });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Save to HDF5").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            wb_save_ui(ui, session, view);
+        });
+}
+
+/// Read the final selection (one image per projection, exclusions applied,
+/// increasing angle) and save it in the same HDF5 layout as the TOF side.
+fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
+    let ctx = ui.ctx().clone();
+    // Fold finished background work into the view.
+    if let Some(scan) = &mut view.process {
+        if let Some(output) = scan.poll() {
+            let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
+            logger::log(format!(
+                "white beam stack read: {} projections (angles {}), {} ob images",
+                output.sample.len(),
+                match (angles.first(), angles.last()) {
+                    (Some(a), Some(b)) => format!("{a:.3} deg -> {b:.3} deg, increasing"),
+                    _ => "unknown".to_owned(),
+                },
+                output.ob.len()
+            ));
+            for e in &output.skipped {
+                logger::error(format!("white beam stack: {e}"));
+            }
+            view.processed = Some(std::sync::Arc::new(output));
+            view.process = None;
+        } else {
+            let done = scan.progress();
+            let frac = (done as f32 / scan.total_images.max(1) as f32).min(1.0);
+            ui.add(egui::ProgressBar::new(frac).text(format!(
+                "{done}/{} images",
+                scan.total_images
+            )));
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+    if let Some(job) = &mut view.save_job {
+        match job.poll() {
+            Some(Ok(msg)) => {
+                logger::log(format!("saved white beam data: {msg}"));
+                view.save_status = Some(Ok(msg));
+                view.save_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("saving white beam data failed: {e}"));
+                view.save_status = Some(Err(e));
+                view.save_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+
+    let selection = view.final_selection();
+    match &selection {
+        Err(msg) => {
+            ui.label(RichText::new(msg.as_str()).weak());
+        }
+        Ok(runs) => {
+            let total: usize = view.sample.total_files();
+            ui.label(format!(
+                "{} of {total} projections will be saved (exclusions and coverage applied), plus {} ob images",
+                runs.len(),
+                view.ob.total_files()
+            ));
+        }
+    }
+
+    let busy = view.process.is_some();
+    if ui
+        .add_enabled(
+            selection.is_ok() && !busy,
+            egui::Button::new("▶ Read & stack the projections"),
+        )
+        .clicked()
+        && let Ok(sample_runs) = selection
+    {
+        let ob_runs: Vec<RunToCombine> = view
+            .ob
+            .selected
+            .iter()
+            .flat_map(|(_, files, _)| files.iter())
+            .map(|file| RunToCombine {
+                name: file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                run_number: tof::run_number(
+                    &file.file_name().unwrap_or_default().to_string_lossy(),
+                ),
+                images: vec![file.clone()],
+                angle_deg: None,
+            })
+            .collect();
+        logger::log(format!(
+            "reading white beam stack: {} projections, {} ob images",
+            sample_runs.len(),
+            ob_runs.len()
+        ));
+        view.processed = None;
+        view.save_status = None;
+        view.process = Some(CombineScan::start(
+            sample_runs,
+            ob_runs,
+            ImageSelection::All,
+            false,
+        ));
+    }
+
+    if let Some(output) = &view.processed {
+        let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
+        let dims = output
+            .sample
+            .first()
+            .map(|p| format!("{}x{}", p.height, p.width))
+            .unwrap_or_else(|| "?".to_owned());
+        ui.label(
+            RichText::new(format!(
+                "stacked: {} projections ({dims}), angles {} — {} ob images",
+                output.sample.len(),
+                match (angles.first(), angles.last()) {
+                    (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
+                    _ => "unknown".to_owned(),
+                },
+                output.ob.len()
+            ))
+            .strong(),
+        );
+        for e in &output.skipped {
+            ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
+        }
+        let saving = view.save_job.is_some();
+        if ui
+            .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
+            .clicked()
+        {
+            let default_name = view
+                .sample
+                .selected
+                .first()
+                .and_then(|(dir, ..)| dir.file_name())
+                .map(|n| format!("{}_white_beam.h5", n.to_string_lossy()))
+                .unwrap_or_else(|| "ct_white_beam.h5".to_owned());
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save the white beam projections")
+                .add_filter("HDF5", &["h5", "hdf5"])
+                .set_file_name(default_name);
+            let shared = session.ipts.path.join("shared");
+            if shared.is_dir() {
+                dialog = dialog.set_directory(shared);
+            }
+            if let Some(path) = dialog.save_file() {
+                let folder_list = |pick: &MultiFolderPick| {
+                    pick.selected
+                        .iter()
+                        .map(|(dir, ..)| dir.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                let mut mode = format!(
+                    "white beam, one image per projection; angles from {}",
+                    view.angle_source.label()
+                );
+                if view.use_percentage {
+                    mode.push_str(&format!("; {}% coverage selection", view.percentage));
+                }
+                if !view.excluded_runs.is_empty() {
+                    let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
+                    sorted.sort();
+                    mode.push_str(&format!("; excluded runs {sorted:?}"));
+                }
+                if view.intensities.is_some() {
+                    mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
+                }
+                let meta = SaveMeta {
+                    instrument: session.instrument.name().to_owned(),
+                    ipts: session.ipts.name.clone(),
+                    detector: view.detector.label().to_owned(),
+                    sample_folder: folder_list(&view.sample),
+                    ob_folder: folder_list(&view.ob),
+                    combine_mode: mode,
+                    selections_json: None,
+                    detector_offset_us: None,
+                };
+                logger::log(format!("saving white beam data to {}", path.display()));
+                view.save_status = None;
+                view.save_job = Some(SaveJob::start(
+                    path,
+                    std::sync::Arc::clone(output),
+                    meta,
+                ));
+            }
+        }
+        if saving {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("writing HDF5…");
+            });
+        }
+    }
+    match &view.save_status {
+        Some(Ok(msg)) => {
+            ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+        }
+        Some(Err(e)) => {
+            ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+        }
+        None => {}
+    }
 }
 
 /// Manual run-number exclusion plus an intensity threshold: the integrated
@@ -2577,6 +3123,7 @@ fn process_section_ui(
                         name: r.name.clone(),
                         run_number: r.run_number,
                         images: f.images.clone(),
+                        angle_deg: None,
                     })
                 })
                 .collect()
@@ -3253,6 +3800,30 @@ impl eframe::App for CtApp {
         self.log_panel(ui, &ctx);
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
+            // A finished HDF5 load jumps straight to pre-processing.
+            if let Some(job) = &mut self.load_job {
+                match job.poll() {
+                    Some(Ok(stack)) => {
+                        logger::log(format!(
+                            "stack loaded: {} — {} projections, {} ob — jumping to pre-processing",
+                            stack.path.display(),
+                            stack.sample.len(),
+                            stack.ob.len()
+                        ));
+                        self.load_job = None;
+                        self.screen = Screen::Stack(StackView::new(stack));
+                    }
+                    Some(Err(e)) => {
+                        logger::error(format!("loading saved stack failed: {e}"));
+                        self.load_error = Some(e);
+                        self.load_job = None;
+                    }
+                    None => ctx.request_repaint_after(Duration::from_millis(300)),
+                }
+            }
+            if !matches!(self.screen, Screen::Setup) {
+                return;
+            }
             let mut next = false;
             egui::Panel::bottom("admin").show(ui, |ui| {
                 self.admin_panel(ui);
@@ -3280,10 +3851,14 @@ impl eframe::App for CtApp {
             }
         } else {
             let mut back = false;
-            egui::CentralPanel::default().show(ui, |ui| {
-                if let Screen::Workflow { session, view } = &mut self.screen {
+            egui::CentralPanel::default().show(ui, |ui| match &mut self.screen {
+                Screen::Workflow { session, view } => {
                     back = workflow_ui(ui, session, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
+                Screen::Stack(view) => {
+                    back = stack_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                }
+                Screen::Setup => {}
             });
             if back {
                 logger::log("returned to setup screen");

@@ -54,13 +54,16 @@ impl ImageSelection {
     }
 }
 
-/// One run folder to combine: its (sorted) images plus the identity carried
-/// into the output.
+/// One run to combine: its (sorted) images plus the identity carried into
+/// the output. For white beam a run is a single image file. `angle_deg`
+/// overrides the angle when the caller already knows it (e.g. from metadata
+/// or an ASCII list); otherwise it is parsed from the name's `Ang` token.
 #[derive(Clone, Debug)]
 pub struct RunToCombine {
     pub name: String,
     pub run_number: Option<u32>,
     pub images: Vec<PathBuf>,
+    pub angle_deg: Option<f64>,
 }
 
 /// The mean of the selected images of one run folder.
@@ -165,7 +168,7 @@ fn combine_run(
     Ok(Projection {
         name: run.name.clone(),
         run_number: run.run_number,
-        angle_deg: angle_from_name(&run.name),
+        angle_deg: run.angle_deg.or_else(|| angle_from_name(&run.name)),
         n_images_used: n,
         height,
         width,
@@ -466,6 +469,122 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
     ))
 }
 
+/// A stack loaded back from a previously saved HDF5 file.
+pub struct LoadedStack {
+    pub path: PathBuf,
+    /// Projections in file order (increasing angle when saved by this app).
+    pub sample: Vec<Projection>,
+    pub ob: Vec<Projection>,
+    /// `/metadata` entries as (name, value) strings, sorted by name.
+    pub metadata: Vec<(String, String)>,
+}
+
+fn read_stack(group: &hdf5_metno::Group, what: &str) -> Result<Vec<Projection>, String> {
+    use hdf5_metno::types::VarLenUnicode;
+    let err = |name: &str, e: hdf5_metno::Error| format!("read {what}/{name}: {e}");
+    let ds = group
+        .dataset("projections")
+        .map_err(|e| err("projections", e))?;
+    let shape = ds.shape();
+    let [n, h, w] = shape.as_slice() else {
+        return Err(format!(
+            "{what}/projections has shape {shape:?}, expected (n, height, width)"
+        ));
+    };
+    let (n, h, w) = (*n, *h, *w);
+    let flat: Vec<f32> = ds.read_raw().map_err(|e| err("projections", e))?;
+    let angles: Vec<f64> = group
+        .dataset("angles_deg")
+        .and_then(|d| d.read_raw())
+        .map_err(|e| err("angles_deg", e))?;
+    let runs: Vec<i64> = group
+        .dataset("run_numbers")
+        .and_then(|d| d.read_raw())
+        .map_err(|e| err("run_numbers", e))?;
+    let used: Vec<u64> = group
+        .dataset("images_used")
+        .and_then(|d| d.read_raw())
+        .map_err(|e| err("images_used", e))?;
+    let names: Vec<VarLenUnicode> = group
+        .dataset("folder_names")
+        .and_then(|d| d.read_raw())
+        .map_err(|e| err("folder_names", e))?;
+    if [angles.len(), runs.len(), used.len(), names.len()] != [n; 4] {
+        return Err(format!("{what}: dataset lengths do not match {n} projections"));
+    }
+    Ok((0..n)
+        .map(|i| {
+            let mean = flat[i * h * w..(i + 1) * h * w].to_vec();
+            let n_images_used = used[i] as usize;
+            let sum: f64 = mean.iter().map(|v| f64::from(*v)).sum();
+            Projection {
+                name: names[i].as_str().to_owned(),
+                run_number: u32::try_from(runs[i]).ok(),
+                angle_deg: (!angles[i].is_nan()).then_some(angles[i]),
+                n_images_used,
+                height: h,
+                width: w,
+                mean,
+                total_counts: sum * n_images_used.max(1) as f64,
+            }
+        })
+        .collect())
+}
+
+/// Read back a file written by [`save_hdf5`].
+pub fn load_hdf5(path: &Path) -> Result<LoadedStack, String> {
+    use hdf5_metno::types::VarLenUnicode;
+    let file = hdf5_metno::File::open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let sample = read_stack(&file, "/")?;
+    if sample.is_empty() {
+        return Err(format!("no projections in {}", path.display()));
+    }
+    let ob = match file.group("ob") {
+        Ok(group) => read_stack(&group, "ob")?,
+        Err(_) => Vec::new(),
+    };
+    let mut metadata = Vec::new();
+    if let Ok(group) = file.group("metadata") {
+        for name in group.member_names().unwrap_or_default() {
+            let Ok(ds) = group.dataset(&name) else { continue };
+            let value = ds
+                .read_scalar::<VarLenUnicode>()
+                .map(|v| v.as_str().to_owned())
+                .or_else(|_| ds.read_scalar::<f64>().map(|v| v.to_string()));
+            if let Ok(value) = value {
+                metadata.push((name, value));
+            }
+        }
+    }
+    metadata.sort();
+    Ok(LoadedStack {
+        path: path.to_path_buf(),
+        sample,
+        ob,
+        metadata,
+    })
+}
+
+/// Loading on a background thread (the stack can be many GB).
+pub struct LoadJob {
+    rx: Receiver<Result<LoadedStack, String>>,
+}
+
+impl LoadJob {
+    pub fn start(path: PathBuf) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_hdf5(&path));
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<LoadedStack, String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// Saving on a background thread (the stack can be hundreds of MB).
 pub struct SaveJob {
     rx: Receiver<Result<String, String>>,
@@ -558,6 +677,53 @@ mod tests {
         assert_eq!(kept.name, "strong");
         assert!(notes[0].contains("kept strong"));
         assert!(notes[0].contains("dropped weak"));
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let output = CombineOutput {
+            sample: vec![
+                projection("p0", Some(0.0), 3, 1.5, 100.0),
+                projection("p1", Some(90.5), 3, 2.5, 200.0),
+                projection("p2", None, 1, 0.5, 10.0),
+            ],
+            ob: vec![projection("ob0", None, 2, 4.0, 50.0)],
+            skipped: Vec::new(),
+            notes: Vec::new(),
+        };
+        let meta = SaveMeta {
+            instrument: "VENUS".to_owned(),
+            ipts: "IPTS-1".to_owned(),
+            detector: "IkonXL".to_owned(),
+            sample_folder: "/a".to_owned(),
+            ob_folder: "/b".to_owned(),
+            combine_mode: "test".to_owned(),
+            selections_json: None,
+            detector_offset_us: Some(12.5),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ct_recon_roundtrip_{}.h5",
+            std::process::id()
+        ));
+        save_hdf5(&path, &output, &meta).unwrap();
+        let loaded = load_hdf5(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.sample.len(), 3);
+        assert_eq!(loaded.ob.len(), 1);
+        assert_eq!(loaded.sample[0].name, "p0");
+        assert_eq!(loaded.sample[1].angle_deg, Some(90.5));
+        assert_eq!(loaded.sample[2].angle_deg, None);
+        assert_eq!(loaded.sample[1].mean, vec![2.5, 2.5]);
+        assert_eq!(loaded.sample[0].n_images_used, 3);
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "instrument" && v == "VENUS"));
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "detector_offset_us" && v == "12.5"));
+        assert!(load_hdf5(Path::new("/nonexistent.h5")).is_err());
     }
 
     #[test]
