@@ -16,6 +16,7 @@ use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
 use crate::rotate::{self, RotateJob};
+use crate::tilt::{TiltApplyJob, TiltCalcJob, TiltResult};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
@@ -79,6 +80,7 @@ enum StackSection {
     Clean,
     Normalize,
     Rotate,
+    Tilt,
     Sinogram,
 }
 
@@ -139,6 +141,21 @@ struct StackView {
     sino_row: usize,
     /// Sinogram texture, keyed by (stack, row).
     sino_tex: Option<((usize, usize), egui::TextureHandle)>,
+
+    // Tilt correction (after normalization).
+    /// Row range (y_top, y_bottom) the tilt fit samples.
+    tilt_range: Option<(usize, usize)>,
+    /// Frame shown by the tilt preview.
+    tilt_frame: usize,
+    /// Show the preview with the estimated correction applied.
+    tilt_preview_corrected: bool,
+    /// Preview texture, keyed by (stack, frame, corrected, result bits).
+    tilt_tex: Option<((usize, usize, bool, u64), egui::TextureHandle)>,
+    tilt_calc: Option<TiltCalcJob>,
+    tilt_result: Option<TiltResult>,
+    tilt_apply: Option<TiltApplyJob>,
+    tilt_applied: Option<TiltResult>,
+    tilt_error: Option<String>,
 }
 
 impl StackView {
@@ -174,7 +191,28 @@ impl StackView {
             rot_tex: None,
             sino_row: 0,
             sino_tex: None,
+            tilt_range: None,
+            tilt_frame: 0,
+            tilt_preview_corrected: false,
+            tilt_tex: None,
+            tilt_calc: None,
+            tilt_result: None,
+            tilt_apply: None,
+            tilt_applied: None,
+            tilt_error: None,
         }
+    }
+
+    fn clear_tilt(&mut self) {
+        self.tilt_range = None;
+        self.tilt_frame = 0;
+        self.tilt_preview_corrected = false;
+        self.tilt_tex = None;
+        self.tilt_calc = None;
+        self.tilt_result = None;
+        self.tilt_apply = None;
+        self.tilt_applied = None;
+        self.tilt_error = None;
     }
 
     /// What the next cleaning run starts from: the pre-cleaning stack when a
@@ -1578,6 +1616,7 @@ fn stack_ui(
             view.rotation_quarters = 0;
             view.rotation_applied = 0;
             view.rot_tex = None;
+            view.clear_tilt();
         }
         top_right_bar(ui, logo, log_open, 28.0);
     });
@@ -1647,6 +1686,9 @@ fn stack_ui(
     if view.normalized {
         section(ui, view, StackSection::Rotate, "Rotate the data", &mut |ui, view| {
             rotation_section_ui(ui, view);
+        });
+        section(ui, view, StackSection::Tilt, "Tilt correction", &mut |ui, view| {
+            tilt_section_ui(ui, view);
         });
         section(ui, view, StackSection::Sinogram, "Sinogram", &mut |ui, view| {
             sinogram_section_ui(ui, view);
@@ -2038,6 +2080,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_quarters = 0;
                 view.rotation_applied = 0;
                 view.rot_tex = None;
+                view.clear_tilt();
                 view.open_section = Some(StackSection::Rotate);
             }
             Some(Err(e)) => {
@@ -2318,6 +2361,299 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
 }
 
+/// Tilt correction (neutompy find_COR port): estimate the rotation-axis
+/// tilt and offset from the 0° and 180° projections, then rotate + roll
+/// every projection to straighten it.
+fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    // Fold finished background work into the view.
+    if let Some(job) = &mut view.tilt_calc {
+        match job.poll() {
+            Some(Ok(result)) => {
+                logger::log(format!(
+                    "tilt estimated: {:.4} deg, axis shift {} px ({} rows fitted)",
+                    result.tilt_deg, result.shift_px, result.rows_used
+                ));
+                view.tilt_result = Some(result);
+                view.tilt_preview_corrected = true;
+                view.tilt_error = None;
+                view.tilt_calc = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("tilt estimation failed: {e}"));
+                view.tilt_error = Some(e);
+                view.tilt_calc = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("estimating the tilt…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+    if let Some(job) = &mut view.tilt_apply {
+        if let Some(corrected) = job.poll() {
+            let applied = view.tilt_result.take();
+            logger::log(format!(
+                "tilt correction applied: {:.4} deg, {} px roll",
+                applied.map(|r| r.tilt_deg).unwrap_or(0.0),
+                applied.map(|r| r.shift_px).unwrap_or(0)
+            ));
+            view.stack = std::sync::Arc::new(corrected);
+            view.tilt_applied = applied;
+            view.tilt_apply = None;
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("applying the tilt correction to the stack…");
+            });
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+    }
+
+    let stack = std::sync::Arc::clone(&view.stack);
+    let Some(first) = stack.sample.first() else {
+        return;
+    };
+    let h = first.height;
+    // The projections closest to 0° and 180°.
+    let nearest = |target: f64| -> Option<usize> {
+        stack
+            .sample
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.angle_deg.map(|a| (i, (a - target).abs())))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+    };
+    let (Some(i0), Some(i180)) = (nearest(0.0), nearest(180.0)) else {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            "the projections carry no angles — the tilt needs the 0° and 180° images",
+        );
+        return;
+    };
+    ui.label(
+        RichText::new(format!(
+            "0°: {} — 180°: {}",
+            stack.sample[i0].name, stack.sample[i180].name
+        ))
+        .weak()
+        .size(11.0),
+    );
+
+    let (mut y_top, mut y_bottom) = view
+        .tilt_range
+        .unwrap_or((h / 10, h.saturating_sub(1 + h / 10)));
+    ui.horizontal(|ui| {
+        ui.label("slice range:");
+        ui.add(egui::DragValue::new(&mut y_top).range(0..=h.saturating_sub(2)));
+        ui.label("to");
+        ui.add(egui::DragValue::new(&mut y_bottom).range(1..=h - 1));
+        ui.label(
+            RichText::new("(rows where the sample is visible)")
+                .weak()
+                .size(11.0),
+        );
+    });
+    y_bottom = y_bottom.clamp(y_top + 1, h - 1);
+    view.tilt_range = Some((y_top, y_bottom));
+
+    // Preview: any projection (frame slider), with the slice range shaded
+    // and — once estimated — either the axis overlay on the raw image or the
+    // image with the correction applied.
+    let w = first.width;
+    let n = stack.sample.len();
+    view.tilt_frame = view.tilt_frame.min(n - 1);
+    ui.horizontal(|ui| {
+        ui.add(egui::Slider::new(&mut view.tilt_frame, 0..=n - 1).text("image"));
+        let p = &stack.sample[view.tilt_frame];
+        ui.label(
+            RichText::new(match p.angle_deg {
+                Some(a) => format!("{} — {a:.3}°", p.name),
+                None => p.name.clone(),
+            })
+            .weak()
+            .size(11.0),
+        );
+        ui.add_enabled(
+            view.tilt_result.is_some(),
+            egui::Checkbox::new(
+                &mut view.tilt_preview_corrected,
+                "with the correction applied",
+            ),
+        );
+    });
+    let corrected = view.tilt_preview_corrected && view.tilt_result.is_some();
+    let result_bits = view
+        .tilt_result
+        .map(|r| r.tilt_deg.to_bits() ^ (r.shift_px as u64).rotate_left(17))
+        .unwrap_or(0);
+    let tex_key = (
+        std::sync::Arc::as_ptr(&stack) as usize,
+        view.tilt_frame,
+        corrected,
+        if corrected { result_bits } else { 0 },
+    );
+    if view.tilt_tex.as_ref().map(|(k, _)| *k) != Some(tex_key) {
+        let p = &stack.sample[view.tilt_frame];
+        let stride = (p.width.max(p.height) / 512).max(1);
+        let (sw, sh) = (p.width.div_ceil(stride), p.height.div_ceil(stride));
+        let mut small = Vec::with_capacity(sw * sh);
+        for y in (0..p.height).step_by(stride) {
+            for x in (0..p.width).step_by(stride) {
+                small.push(p.mean[y * p.width + x]);
+            }
+        }
+        if corrected && let Some(result) = &view.tilt_result {
+            // Same correction, scaled to the downsampled preview.
+            let shift_small = (result.shift_px as f64 / stride as f64).round() as i64;
+            small = crate::tilt::rotate_roll(&small, sw, sh, result.tilt_deg, shift_small);
+        }
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for v in &small {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let span = (hi - lo).max(1e-6);
+        let pixels: Vec<Color32> = small
+            .iter()
+            .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+            .collect();
+        let image = egui::ColorImage {
+            size: [sw, sh],
+            source_size: egui::vec2(sw as f32, sh as f32),
+            pixels,
+        };
+        let tex = ctx.load_texture("tilt_preview", image, egui::TextureOptions::LINEAR);
+        view.tilt_tex = Some((tex_key, tex));
+    }
+    if let Some((_, tex)) = &view.tilt_tex {
+        let size = tex.size_vec2();
+        let scale = (440.0 / size.x.max(size.y)).min(2.0);
+        let response = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
+        let rect = response.rect;
+        let painter = ui.painter_at(rect);
+        let y_of = |row: f64| rect.top() + (row / h as f64) as f32 * rect.height();
+        let x_of = |col: f64| rect.left() + (col / w as f64) as f32 * rect.width();
+        // Slice range: shaded band and its two edge lines.
+        let band = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), y_of(y_top as f64)),
+            egui::pos2(rect.right(), y_of(y_bottom as f64)),
+        );
+        painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(100, 170, 255, 28));
+        for row in [y_top, y_bottom] {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), y_of(row as f64)),
+                    egui::pos2(rect.right(), y_of(row as f64)),
+                ],
+                egui::Stroke::new(1.5, Color32::from_rgb(100, 170, 255)),
+            );
+        }
+        // Vertical reference through the detector center.
+        let center_x = x_of((w as f64 - 1.0) / 2.0);
+        painter.line_segment(
+            [
+                egui::pos2(center_x, rect.top()),
+                egui::pos2(center_x, rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, Color32::from_gray(120)),
+        );
+        // On the raw image: the estimated rotation axis (what the correction
+        // will straighten). On the corrected image it coincides with the
+        // vertical reference, so it is not drawn.
+        if !corrected
+            && let Some(result) = &view.tilt_result
+        {
+            painter.line_segment(
+                [
+                    egui::pos2(x_of(result.axis_column(0.0, w)), y_of(0.0)),
+                    egui::pos2(x_of(result.axis_column(h as f64 - 1.0, w)), y_of(h as f64 - 1.0)),
+                ],
+                egui::Stroke::new(2.0, Color32::from_rgb(255, 160, 70)),
+            );
+        }
+    }
+    ui.label(
+        RichText::new(if corrected {
+            "correction applied in the preview — the rotation axis should now match the \
+             gray vertical reference"
+        } else if view.tilt_result.is_some() {
+            "blue: slice range — gray: vertical reference — orange: estimated rotation axis \
+             (the correction makes it match the gray line)"
+        } else {
+            "blue: slice range used by the fit — gray: vertical reference; calculate to see \
+             the estimated axis"
+        })
+        .weak()
+        .size(11.0),
+    );
+
+    let busy = view.tilt_calc.is_some() || view.tilt_apply.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, egui::Button::new("🧮 Calculate the tilt"))
+            .clicked()
+        {
+            logger::log(format!(
+                "estimating the tilt from {} (0°) and {} (180°), rows {y_top}..{y_bottom}",
+                stack.sample[i0].name, stack.sample[i180].name
+            ));
+            view.tilt_error = None;
+            view.tilt_calc = Some(TiltCalcJob::start(
+                std::sync::Arc::clone(&stack),
+                i0,
+                i180,
+                y_top,
+                y_bottom,
+            ));
+        }
+        if let Some(result) = &view.tilt_result {
+            ui.label(
+                RichText::new(format!(
+                    "tilt: {:.4}° — axis shift: {} px ({} rows fitted)",
+                    result.tilt_deg, result.shift_px, result.rows_used
+                ))
+                .strong(),
+            );
+        }
+    });
+
+    if view.tilt_result.is_some()
+        && ui
+            .add_enabled(!busy, egui::Button::new("▶ Apply the correction to the stack"))
+            .on_hover_text("rotates every projection by the tilt and rolls it by the axis shift")
+            .clicked()
+        && let Some(result) = view.tilt_result
+    {
+        logger::log(format!(
+            "applying the tilt correction ({:.4} deg, {} px) to {} projections…",
+            result.tilt_deg,
+            result.shift_px,
+            stack.sample.len()
+        ));
+        view.tilt_apply = Some(TiltApplyJob::start(stack, result));
+    }
+    if let Some(applied) = &view.tilt_applied {
+        ui.label(
+            RichText::new(format!(
+                "correction applied ✔ ({:.4}°, {} px) — recalculate to verify: it should now \
+                 find ≈ 0°",
+                applied.tilt_deg, applied.shift_px
+            ))
+            .color(Color32::from_rgb(120, 200, 120)),
+        );
+    }
+    if let Some(e) = &view.tilt_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
 /// The sinogram of one detector row of the current (normalized, possibly
 /// rotated) stack: one line per projection, in stack order (increasing
 /// angle), against the detector column.
@@ -2429,6 +2765,7 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_quarters = 0;
                 view.rotation_applied = 0;
                 view.rot_tex = None;
+                view.clear_tilt();
             }
             Some(Ok(None)) => {
                 logger::log("crop tool closed without saving a region");
