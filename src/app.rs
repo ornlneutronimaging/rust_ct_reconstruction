@@ -15,6 +15,7 @@ use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
+use crate::rotate::{self, RotateJob};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
@@ -70,7 +71,19 @@ enum Screen {
     Stack(StackView),
 }
 
+/// The accordion sections of the pre-processing screen — one open at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackSection {
+    Provenance,
+    Crop,
+    Clean,
+    Normalize,
+    Rotate,
+}
+
 struct StackView {
+    /// Which accordion section is open (one at a time).
+    open_section: Option<StackSection>,
     /// The stack as loaded — crops are always drawn on this one, so the
     /// region can be widened again later.
     original: std::sync::Arc<LoadedStack>,
@@ -106,12 +119,26 @@ struct StackView {
     norm_summary: Option<String>,
     norm_error: Option<String>,
     visualize_job: Option<VisualizeJob>,
+
+    // Rotation (after normalization; the rotation axis must be vertical).
+    /// The normalized, un-rotated baseline every rotation starts from.
+    unrotated: Option<std::sync::Arc<LoadedStack>>,
+    /// Selected rotation, in quarter turns clockwise (0..=3).
+    rotation_quarters: usize,
+    /// Rotation currently applied to the stack, in quarter turns.
+    rotation_applied: usize,
+    rotate_job: Option<RotateJob>,
+    /// Frame shown by the rotation preview.
+    rot_frame: usize,
+    /// Preview texture, keyed by (baseline, frame, quarters).
+    rot_tex: Option<((usize, usize, usize), egui::TextureHandle)>,
 }
 
 impl StackView {
     fn new(stack: LoadedStack) -> Self {
         let stack = std::sync::Arc::new(stack);
         Self {
+            open_section: Some(StackSection::Normalize),
             original: std::sync::Arc::clone(&stack),
             stack,
             crop: None,
@@ -132,6 +159,12 @@ impl StackView {
             norm_summary: None,
             norm_error: None,
             visualize_job: None,
+            unrotated: None,
+            rotation_quarters: 0,
+            rotation_applied: 0,
+            rotate_job: None,
+            rot_frame: 0,
+            rot_tex: None,
         }
     }
 
@@ -1532,6 +1565,10 @@ fn stack_ui(
             view.norm_summary = None;
             view.norm_error = None;
             view.norm_settings.roi = None;
+            view.unrotated = None;
+            view.rotation_quarters = 0;
+            view.rotation_applied = 0;
+            view.rot_tex = None;
         }
         top_right_bar(ui, logo, log_open, 28.0);
     });
@@ -1557,34 +1594,59 @@ fn stack_ui(
         .strong(),
     );
     ui.add_space(6.0);
-    egui::CollapsingHeader::new(RichText::new("Provenance").strong())
-        .default_open(false)
-        .show(ui, |ui| {
-            for (name, value) in &stack.metadata {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
-                    ui.label(RichText::new(value).size(12.0));
-                });
+    // Accordion: exactly one section open at a time; clicking an open
+    // section's header collapses it.
+    let mut clicked: Option<StackSection> = None;
+    let mut section =
+        |ui: &mut egui::Ui,
+         view: &mut StackView,
+         which: StackSection,
+         title: &str,
+         body: &mut dyn FnMut(&mut egui::Ui, &mut StackView)| {
+            let open = view.open_section == Some(which);
+            let response = egui::CollapsingHeader::new(RichText::new(title).strong())
+                .open(Some(open))
+                .show(ui, |ui| body(ui, view));
+            if response.header_response.clicked() {
+                clicked = Some(which);
             }
-        });
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Crop").strong())
-        .default_open(true)
-        .show(ui, |ui| {
-            crop_section_ui(ui, view);
-        });
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Remove outliers").strong())
-        .default_open(true)
-        .show(ui, |ui| {
-            clean_section_ui(ui, view);
-        });
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Normalization (mandatory)").strong())
-        .default_open(true)
-        .show(ui, |ui| {
+            ui.add_space(4.0);
+        };
+    section(ui, view, StackSection::Provenance, "Provenance", &mut |ui, view| {
+        for (name, value) in &view.stack.metadata {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                ui.label(RichText::new(value).size(12.0));
+            });
+        }
+    });
+    section(ui, view, StackSection::Crop, "Crop", &mut |ui, view| {
+        crop_section_ui(ui, view);
+    });
+    section(ui, view, StackSection::Clean, "Remove outliers", &mut |ui, view| {
+        clean_section_ui(ui, view);
+    });
+    section(
+        ui,
+        view,
+        StackSection::Normalize,
+        "Normalization (mandatory)",
+        &mut |ui, view| {
             normalization_section_ui(ui, view);
+        },
+    );
+    if view.normalized {
+        section(ui, view, StackSection::Rotate, "Rotate the data", &mut |ui, view| {
+            rotation_section_ui(ui, view);
         });
+    }
+    if let Some(which) = clicked {
+        view.open_section = if view.open_section == Some(which) {
+            None
+        } else {
+            Some(which)
+        };
+    }
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
         ui.label(
@@ -1958,6 +2020,13 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.norm_summary = Some(summary);
                 view.norm_error = None;
                 view.norm_job = None;
+                // The rotation step starts from this normalized baseline,
+                // and the accordion moves on to it.
+                view.unrotated = Some(std::sync::Arc::clone(&view.stack));
+                view.rotation_quarters = 0;
+                view.rotation_applied = 0;
+                view.rot_tex = None;
+                view.open_section = Some(StackSection::Rotate);
             }
             Some(Err(e)) => {
                 logger::error(format!("normalization failed: {e}"));
@@ -2100,6 +2169,143 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
 }
 
+/// Rotate the stack in 90° steps so the scan's rotation axis is vertical —
+/// with a live preview (any projection, via a frame slider) of the selected
+/// rotation before applying it to the whole stack.
+fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.rotate_job {
+        if let Some(rotated) = job.poll() {
+            logger::log(format!(
+                "rotation applied to sample and open beams: {}°",
+                view.rotation_quarters * 90
+            ));
+            view.stack = std::sync::Arc::new(rotated);
+            view.rotation_applied = view.rotation_quarters;
+            view.rotate_job = None;
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("rotating the stack…");
+            });
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+    }
+
+    let Some(baseline) = view.unrotated.clone() else {
+        ui.label(RichText::new("normalize first").weak());
+        return;
+    };
+    let n = baseline.sample.len();
+    if n == 0 {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Rotation:").strong());
+        ui.add(
+            egui::Slider::new(&mut view.rotation_quarters, 0..=3)
+                .custom_formatter(|v, _| format!("{}°", (v as usize % 4) * 90))
+                .custom_parser(|s| {
+                    s.trim().trim_end_matches('°').parse::<f64>().ok().map(|d| d / 90.0)
+                }),
+        )
+        .on_hover_text("clockwise, in 90° steps — the rotation axis must end up vertical");
+        ui.label(
+            RichText::new(if view.rotation_applied == view.rotation_quarters {
+                format!("applied: {}°", view.rotation_applied * 90)
+            } else {
+                format!(
+                    "applied: {}° — previewing {}°",
+                    view.rotation_applied * 90,
+                    view.rotation_quarters * 90
+                )
+            })
+            .weak(),
+        );
+    });
+
+    // Frame slider through ALL projections, so the effect of the rotation is
+    // visible on any of them.
+    view.rot_frame = view.rot_frame.min(n - 1);
+    ui.horizontal(|ui| {
+        ui.add(egui::Slider::new(&mut view.rot_frame, 0..=n - 1).text("image"));
+        let p = &baseline.sample[view.rot_frame];
+        ui.label(
+            RichText::new(match p.angle_deg {
+                Some(a) => format!("{} — {a:.3}°", p.name),
+                None => p.name.clone(),
+            })
+            .weak()
+            .size(11.0),
+        );
+    });
+
+    // Preview: the selected frame, downsampled then rotated.
+    let key = (
+        std::sync::Arc::as_ptr(&baseline) as usize,
+        view.rot_frame,
+        view.rotation_quarters,
+    );
+    if view.rot_tex.as_ref().map(|(k, _)| *k) != Some(key) {
+        let p = &baseline.sample[view.rot_frame];
+        let stride = (p.width.max(p.height) / 512).max(1);
+        let (sw, sh) = (p.width.div_ceil(stride), p.height.div_ceil(stride));
+        let mut small = Vec::with_capacity(sw * sh);
+        for y in (0..p.height).step_by(stride) {
+            for x in (0..p.width).step_by(stride) {
+                small.push(p.mean[y * p.width + x]);
+            }
+        }
+        let (rw, rh, rotated) = rotate::rotate_quarter(&small, sw, sh, view.rotation_quarters);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for v in &rotated {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let span = (hi - lo).max(1e-6);
+        let pixels: Vec<Color32> = rotated
+            .iter()
+            .map(|v| {
+                let g = (((v - lo) / span) * 255.0) as u8;
+                Color32::from_gray(g)
+            })
+            .collect();
+        let image = egui::ColorImage {
+            size: [rw, rh],
+            source_size: egui::vec2(rw as f32, rh as f32),
+            pixels,
+        };
+        let tex = ctx.load_texture("rotation_preview", image, egui::TextureOptions::LINEAR);
+        view.rot_tex = Some((key, tex));
+    }
+    if let Some((_, tex)) = &view.rot_tex {
+        let size = tex.size_vec2();
+        let scale = (420.0 / size.x.max(size.y)).min(2.0);
+        ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
+    }
+
+    let ready = view.rotation_quarters != view.rotation_applied && view.rotate_job.is_none();
+    if ui
+        .add_enabled(ready, egui::Button::new("▶ Apply the rotation to the stack"))
+        .clicked()
+    {
+        logger::log(format!(
+            "rotating the stack (sample + ob) by {}° clockwise…",
+            view.rotation_quarters * 90
+        ));
+        view.rotate_job = Some(RotateJob::start(baseline, view.rotation_quarters));
+    }
+    if view.rotation_applied == view.rotation_quarters {
+        ui.label(
+            RichText::new("the preview matches what the stack currently is")
+                .weak()
+                .size(11.0),
+        );
+    }
+}
+
 /// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
 /// handed over, and the returned region is applied to the sample AND the
 /// open beams.
@@ -2131,6 +2337,10 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.normalized = false;
                 view.norm_summary = None;
                 view.norm_settings.roi = None;
+                view.unrotated = None;
+                view.rotation_quarters = 0;
+                view.rotation_applied = 0;
+                view.rot_tex = None;
             }
             Some(Ok(None)) => {
                 logger::log("crop tool closed without saving a region");
