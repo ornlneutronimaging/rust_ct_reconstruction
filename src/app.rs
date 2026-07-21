@@ -1255,24 +1255,71 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
 
     match view.angle_source {
         AngleSource::NamingConvention => {
-            let Some(example) = view.first_sample_image().cloned() else {
+            if view.first_sample_image().is_none() {
                 ui.label(
                     RichText::new("select at least one sample folder to set up the convention")
                         .weak(),
                 );
                 return;
-            };
-            // (Re)build the checkboxes when the example file changes.
-            if view.nc_example.as_ref() != Some(&example) {
+            }
+            // The current example must still belong to the selection;
+            // otherwise fall back to the first sample image and rebuild.
+            let example_valid = view.nc_example.as_ref().is_some_and(|e| {
+                view.sample
+                    .selected
+                    .iter()
+                    .any(|(_, files)| files.contains(e))
+            });
+            if !example_valid {
+                let example = view.first_sample_image().cloned().expect("checked above");
                 view.nc_fields = white_beam::name_fields(&example);
                 view.nc_checked = vec![false; view.nc_fields.len()];
                 if let Some((i, j)) = white_beam::default_angle_fields(view.nc_fields.len()) {
                     view.nc_checked[i] = true;
                     view.nc_checked[j] = true;
                 }
-                view.nc_example = Some(example.clone());
+                view.nc_example = Some(example);
             }
+            let example = view.nc_example.clone().expect("set above");
             ui.horizontal(|ui| {
+                if ui
+                    .small_button("🎲")
+                    .on_hover_text(
+                        "try another randomly picked file name, keeping the checked \
+                         fields, to make sure they are the right ones",
+                    )
+                    .clicked()
+                {
+                    let files: Vec<&PathBuf> = view
+                        .sample
+                        .selected
+                        .iter()
+                        .flat_map(|(_, files)| files.iter())
+                        .collect();
+                    if files.len() > 1 {
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos() as usize)
+                            .unwrap_or(0);
+                        let mut index = nanos % files.len();
+                        if files[index] == &example {
+                            index = (index + 1) % files.len();
+                        }
+                        let new_example = files[index].clone();
+                        let fields = white_beam::name_fields(&new_example);
+                        // Same field count: the checked fields carry over so
+                        // they can be validated; otherwise back to defaults.
+                        if fields.len() != view.nc_fields.len() {
+                            view.nc_checked = vec![false; fields.len()];
+                            if let Some((i, j)) = white_beam::default_angle_fields(fields.len()) {
+                                view.nc_checked[i] = true;
+                                view.nc_checked[j] = true;
+                            }
+                        }
+                        view.nc_fields = fields;
+                        view.nc_example = Some(new_example);
+                    }
+                }
                 ui.label(RichText::new("File name:").strong());
                 ui.label(
                     RichText::new(
@@ -1285,6 +1332,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                     .size(12.0),
                 );
             });
+            let example = view.nc_example.clone().expect("set above");
             ui.label(
                 RichText::new(
                     "check the 2 fields giving the angle value (degrees . decimals)",
