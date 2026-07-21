@@ -67,6 +67,7 @@ pub struct RunToCombine {
 }
 
 /// The mean of the selected images of one run folder.
+#[derive(Clone)]
 pub struct Projection {
     pub name: String,
     pub run_number: Option<u32>,
@@ -332,6 +333,7 @@ impl CombineScan {
 }
 
 /// Everything recorded next to the data in the HDF5 file.
+#[derive(Clone)]
 pub struct SaveMeta {
     pub instrument: String,
     pub ipts: String,
@@ -467,6 +469,39 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
         output.sample[0].width,
         output.ob.len()
     ))
+}
+
+/// A combined output as a pre-processing stack, without going through a
+/// file — same content a save + load round trip would produce.
+/// `pseudo_path` stands in for the (not saved) file: its name is shown as
+/// the stack title and its folder is used for scratch space.
+pub fn stack_from_output(
+    output: &CombineOutput,
+    meta: &SaveMeta,
+    pseudo_path: PathBuf,
+) -> LoadedStack {
+    let mut metadata = vec![
+        ("method".to_owned(), "mean".to_owned()),
+        ("instrument".to_owned(), meta.instrument.clone()),
+        ("ipts".to_owned(), meta.ipts.clone()),
+        ("detector".to_owned(), meta.detector.clone()),
+        ("sample_folder".to_owned(), meta.sample_folder.clone()),
+        ("ob_folder".to_owned(), meta.ob_folder.clone()),
+        ("combine_mode".to_owned(), meta.combine_mode.clone()),
+    ];
+    if let Some(json) = &meta.selections_json {
+        metadata.push(("tof_selections_json".to_owned(), json.clone()));
+    }
+    if let Some(offset) = meta.detector_offset_us {
+        metadata.push(("detector_offset_us".to_owned(), offset.to_string()));
+    }
+    metadata.sort();
+    LoadedStack {
+        path: pseudo_path,
+        sample: output.sample.clone(),
+        ob: output.ob.clone(),
+        metadata,
+    }
 }
 
 /// A stack loaded back from a previously saved HDF5 file.

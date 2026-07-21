@@ -5,9 +5,10 @@
 //! decides which workflow screen the rest of the application shows.
 
 use crate::combine::{
-    CombineOutput, CombineScan, ImageSelection, LoadJob, LoadedStack, RunToCombine, SaveJob,
-    SaveMeta,
+    self, CombineOutput, CombineScan, ImageSelection, LoadJob, LoadedStack, RunToCombine,
+    SaveJob, SaveMeta,
 };
+use crate::clean::{self, CleanJob, CleanSettings, CleanStats};
 use crate::config;
 use crate::crop::{CropJob, CropRect};
 use crate::instrument::Instrument;
@@ -78,6 +79,23 @@ struct StackView {
     crop: Option<CropRect>,
     crop_job: Option<CropJob>,
     crop_error: Option<String>,
+
+    // Remove outliers.
+    clean_settings: CleanSettings,
+    clean_job: Option<CleanJob>,
+    clean_stats: Option<CleanStats>,
+    /// The stack before cleaning (i.e. the crop output), kept so the
+    /// cleaning can be re-run with different settings.
+    uncleaned: Option<std::sync::Arc<LoadedStack>>,
+    /// Show the OB histogram instead of the sample one.
+    hist_show_ob: bool,
+    /// Edge-trimmed summed images for the histogram plots, keyed by
+    /// (stack pointer, is_ob). A small FIFO so before/after × sample/ob fit.
+    sum_cache: Vec<((usize, bool), Vec<f32>)>,
+    sum_jobs: Vec<((usize, bool), std::sync::mpsc::Receiver<Vec<f32>>)>,
+    /// Histograms of the summed images: key (stack, is_ob, bins, range
+    /// fingerprint — 0 for the data's own min/max).
+    hist_cache: Vec<((usize, bool, usize, u64), (f64, f64, Vec<u64>))>,
 }
 
 impl StackView {
@@ -89,7 +107,23 @@ impl StackView {
             crop: None,
             crop_job: None,
             crop_error: None,
+            clean_settings: CleanSettings::default(),
+            clean_job: None,
+            clean_stats: None,
+            uncleaned: None,
+            hist_show_ob: false,
+            sum_cache: Vec::new(),
+            sum_jobs: Vec::new(),
+            hist_cache: Vec::new(),
         }
+    }
+
+    /// What the next cleaning run starts from: the pre-cleaning stack when a
+    /// cleaning was already applied, the current stack otherwise.
+    fn clean_input(&self) -> std::sync::Arc<LoadedStack> {
+        self.uncleaned
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::clone(&self.stack))
     }
 }
 
@@ -147,6 +181,9 @@ struct WhiteBeamView {
     processed: Option<std::sync::Arc<CombineOutput>>,
     save_job: Option<SaveJob>,
     save_status: Option<Result<String, String>>,
+    /// Set by the "continue to pre-processing" button; the main loop picks
+    /// it up and switches to the pre-processing screen.
+    goto_preprocess: Option<LoadedStack>,
 }
 
 /// Integrated intensities cached per selection: the scan covers the used
@@ -222,6 +259,7 @@ impl WhiteBeamView {
             processed: None,
             save_job: None,
             save_status: None,
+            goto_preprocess: None,
         }
     }
 
@@ -556,6 +594,9 @@ struct TofView {
     processed: Option<std::sync::Arc<CombineOutput>>,
     save_job: Option<SaveJob>,
     save_status: Option<Result<String, String>>,
+    /// Set by the "continue to pre-processing" button; the main loop picks
+    /// it up and switches to the pre-processing screen.
+    goto_preprocess: Option<LoadedStack>,
 }
 
 impl TofView {
@@ -603,6 +644,7 @@ impl TofView {
             processed: None,
             save_job: None,
             save_status: None,
+            goto_preprocess: None,
         }
     }
 
@@ -1434,27 +1476,46 @@ fn stack_ui(
     log_open: &mut bool,
 ) -> bool {
     let mut back = false;
-    let stack = &view.stack;
+    let title_name = view
+        .stack
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     ui.horizontal(|ui| {
         if ui.button("↩ Back").clicked() {
             back = true;
         }
         ui.label(
-            RichText::new(format!(
-                "Pre-processing — {}",
-                stack
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ))
-            .size(15.0)
-            .strong(),
+            RichText::new(format!("Pre-processing — {title_name}"))
+                .size(15.0)
+                .strong(),
         );
+        let busy = view.crop_job.is_some() || view.clean_job.is_some();
+        let touched = view.crop.is_some() || view.clean_stats.is_some();
+        if ui
+            .add_enabled(!busy && touched, egui::Button::new("🔄 Reset to the loaded data"))
+            .on_hover_text(
+                "discard the crop and outlier removal and start over from the data set \
+                 this screen was opened with",
+            )
+            .clicked()
+        {
+            logger::log("pre-processing reset: back to the loaded data set");
+            view.stack = std::sync::Arc::clone(&view.original);
+            view.crop = None;
+            view.crop_error = None;
+            view.uncleaned = None;
+            view.clean_stats = None;
+            view.sum_cache.clear();
+            view.sum_jobs.clear();
+            view.hist_cache.clear();
+        }
         top_right_bar(ui, logo, log_open, 28.0);
     });
     ui.add_space(10.0);
 
+    let stack = &view.stack;
     let angles: Vec<f64> = stack.sample.iter().filter_map(|p| p.angle_deg).collect();
     let dims = stack
         .sample
@@ -1490,6 +1551,12 @@ fn stack_ui(
         .show(ui, |ui| {
             crop_section_ui(ui, view);
         });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Remove outliers").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            clean_section_ui(ui, view);
+        });
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
         ui.label(
@@ -1499,6 +1566,320 @@ fn stack_ui(
         );
     });
     back
+}
+
+/// "Remove outliers": the three cleaning methods of the Python
+/// ImagesCleaner (in-house histogram, tomopy remove_outlier, scipy median
+/// filter), applied to the sample and open-beam stacks.
+fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    // Fold a finished cleaning run into the view.
+    if let Some(job) = &mut view.clean_job {
+        if let Some((cleaned, stats)) = job.poll() {
+            logger::log(format!(
+                "outliers removed ({}): {} in-house, {} tomopy replacements{}",
+                view.clean_settings.describe(),
+                stats.in_house_replaced,
+                stats.tomopy_replaced,
+                if stats.scipy_applied {
+                    ", scipy filter applied"
+                } else {
+                    ""
+                }
+            ));
+            if view.uncleaned.is_none() {
+                view.uncleaned = Some(std::sync::Arc::clone(&view.stack));
+            }
+            view.stack = std::sync::Arc::new(cleaned);
+            view.clean_stats = Some(stats);
+            view.clean_job = None;
+        } else {
+            let done = job.done();
+            let frac = (done as f32 / job.total.max(1) as f32).min(1.0);
+            ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{} images", job.total)));
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+    }
+
+    let settings = &mut view.clean_settings;
+    ui.checkbox(&mut settings.in_house, "In-house (histogram)");
+    if settings.in_house {
+        ui.indent("in_house_settings", |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.nbr_bins, 10..=1000).text("bins"),
+                );
+                ui.label("exclude bins:");
+                ui.add(egui::DragValue::new(&mut settings.exclude_left).range(0..=50));
+                ui.label("left,");
+                ui.add(egui::DragValue::new(&mut settings.exclude_right).range(0..=50));
+                ui.label("right");
+                ui.label("radius:");
+                ui.add(egui::DragValue::new(&mut settings.correct_radius).range(1..=5))
+                    .on_hover_text("replacement median window is (2r+1) x (2r+1)");
+            });
+        });
+    }
+    ui.checkbox(&mut settings.tomopy, "Tomopy (remove_outlier)");
+    if settings.tomopy {
+        ui.indent("tomopy_settings", |ui| {
+            ui.add(
+                egui::Slider::new(&mut settings.tomopy_diff, 1.0..=100.0).text("diff value"),
+            )
+            .on_hover_text(
+                "pixels brighter than the 3x3 median of their image by more than this \
+                 are replaced by that median",
+            );
+        });
+    }
+    ui.checkbox(&mut settings.scipy, "Scipy (median_filter)")
+        .on_hover_text("every pixel is replaced by the 3x3 median of its image");
+
+    // Histogram of the edge-trimmed summed image, sample or ob, before and
+    // (once cleaned) after — the excluded bins of the in-house method in red.
+    let ob_available = !view.stack.ob.is_empty();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Histogram:").strong());
+        if ui.selectable_label(!view.hist_show_ob, "sample").clicked() {
+            view.hist_show_ob = false;
+        }
+        if ui
+            .add_enabled(
+                ob_available,
+                egui::Button::selectable(view.hist_show_ob, "ob"),
+            )
+            .clicked()
+        {
+            view.hist_show_ob = true;
+        }
+        if !ob_available {
+            ui.label(RichText::new("(no ob in this stack)").weak().size(11.0));
+        }
+    });
+    let use_ob = view.hist_show_ob && ob_available;
+    let before = view.clean_input();
+    let cleaned = (view.clean_stats.is_some() && view.uncleaned.is_some())
+        .then(|| std::sync::Arc::clone(&view.stack));
+    match cleaned {
+        None => {
+            stack_histogram_ui(ui, &ctx, view, &before, use_ob, "before cleaning", true, None);
+        }
+        Some(after) => {
+            ui.columns(2, |cols| {
+                stack_histogram_ui(
+                    &mut cols[0],
+                    &ctx,
+                    view,
+                    &before,
+                    use_ob,
+                    "before cleaning",
+                    true,
+                    None,
+                );
+                // Same bin edges as the before histogram, so the two compare
+                // bin for bin (only the red-marked tails should empty out).
+                let bins = view.clean_settings.nbr_bins;
+                let before_key = (std::sync::Arc::as_ptr(&before) as usize, use_ob, bins, 0u64);
+                let before_range = view
+                    .hist_cache
+                    .iter()
+                    .find(|(k, _)| *k == before_key)
+                    .map(|(_, (min, max, _))| (*min, *max));
+                stack_histogram_ui(
+                    &mut cols[1],
+                    &ctx,
+                    view,
+                    &after,
+                    use_ob,
+                    "after cleaning",
+                    false,
+                    before_range,
+                );
+            });
+        }
+    }
+
+    let busy = view.clean_job.is_some();
+    let ready = view.clean_settings.any_enabled() && !busy;
+    if ui
+        .add_enabled(ready, egui::Button::new("▶ Remove the outliers"))
+        .clicked()
+    {
+        let input = view.clean_input();
+        logger::log(format!(
+            "removing outliers ({}) on {} sample + {} ob images…",
+            view.clean_settings.describe(),
+            input.sample.len(),
+            input.ob.len()
+        ));
+        if view.uncleaned.is_none() {
+            view.uncleaned = Some(std::sync::Arc::clone(&input));
+        }
+        view.clean_stats = None;
+        view.clean_job = Some(CleanJob::start(input, view.clean_settings.clone()));
+    }
+    if !view.clean_settings.any_enabled() {
+        ui.label(RichText::new("select at least one method").weak());
+    }
+    if let Some(stats) = &view.clean_stats {
+        let mut parts = Vec::new();
+        if view.clean_settings.in_house {
+            parts.push(format!("{} pixels by the in-house histogram", stats.in_house_replaced));
+        }
+        if view.clean_settings.tomopy {
+            parts.push(format!("{} pixels by tomopy", stats.tomopy_replaced));
+        }
+        if stats.scipy_applied {
+            parts.push("every pixel median-filtered by scipy".to_owned());
+        }
+        ui.label(
+            RichText::new(format!("cleaned (sample + ob): {}", parts.join(", "))).strong(),
+        );
+        ui.label(
+            RichText::new("re-running applies the current settings to the pre-cleaning stack")
+                .weak()
+                .size(11.0),
+        );
+    }
+}
+
+/// Histogram of the edge-trimmed summed image (sample or ob) of one stack,
+/// computed once per (stack, data type) on a background thread. The excluded
+/// bins of the in-house method are drawn in red.
+#[allow(clippy::too_many_arguments)]
+fn stack_histogram_ui(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    view: &mut StackView,
+    stack: &std::sync::Arc<LoadedStack>,
+    use_ob: bool,
+    title: &str,
+    mark_exclusions: bool,
+    range: Option<(f64, f64)>,
+) {
+    const EDGE_TRIM: usize = 10;
+    ui.label(RichText::new(title).strong().size(13.0));
+    let projections = if use_ob { &stack.ob } else { &stack.sample };
+    if projections.is_empty() {
+        ui.label(RichText::new("no data").weak());
+        return;
+    }
+    let key = (std::sync::Arc::as_ptr(stack) as usize, use_ob);
+
+    // Summed image: cached, else polled from its job, else started.
+    let cached = view.sum_cache.iter().position(|(k, _)| *k == key);
+    let index = match cached {
+        Some(index) => index,
+        None => {
+            if let Some(pos) = view.sum_jobs.iter().position(|(k, _)| *k == key) {
+                match view.sum_jobs[pos].1.try_recv() {
+                    Ok(values) => {
+                        view.sum_jobs.remove(pos);
+                        if view.sum_cache.len() >= 4 {
+                            view.sum_cache.remove(0);
+                        }
+                        view.sum_cache.push((key, values));
+                        view.sum_cache.len() - 1
+                    }
+                    Err(_) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("summing the stack for the histogram…");
+                        });
+                        ctx.request_repaint_after(Duration::from_millis(300));
+                        return;
+                    }
+                }
+            } else {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stack = std::sync::Arc::clone(stack);
+                std::thread::spawn(move || {
+                    let projections = if use_ob { &stack.ob } else { &stack.sample };
+                    let Some(first) = projections.first() else {
+                        let _ = tx.send(Vec::new());
+                        return;
+                    };
+                    let (w, h) = (first.width, first.height);
+                    let mut sum = vec![0.0f64; w * h];
+                    for p in projections {
+                        for (acc, v) in sum.iter_mut().zip(&p.mean) {
+                            *acc += f64::from(*v);
+                        }
+                    }
+                    let trim = EDGE_TRIM.min(w.saturating_sub(1) / 2).min(h.saturating_sub(1) / 2);
+                    let mut values =
+                        Vec::with_capacity((h - 2 * trim).saturating_mul(w - 2 * trim));
+                    for y in trim..h - trim {
+                        for x in trim..w - trim {
+                            values.push(sum[y * w + x] as f32);
+                        }
+                    }
+                    let _ = tx.send(values);
+                });
+                view.sum_jobs.push((key, rx));
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("summing the stack for the histogram…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    };
+    if view.sum_cache[index].1.is_empty() {
+        ui.label(RichText::new("no data").weak());
+        return;
+    }
+
+    let bins = view.clean_settings.nbr_bins;
+    // A fixed range (the before histogram's edges) is part of the key so a
+    // full-range entry cached earlier cannot shadow it.
+    let range_fingerprint = range
+        .map(|(lo, hi)| lo.to_bits() ^ hi.to_bits().rotate_left(1))
+        .unwrap_or(0);
+    let hist_key = (key.0, key.1, bins, range_fingerprint);
+    if !view.hist_cache.iter().any(|(k, _)| *k == hist_key) {
+        let values = &view.sum_cache[index].1;
+        let (min, max, counts) = match range {
+            Some((lo, hi)) => clean::histogram_range(values, bins, lo, hi),
+            None => clean::histogram(values, bins),
+        };
+        if view.hist_cache.len() >= 8 {
+            view.hist_cache.remove(0);
+        }
+        view.hist_cache.push((hist_key, (min, max, counts)));
+    }
+    let Some((_, (min, max, counts))) = view.hist_cache.iter().find(|(k, _)| *k == hist_key)
+    else {
+        return;
+    };
+    let bin_width = (max - min) / counts.len() as f64;
+    let mark_exclusions = mark_exclusions && view.clean_settings.in_house;
+    let left = view.clean_settings.exclude_left;
+    let right = view.clean_settings.exclude_right;
+    let bars: Vec<egui_plot::Bar> = counts
+        .iter()
+        .enumerate()
+        .map(|(k, count)| {
+            let excluded =
+                mark_exclusions && (k < left || k >= counts.len().saturating_sub(right));
+            egui_plot::Bar::new(min + (k as f64 + 0.5) * bin_width, (*count as f64 + 1.0).log10())
+                .width(bin_width)
+                .fill(if excluded {
+                    Color32::from_rgb(230, 100, 100)
+                } else {
+                    Color32::from_rgb(100, 170, 255)
+                })
+        })
+        .collect();
+    egui_plot::Plot::new(format!("clean_histogram_{title}_{use_ob}"))
+        .height(180.0)
+        .x_axis_label("summed image value")
+        .y_axis_label("log10(count + 1)")
+        .show(ui, |plot_ui| {
+            plot_ui.bar_chart(egui_plot::BarChart::new("histogram", bars));
+        });
 }
 
 /// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
@@ -1522,6 +1903,13 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.crop = Some(rect);
                 view.crop_error = None;
                 view.crop_job = None;
+                // Cleaning (and its previews) applied to the previous crop
+                // are void — the next run starts from this new crop.
+                view.uncleaned = None;
+                view.clean_stats = None;
+                view.sum_cache.clear();
+                view.sum_jobs.clear();
+                view.hist_cache.clear();
             }
             Some(Ok(None)) => {
                 logger::log("crop tool closed without saving a region");
@@ -1825,67 +2213,83 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         for e in &output.skipped {
             ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
         }
+        let folder_list = |pick: &MultiFolderPick| {
+            pick.selected
+                .iter()
+                .map(|(dir, ..)| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let mut mode = format!(
+            "white beam, one image per projection; angles from {}",
+            view.angle_source.label()
+        );
+        if view.use_percentage {
+            mode.push_str(&format!("; {}% coverage selection", view.percentage));
+        }
+        if !view.excluded_runs.is_empty() {
+            let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
+            sorted.sort();
+            mode.push_str(&format!("; excluded runs {sorted:?}"));
+        }
+        if view.intensities.is_some() {
+            mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
+        }
+        let meta = SaveMeta {
+            instrument: session.instrument.name().to_owned(),
+            ipts: session.ipts.name.clone(),
+            detector: view.detector.label().to_owned(),
+            sample_folder: folder_list(&view.sample),
+            ob_folder: folder_list(&view.ob),
+            combine_mode: mode,
+            selections_json: None,
+            detector_offset_us: None,
+        };
         let saving = view.save_job.is_some();
-        if ui
-            .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
-            .clicked()
-        {
-            let default_name = view
-                .sample
-                .selected
-                .first()
-                .and_then(|(dir, ..)| dir.file_name())
-                .map(|n| format!("{}_white_beam.h5", n.to_string_lossy()))
-                .unwrap_or_else(|| "ct_white_beam.h5".to_owned());
-            let mut dialog = rfd::FileDialog::new()
-                .set_title("Save the white beam projections")
-                .add_filter("HDF5", &["h5", "hdf5"])
-                .set_file_name(default_name);
-            let shared = session.ipts.path.join("shared");
-            if shared.is_dir() {
-                dialog = dialog.set_directory(shared);
+        let mut jump = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
+                .clicked()
+            {
+                let default_name = view
+                    .sample
+                    .selected
+                    .first()
+                    .and_then(|(dir, ..)| dir.file_name())
+                    .map(|n| format!("{}_white_beam.h5", n.to_string_lossy()))
+                    .unwrap_or_else(|| "ct_white_beam.h5".to_owned());
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Save the white beam projections")
+                    .add_filter("HDF5", &["h5", "hdf5"])
+                    .set_file_name(default_name);
+                let shared = session.ipts.path.join("shared");
+                if shared.is_dir() {
+                    dialog = dialog.set_directory(shared);
+                }
+                if let Some(path) = dialog.save_file() {
+                    logger::log(format!("saving white beam data to {}", path.display()));
+                    view.save_status = None;
+                    view.save_job = Some(SaveJob::start(
+                        path,
+                        std::sync::Arc::clone(output),
+                        meta.clone(),
+                    ));
+                }
             }
-            if let Some(path) = dialog.save_file() {
-                let folder_list = |pick: &MultiFolderPick| {
-                    pick.selected
-                        .iter()
-                        .map(|(dir, ..)| dir.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                };
-                let mut mode = format!(
-                    "white beam, one image per projection; angles from {}",
-                    view.angle_source.label()
-                );
-                if view.use_percentage {
-                    mode.push_str(&format!("; {}% coverage selection", view.percentage));
-                }
-                if !view.excluded_runs.is_empty() {
-                    let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
-                    sorted.sort();
-                    mode.push_str(&format!("; excluded runs {sorted:?}"));
-                }
-                if view.intensities.is_some() {
-                    mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
-                }
-                let meta = SaveMeta {
-                    instrument: session.instrument.name().to_owned(),
-                    ipts: session.ipts.name.clone(),
-                    detector: view.detector.label().to_owned(),
-                    sample_folder: folder_list(&view.sample),
-                    ob_folder: folder_list(&view.ob),
-                    combine_mode: mode,
-                    selections_json: None,
-                    detector_offset_us: None,
-                };
-                logger::log(format!("saving white beam data to {}", path.display()));
-                view.save_status = None;
-                view.save_job = Some(SaveJob::start(
-                    path,
-                    std::sync::Arc::clone(output),
-                    meta,
-                ));
-            }
+            jump = ui
+                .button("🚀 Continue to pre-processing")
+                .on_hover_text("work on the stacked projections right away — saving is optional")
+                .clicked();
+        });
+        if jump {
+            logger::log("continuing to pre-processing with the white beam stack");
+            let pseudo = session
+                .ipts
+                .path
+                .join("shared")
+                .join("white_beam_combined (not saved).h5");
+            view.goto_preprocess = Some(combine::stack_from_output(output, &meta, pseudo));
         }
         if saving {
             ui.horizontal(|ui| {
@@ -2969,11 +3373,13 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
                 combine_section_ui(ui, &ctx, view);
             });
         ui.add_space(4.0);
-        egui::CollapsingHeader::new(RichText::new("Process & combine (save to HDF5)").strong())
-            .default_open(true)
-            .show(ui, |ui| {
-                process_section_ui(ui, &ctx, session, view);
-            });
+        egui::CollapsingHeader::new(
+            RichText::new("Combine the TOF images of each run (save to HDF5)").strong(),
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            process_section_ui(ui, &ctx, session, view);
+        });
     }
 }
 
@@ -3076,10 +3482,12 @@ fn process_section_ui(
         }
         Some(sel) => {
             ui.label(format!(
-                "{} sample folders (one projection per angle) and {} ob folders — mean of {}",
+                "the TOF images ({}) inside each run are averaged into ONE projection: \
+                 {} sample runs (one per angle) and {} ob runs — runs are not combined \
+                 with each other",
+                sel.describe(),
                 kept_sample.len(),
                 kept_ob.len(),
-                sel.describe()
             ));
         }
     }
@@ -3087,10 +3495,10 @@ fn process_section_ui(
     if ui
         .checkbox(
             &mut view.merge_same_angle,
-            "Combine folders having the same angle",
+            "Combine runs having the same angle (the exception: this one merges runs)",
         )
         .on_hover_text(
-            "off: when several folders share a projection angle, only the one with the \
+            "off: when several runs share a projection angle, only the one with the \
              best statistics (highest total counts over its stack) is used",
         )
         .changed()
@@ -3108,7 +3516,10 @@ fn process_section_ui(
     let busy = view.process.is_some();
     let ready = selection.is_some() && !kept_sample.is_empty() && !busy;
     if ui
-        .add_enabled(ready, egui::Button::new("▶ Combine all kept folders (mean)"))
+        .add_enabled(
+            ready,
+            egui::Button::new("▶ Combine the TOF images of each run (mean)"),
+        )
         .clicked()
         && let Some(sel) = selection
     {
@@ -3131,7 +3542,7 @@ fn process_section_ui(
         let sample_runs = to_combine(&kept_sample);
         let ob_runs = to_combine(&kept_ob);
         logger::log(format!(
-            "combining (mean of {}): {} sample folders, {} ob folders",
+            "combining the TOF images ({}) of each run with the mean: {} sample runs, {} ob runs",
             sel.describe(),
             sample_runs.len(),
             ob_runs.len()
@@ -3180,63 +3591,79 @@ fn process_section_ui(
         for e in &output.skipped {
             ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
         }
-        let saving = view.save_job.is_some();
-        if ui
-            .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
-            .clicked()
-        {
-            let default_name = view
+        let meta = SaveMeta {
+            instrument: session.instrument.name().to_owned(),
+            ipts: session.ipts.name.clone(),
+            detector: view.detector.label().to_owned(),
+            sample_folder: view
                 .sample
                 .selected
                 .as_deref()
-                .and_then(|p| p.file_name())
-                .map(|n| format!("{}_combined.h5", n.to_string_lossy()))
-                .unwrap_or_else(|| "ct_combined.h5".to_owned());
-            let mut dialog = rfd::FileDialog::new()
-                .set_title("Save the combined projections")
-                .add_filter("HDF5", &["h5", "hdf5"])
-                .set_file_name(default_name);
-            let shared = session.ipts.path.join("shared");
-            if shared.is_dir() {
-                dialog = dialog.set_directory(shared);
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            ob_folder: view
+                .ob
+                .selected
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            combine_mode: if view.combine_all {
+                "all images".to_owned()
+            } else {
+                image_selection(view)
+                    .map(|s| s.describe())
+                    .unwrap_or_default()
+            },
+            selections_json: (!view.combine_all)
+                .then(|| view.combine_spec.as_ref().map(|s| s.raw.clone()))
+                .flatten(),
+            detector_offset_us: result.detector_offset_us,
+        };
+        let saving = view.save_job.is_some();
+        let mut jump = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
+                .clicked()
+            {
+                let default_name = view
+                    .sample
+                    .selected
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| format!("{}_combined.h5", n.to_string_lossy()))
+                    .unwrap_or_else(|| "ct_combined.h5".to_owned());
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Save the combined projections")
+                    .add_filter("HDF5", &["h5", "hdf5"])
+                    .set_file_name(default_name);
+                let shared = session.ipts.path.join("shared");
+                if shared.is_dir() {
+                    dialog = dialog.set_directory(shared);
+                }
+                if let Some(path) = dialog.save_file() {
+                    logger::log(format!("saving combined data to {}", path.display()));
+                    view.save_status = None;
+                    view.save_job = Some(SaveJob::start(
+                        path,
+                        std::sync::Arc::clone(output),
+                        meta.clone(),
+                    ));
+                }
             }
-            if let Some(path) = dialog.save_file() {
-                let meta = SaveMeta {
-                    instrument: session.instrument.name().to_owned(),
-                    ipts: session.ipts.name.clone(),
-                    detector: view.detector.label().to_owned(),
-                    sample_folder: view
-                        .sample
-                        .selected
-                        .as_deref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                    ob_folder: view
-                        .ob
-                        .selected
-                        .as_deref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                    combine_mode: if view.combine_all {
-                        "all images".to_owned()
-                    } else {
-                        image_selection(view)
-                            .map(|s| s.describe())
-                            .unwrap_or_default()
-                    },
-                    selections_json: (!view.combine_all)
-                        .then(|| view.combine_spec.as_ref().map(|s| s.raw.clone()))
-                        .flatten(),
-                    detector_offset_us: result.detector_offset_us,
-                };
-                logger::log(format!("saving combined data to {}", path.display()));
-                view.save_status = None;
-                view.save_job = Some(SaveJob::start(
-                    path,
-                    std::sync::Arc::clone(output),
-                    meta,
-                ));
-            }
+            jump = ui
+                .button("🚀 Continue to pre-processing")
+                .on_hover_text("work on the combined stack right away — saving is optional")
+                .clicked();
+        });
+        if jump {
+            logger::log("continuing to pre-processing with the combined TOF stack");
+            let pseudo = session
+                .ipts
+                .path
+                .join("shared")
+                .join("tof_combined (not saved).h5");
+            view.goto_preprocess = Some(combine::stack_from_output(output, &meta, pseudo));
         }
         if saving {
             ui.horizontal(|ui| {
@@ -3860,7 +4287,22 @@ impl eframe::App for CtApp {
                 }
                 Screen::Setup => {}
             });
-            if back {
+            // A workflow's "continue to pre-processing" button hands its
+            // combined stack over without going through a file.
+            let pending = match &mut self.screen {
+                Screen::Workflow {
+                    view: WorkflowView::Tof(tof_view),
+                    ..
+                } => tof_view.goto_preprocess.take(),
+                Screen::Workflow {
+                    view: WorkflowView::WhiteBeam(wb_view),
+                    ..
+                } => wb_view.goto_preprocess.take(),
+                _ => None,
+            };
+            if let Some(stack) = pending {
+                self.screen = Screen::Stack(StackView::new(stack));
+            } else if back {
                 logger::log("returned to setup screen");
                 self.screen = Screen::Setup;
             }
