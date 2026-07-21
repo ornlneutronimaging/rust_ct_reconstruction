@@ -5,6 +5,7 @@
 //! validation) can be tested without a display.
 
 pub mod app;
+pub mod combine;
 pub mod config;
 pub mod instrument;
 pub mod ipts;

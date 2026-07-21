@@ -4,6 +4,9 @@
 //! acquisition mode) gates everything else, and the [`Session`] it produces
 //! decides which workflow screen the rest of the application shows.
 
+use crate::combine::{
+    CombineOutput, CombineScan, ImageSelection, RunToCombine, SaveJob, SaveMeta,
+};
 use crate::config;
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
@@ -97,6 +100,15 @@ struct TofView {
     combine_error: Option<String>,
     /// `true`: combine every image of each run, no TOF range selection.
     combine_all: bool,
+    /// `true`: folders sharing an angle are merged; `false`: only the one
+    /// with the best statistics (highest total counts) is used.
+    merge_same_angle: bool,
+    /// Mean-combining pass in flight, and its result (shared with the save
+    /// thread, the stacks can be hundreds of MB).
+    process: Option<CombineScan>,
+    processed: Option<std::sync::Arc<CombineOutput>>,
+    save_job: Option<SaveJob>,
+    save_status: Option<Result<String, String>>,
 }
 
 impl TofView {
@@ -136,7 +148,14 @@ impl TofView {
             combine_job: None,
             combine_spec: None,
             combine_error: None,
-            combine_all: false,
+            // "Combine all images" is the default; picking TOF ranges with
+            // the profile viewer is the opt-in refinement.
+            combine_all: true,
+            merge_same_angle: false,
+            process: None,
+            processed: None,
+            save_job: None,
+            save_status: None,
         }
     }
 
@@ -441,7 +460,7 @@ impl CtApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Application log").strong());
-                    if ui.button("⟳ Refresh").clicked() {
+                    if ui.button("🔄 Refresh").clicked() {
                         self.refresh_log();
                     }
                     ui.checkbox(&mut self.log_auto_refresh, "auto");
@@ -476,7 +495,7 @@ impl CtApp {
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
-        top_right_bar(ui, self.logo.as_ref(), &mut self.log_view_open);
+        top_right_bar(ui, self.logo.as_ref(), &mut self.log_view_open, LOGO_MAX_HEIGHT);
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
             ui.label(RichText::new("CT Reconstruction").size(32.0).strong());
@@ -742,7 +761,7 @@ impl CtApp {
                     cfg.mode.label()
                 ));
                 self.debug_info = Some(format!(
-                    "{} → {} / {} / {}",
+                    "{} -> {} / {} / {}",
                     path.display(),
                     cfg.instrument.name(),
                     cfg.ipts,
@@ -895,12 +914,17 @@ fn next_button_widget(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     }
 }
 
-/// Top-right corner of the current row: the imaging team logo and the toggle
-/// that opens/closes the log viewer side panel.
-fn top_right_bar(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>, log_open: &mut bool) {
+/// Top-right corner of the current row: the imaging team logo (at the given
+/// height) and the toggle that opens/closes the log viewer side panel.
+fn top_right_bar(
+    ui: &mut egui::Ui,
+    logo: Option<&egui::TextureHandle>,
+    log_open: &mut bool,
+    logo_height: f32,
+) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         if let Some(tex) = logo {
-            ui.add(egui::Image::from_texture(tex).max_height(LOGO_MAX_HEIGHT));
+            ui.add(egui::Image::from_texture(tex).max_height(logo_height));
         }
         if ui.selectable_label(*log_open, "📜 Log").clicked() {
             *log_open = !*log_open;
@@ -918,14 +942,12 @@ fn workflow_ui(
     log_open: &mut bool,
 ) -> bool {
     let mut back = false;
+    // One compact header row: back, session recap, log toggle and a small
+    // logo — the vertical space belongs to the workflow itself.
     ui.horizontal(|ui| {
-        if ui.button("← Back to setup").clicked() {
+        if ui.button("↩ Back").clicked() {
             back = true;
         }
-        top_right_bar(ui, logo, log_open);
-    });
-    ui.add_space(8.0);
-    ui.vertical_centered(|ui| {
         ui.label(
             RichText::new(format!(
                 "{} — {} — {}",
@@ -933,11 +955,12 @@ fn workflow_ui(
                 session.ipts.name,
                 session.mode.label()
             ))
-            .size(24.0)
+            .size(15.0)
             .strong(),
         );
+        top_right_bar(ui, logo, log_open, 28.0);
     });
-    ui.add_space(12.0);
+    ui.add_space(6.0);
     match view {
         WorkflowView::WhiteBeam => {
             ui.vertical_centered(|ui| {
@@ -949,7 +972,12 @@ fn workflow_ui(
                 );
             });
         }
-        WorkflowView::Tof(tof_view) => tof_ui(ui, session, tof_view),
+        WorkflowView::Tof(tof_view) => {
+            egui::ScrollArea::vertical()
+                .id_salt("tof_workflow_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| tof_ui(ui, session, tof_view));
+        }
     }
     back
 }
@@ -981,6 +1009,9 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             view.preprocessed = None;
             view.removed_sample.clear();
             view.removed_ob.clear();
+            view.process = None;
+            view.processed = None;
+            view.save_status = None;
             view.preprocess = Some(PreprocessScan::start(
                 sample_folders.iter().map(ImageFolder::summary).collect(),
                 view.ob
@@ -1075,6 +1106,290 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             .show(ui, |ui| {
                 combine_section_ui(ui, &ctx, view);
             });
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(RichText::new("Process & combine (save to HDF5)").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                process_section_ui(ui, &ctx, session, view);
+            });
+    }
+}
+
+/// The union of the enabled file-index ranges of the viewer selections, or
+/// everything in combine-all mode; `None` when nothing usable is selected.
+fn image_selection(view: &TofView) -> Option<ImageSelection> {
+    if view.combine_all {
+        return Some(ImageSelection::All);
+    }
+    let spec = view.combine_spec.as_ref()?;
+    let ranges: Vec<(usize, usize)> = spec
+        .ranges
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(|r| r.file_index)
+        .map(|(a, b)| {
+            let (a, b) = (a.round().max(0.0) as usize, b.round().max(0.0) as usize);
+            (a.min(b), a.max(b))
+        })
+        .collect();
+    (!ranges.is_empty()).then_some(ImageSelection::FileIndexRanges(ranges))
+}
+
+/// Mean-combine every kept run folder and offer to save the projections
+/// (sorted by increasing angle) plus the OB stack into an HDF5 file.
+fn process_section_ui(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    session: &Session,
+    view: &mut TofView,
+) {
+    // Fold finished background work into the view.
+    if let Some(scan) = &mut view.process {
+        if let Some(output) = scan.poll() {
+            let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
+            logger::log(format!(
+                "combined {} sample projections (angles {}) and {} ob images with mean",
+                output.sample.len(),
+                match (angles.first(), angles.last()) {
+                    (Some(a), Some(b)) => format!("{a:.3} deg -> {b:.3} deg, increasing"),
+                    _ => "unknown".to_owned(),
+                },
+                output.ob.len()
+            ));
+            for note in &output.notes {
+                logger::log(format!("duplicate angle: {note}"));
+            }
+            for e in &output.skipped {
+                logger::error(format!("combine skipped: {e}"));
+            }
+            view.processed = Some(std::sync::Arc::new(output));
+            view.process = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+    if let Some(job) = &mut view.save_job {
+        match job.poll() {
+            Some(Ok(msg)) => {
+                logger::log(format!("saved combined data: {msg}"));
+                view.save_status = Some(Ok(msg));
+                view.save_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("saving combined data failed: {e}"));
+                view.save_status = Some(Err(e));
+                view.save_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+
+    let Some(result) = &view.preprocessed else {
+        return;
+    };
+    let Some(range) = view.pc_range else {
+        return;
+    };
+    fn kept<'a>(
+        runs: &'a [RunInfo],
+        removed: &HashSet<String>,
+        range: (f64, f64),
+    ) -> Vec<&'a RunInfo> {
+        runs.iter()
+            .filter(|r| pc_in_range(r, range) && !removed.contains(&r.name))
+            .collect()
+    }
+    let kept_sample = kept(&result.sample, &view.removed_sample, range);
+    let kept_ob = kept(&result.ob, &view.removed_ob, range);
+
+    let selection = image_selection(view);
+    match &selection {
+        None => {
+            ui.label(
+                RichText::new(
+                    "select TOF range(s) above (or switch to 'combine all images') to enable",
+                )
+                .weak(),
+            );
+        }
+        Some(sel) => {
+            ui.label(format!(
+                "{} sample folders (one projection per angle) and {} ob folders — mean of {}",
+                kept_sample.len(),
+                kept_ob.len(),
+                sel.describe()
+            ));
+        }
+    }
+
+    if ui
+        .checkbox(
+            &mut view.merge_same_angle,
+            "Combine folders having the same angle",
+        )
+        .on_hover_text(
+            "off: when several folders share a projection angle, only the one with the \
+             best statistics (highest total counts over its stack) is used",
+        )
+        .changed()
+    {
+        logger::log(format!(
+            "duplicate angles policy: {}",
+            if view.merge_same_angle {
+                "combine folders with the same angle"
+            } else {
+                "keep the folder with the best statistics"
+            }
+        ));
+    }
+
+    let busy = view.process.is_some();
+    let ready = selection.is_some() && !kept_sample.is_empty() && !busy;
+    if ui
+        .add_enabled(ready, egui::Button::new("▶ Combine all kept folders (mean)"))
+        .clicked()
+        && let Some(sel) = selection
+    {
+        let to_combine = |kept: &[&RunInfo]| -> Vec<RunToCombine> {
+            kept.iter()
+                .filter_map(|r| {
+                    let folders = match r.path.parent() == view.sample.selected.as_deref() {
+                        true => view.sample.folders.as_deref(),
+                        false => view.ob.folders.as_deref(),
+                    }?;
+                    folders.iter().find(|f| f.name == r.name).map(|f| RunToCombine {
+                        name: r.name.clone(),
+                        run_number: r.run_number,
+                        images: f.images.clone(),
+                    })
+                })
+                .collect()
+        };
+        let sample_runs = to_combine(&kept_sample);
+        let ob_runs = to_combine(&kept_ob);
+        logger::log(format!(
+            "combining (mean of {}): {} sample folders, {} ob folders",
+            sel.describe(),
+            sample_runs.len(),
+            ob_runs.len()
+        ));
+        view.processed = None;
+        view.save_status = None;
+        view.process = Some(CombineScan::start(
+            sample_runs,
+            ob_runs,
+            sel,
+            view.merge_same_angle,
+        ));
+    }
+
+    if let Some(scan) = &view.process {
+        let done = scan.progress();
+        let frac = (done as f32 / scan.total_images.max(1) as f32).min(1.0);
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .text(format!("{done}/{} images", scan.total_images)),
+        );
+    }
+
+    if let Some(output) = &view.processed {
+        let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
+        let dims = output
+            .sample
+            .first()
+            .map(|p| format!("{}x{}", p.height, p.width))
+            .unwrap_or_else(|| "?".to_owned());
+        ui.label(
+            RichText::new(format!(
+                "combined: {} projections ({dims}), angles {} — {} ob images",
+                output.sample.len(),
+                match (angles.first(), angles.last()) {
+                    (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
+                    _ => "unknown".to_owned(),
+                },
+                output.ob.len()
+            ))
+            .strong(),
+        );
+        for note in &output.notes {
+            ui.label(RichText::new(note).weak().size(12.0));
+        }
+        for e in &output.skipped {
+            ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
+        }
+        let saving = view.save_job.is_some();
+        if ui
+            .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
+            .clicked()
+        {
+            let default_name = view
+                .sample
+                .selected
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| format!("{}_combined.h5", n.to_string_lossy()))
+                .unwrap_or_else(|| "ct_combined.h5".to_owned());
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save the combined projections")
+                .add_filter("HDF5", &["h5", "hdf5"])
+                .set_file_name(default_name);
+            let shared = session.ipts.path.join("shared");
+            if shared.is_dir() {
+                dialog = dialog.set_directory(shared);
+            }
+            if let Some(path) = dialog.save_file() {
+                let meta = SaveMeta {
+                    instrument: session.instrument.name().to_owned(),
+                    ipts: session.ipts.name.clone(),
+                    detector: view.detector.label().to_owned(),
+                    sample_folder: view
+                        .sample
+                        .selected
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    ob_folder: view
+                        .ob
+                        .selected
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    combine_mode: if view.combine_all {
+                        "all images".to_owned()
+                    } else {
+                        image_selection(view)
+                            .map(|s| s.describe())
+                            .unwrap_or_default()
+                    },
+                    selections_json: (!view.combine_all)
+                        .then(|| view.combine_spec.as_ref().map(|s| s.raw.clone()))
+                        .flatten(),
+                    detector_offset_us: result.detector_offset_us,
+                };
+                logger::log(format!("saving combined data to {}", path.display()));
+                view.save_status = None;
+                view.save_job = Some(SaveJob::start(
+                    path,
+                    std::sync::Arc::clone(output),
+                    meta,
+                ));
+            }
+        }
+        if saving {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("writing HDF5…");
+            });
+        }
+    }
+    match &view.save_status {
+        Some(Ok(msg)) => {
+            ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+        }
+        Some(Err(e)) => {
+            ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+        }
+        None => {}
     }
 }
 
@@ -1631,7 +1946,7 @@ impl eframe::App for CtApp {
             });
             if next && let (Some(mode), Some(ipts)) = (self.mode, self.selected.clone()) {
                 logger::log(format!(
-                    "next → {} workflow: {} / {}",
+                    "next -> {} workflow: {} / {}",
                     mode.label(),
                     self.instrument.name(),
                     ipts.name
