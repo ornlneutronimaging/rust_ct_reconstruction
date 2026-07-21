@@ -90,7 +90,7 @@ pub struct CombineOutput {
 }
 
 /// First page of a TIFF as `(width, height, row-major f32 values)`.
-fn read_tiff_f32(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
+pub fn read_tiff_f32(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
     use tiff::decoder::{Decoder, DecodingResult};
     let file =
         std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;

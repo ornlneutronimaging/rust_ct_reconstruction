@@ -51,18 +51,73 @@ impl WbDetector {
     }
 }
 
-/// The TIFF files directly inside `dir`, sorted by name — what a selected
-/// white-beam folder contributes (one file per projection / OB exposure).
-pub fn tiff_files_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// The TIFF files directly inside `dir`, sorted by name, split into the
+/// highest revision of each projection (used) and the older revisions of
+/// retaken projections (kept visible but excluded automatically).
+pub fn tiff_files_in(dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
-    let mut files: Vec<PathBuf> = entries
+    let files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && crate::tof::is_image(p))
         .collect();
-    files.sort();
-    Ok(files)
+    Ok(keep_only_highest_revision(files))
+}
+
+/// The trailing revision number of a file stem (`..._R2` → 2, none → 0) and
+/// the stem without it — retakes of the same projection share that base.
+fn revision_of(stem: &str) -> (String, u32) {
+    if let Some((base, last)) = stem.rsplit_once('_')
+        && let Some(digits) = last.strip_prefix('R')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && let Ok(revision) = digits.parse()
+    {
+        return (base.to_owned(), revision);
+    }
+    (stem.to_owned(), 0)
+}
+
+/// The revision base of a file: retakes of the same projection (`x.tiff`,
+/// `x_R1.tiff`, `x_R2.tiff`) all map to `x`.
+pub fn revision_base(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    revision_of(&stem).0
+}
+
+/// When a projection was re-acquired (`x.tiff`, `x_R1.tiff`, `x_R2.tiff` —
+/// same run number and angle), only the highest revision is used, like the
+/// Python `_keep_only_highest_R_value`. Returns `(used, superseded)`, both
+/// sorted.
+pub fn keep_only_highest_revision(files: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    use std::collections::HashMap;
+    let mut best: HashMap<String, (u32, PathBuf)> = HashMap::new();
+    let mut superseded = Vec::new();
+    for file in files {
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (base, revision) = revision_of(&stem);
+        match best.get_mut(&base) {
+            Some((kept, kept_file)) if *kept >= revision => superseded.push(file),
+            Some((kept, kept_file)) => {
+                superseded.push(std::mem::replace(kept_file, file));
+                *kept = revision;
+            }
+            None => {
+                best.insert(base, (revision, file));
+            }
+        }
+    }
+    let mut kept: Vec<PathBuf> = best.into_values().map(|(_, f)| f).collect();
+    kept.sort();
+    superseded.sort();
+    (kept, superseded)
 }
 
 /// The three ways to obtain the projection angle of each image (same options
@@ -188,6 +243,99 @@ pub fn angles_from_ascii(path: &Path) -> Result<Vec<f64>, String> {
         return Err(format!("no angle values in {}", path.display()));
     }
     Ok(angles)
+}
+
+/// Run numbers from a manual exclusion list like `1,2,5-10` →
+/// {1, 2, 5, 6, 7, 8, 9, 10}. Whitespace is ignored; an empty text is an
+/// empty set.
+pub fn parse_run_list(text: &str) -> Result<std::collections::HashSet<u32>, String> {
+    let mut runs = std::collections::HashSet::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            None => {
+                let n: u32 = part
+                    .parse()
+                    .map_err(|_| format!("'{part}' is not a run number"))?;
+                runs.insert(n);
+            }
+            Some((a, b)) => {
+                let a: u32 = a
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("'{part}' is not a run range"))?;
+                let b: u32 = b
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("'{part}' is not a run range"))?;
+                if a > b {
+                    return Err(format!("'{part}': range start is after its end"));
+                }
+                runs.extend(a..=b);
+            }
+        }
+    }
+    Ok(runs)
+}
+
+/// Integrated intensity (sum of every pixel) of one image.
+#[derive(Clone, Debug)]
+pub struct ImageIntensity {
+    pub path: PathBuf,
+    pub run_number: Option<u32>,
+    pub intensity: f64,
+}
+
+/// Integrated intensities of every sample image, on background threads (each
+/// image is read fully once — tens of MB per CCD frame).
+pub struct IntensityScan {
+    rx: Receiver<Vec<Result<ImageIntensity, String>>>,
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub total: usize,
+}
+
+impl IntensityScan {
+    pub fn start(files: Vec<PathBuf>) -> Self {
+        use rayon::prelude::*;
+        let (tx, rx) = channel();
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_progress = std::sync::Arc::clone(&progress);
+        let total = files.len();
+        std::thread::spawn(move || {
+            let results: Vec<Result<ImageIntensity, String>> = files
+                .par_iter()
+                .map(|path| {
+                    let result =
+                        crate::combine::read_tiff_f32(path).map(|(_, _, values)| ImageIntensity {
+                            path: path.clone(),
+                            run_number: crate::tof::run_number(
+                                &path.file_name().unwrap_or_default().to_string_lossy(),
+                            ),
+                            intensity: values.iter().map(|v| f64::from(*v)).sum(),
+                        });
+                    thread_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    result
+                })
+                .collect();
+            let _ = tx.send(results);
+        });
+        Self {
+            rx,
+            progress,
+            total,
+        }
+    }
+
+    pub fn done(&self) -> usize {
+        self.progress.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn poll(&mut self) -> Option<Vec<Result<ImageIntensity, String>>> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Shortest angular distance between two angles on a circle of
@@ -337,6 +485,57 @@ mod tests {
         let (i, j) = default_angle_fields(fields.len()).unwrap();
         assert_eq!(angle_from_fields(rev, i, j), Some(45.03));
         assert_eq!(default_angle_fields(2), None);
+    }
+
+    #[test]
+    fn highest_revision_wins() {
+        let files: Vec<PathBuf> = [
+            "a_Ang_037_329_189.tiff",
+            "a_Ang_037_329_189_R1.tiff",
+            "a_Ang_037_329_189_R2.tiff",
+            "a_Ang_000_000_1.tiff",
+            "a_Ang_180_000_2_R1.tiff",
+        ]
+        .iter()
+        .map(|f| PathBuf::from(format!("/x/{f}")))
+        .collect();
+        let (kept, superseded) = keep_only_highest_revision(files);
+        let names: Vec<String> = kept
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "a_Ang_000_000_1.tiff",
+                "a_Ang_037_329_189_R2.tiff",
+                "a_Ang_180_000_2_R1.tiff",
+            ]
+        );
+        let old: Vec<String> = superseded
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            old,
+            ["a_Ang_037_329_189.tiff", "a_Ang_037_329_189_R1.tiff"]
+        );
+        assert_eq!(
+            revision_base(Path::new("/x/a_Ang_037_329_189_R1.tiff")),
+            "a_Ang_037_329_189"
+        );
+    }
+
+    #[test]
+    fn run_list_parsing() {
+        let runs = parse_run_list("1,2,5-10").unwrap();
+        let mut sorted: Vec<u32> = runs.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(parse_run_list("").unwrap().len(), 0);
+        assert_eq!(parse_run_list(" 3 , 7 - 9 ").unwrap().len(), 4);
+        assert!(parse_run_list("a,b").is_err());
+        assert!(parse_run_list("10-5").is_err());
     }
 
     #[test]

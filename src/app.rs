@@ -16,7 +16,7 @@ use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
     RunInfo, ViewerJob,
 };
-use crate::white_beam::{self, AngleSource, MetaAnglesScan, WbDetector};
+use crate::white_beam::{self, AngleSource, ImageIntensity, IntensityScan, MetaAnglesScan, WbDetector};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -98,6 +98,30 @@ struct WhiteBeamView {
     meta_job: Option<MetaAnglesScan>,
     /// Metadata angles cached per selection: (file count, first file) key.
     meta_angles: Option<(usize, Option<PathBuf>, Vec<Result<f64, String>>)>,
+
+    // Exclude images.
+    exclude_text: String,
+    excluded_runs: HashSet<u32>,
+    exclude_error: Option<String>,
+    intensity_job: Option<IntensityScan>,
+    intensities: Option<IntensityCache>,
+    /// Images with an intensity below this are excluded.
+    threshold: f64,
+    threshold_bounds: (f64, f64),
+    threshold_dragging: bool,
+    /// Show the intensity plot with a log10 y axis.
+    intensity_log: bool,
+}
+
+/// Integrated intensities cached per selection: the scan covers the used
+/// files first, then the superseded old revisions; `values` stays aligned
+/// with that input (`None` = unreadable image).
+struct IntensityCache {
+    total: usize,
+    first: Option<PathBuf>,
+    values: Vec<Option<ImageIntensity>>,
+    kept_len: usize,
+    failed: usize,
 }
 
 /// The projection angles of the current sample selection, per the chosen
@@ -149,6 +173,49 @@ impl WhiteBeamView {
             percentage: 50,
             meta_job: None,
             meta_angles: None,
+            exclude_text: String::new(),
+            excluded_runs: HashSet::new(),
+            exclude_error: None,
+            intensity_job: None,
+            intensities: None,
+            threshold: 0.0,
+            threshold_bounds: (0.0, 1.0),
+            threshold_dragging: false,
+            intensity_log: false,
+        }
+    }
+
+    /// The angle of each sample file (aligned with the flattened selection),
+    /// per the configured retrieval method; `None` when the method is not
+    /// ready yet (metadata not read, ASCII mismatch, fields not set up).
+    fn per_file_angles(&self, files: &[PathBuf]) -> Option<Vec<Option<f64>>> {
+        match self.angle_source {
+            AngleSource::NamingConvention => {
+                let picked: Vec<usize> = self
+                    .nc_checked
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c)
+                    .map(|(i, _)| i)
+                    .collect();
+                let [i, j] = picked.as_slice() else { return None };
+                Some(
+                    files
+                        .iter()
+                        .map(|f| white_beam::angle_from_fields(f, *i, *j))
+                        .collect(),
+                )
+            }
+            AngleSource::AsciiFile => {
+                let angles = self.ascii_angles.as_ref()?;
+                (angles.len() == files.len())
+                    .then(|| angles.iter().map(|a| Some(*a)).collect())
+            }
+            AngleSource::Metadata => {
+                let (n, first, results) = self.meta_angles.as_ref()?;
+                ((*n, first.as_ref()) == (files.len(), files.first()))
+                    .then(|| results.iter().map(|r| r.as_ref().ok().copied()).collect())
+            }
         }
     }
 
@@ -158,7 +225,7 @@ impl WhiteBeamView {
         self.sample
             .selected
             .iter()
-            .flat_map(|(_, files)| files.iter())
+            .flat_map(|(_, files, _)| files.iter())
             .next()
     }
 
@@ -174,8 +241,10 @@ struct MultiFolderPick {
     kind: &'static str,
     root: PathBuf,
     candidates: Result<Vec<PathBuf>, String>,
-    /// Selected folders (sorted by name) and the TIFF files inside each.
-    selected: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// Selected folders (sorted by name): `(folder, used TIFFs, superseded
+    /// TIFFs)` — superseded are older revisions of retaken projections,
+    /// excluded automatically but kept visible.
+    selected: Vec<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)>,
     error: Option<String>,
 }
 
@@ -192,30 +261,38 @@ impl MultiFolderPick {
     }
 
     fn is_selected(&self, dir: &Path) -> bool {
-        self.selected.iter().any(|(d, _)| d == dir)
+        self.selected.iter().any(|(d, ..)| d == dir)
     }
 
     fn total_files(&self) -> usize {
-        self.selected.iter().map(|(_, files)| files.len()).sum()
+        self.selected.iter().map(|(_, files, _)| files.len()).sum()
     }
 
     /// Add (recording its TIFF files) or remove one folder.
     fn toggle(&mut self, dir: PathBuf) {
-        if let Some(i) = self.selected.iter().position(|(d, _)| d == &dir) {
+        if let Some(i) = self.selected.iter().position(|(d, ..)| d == &dir) {
             logger::log(format!("{} folder removed: {}", self.kind, dir.display()));
             self.selected.remove(i);
             return;
         }
         match white_beam::tiff_files_in(&dir) {
-            Ok(files) => {
+            Ok((files, superseded)) => {
                 logger::log(format!(
-                    "{} folder selected: {} ({} tiff images)",
+                    "{} folder selected: {} ({} tiff images{})",
                     self.kind,
                     dir.display(),
-                    files.len()
+                    files.len(),
+                    if superseded.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", {} older revision(s) excluded automatically",
+                            superseded.len()
+                        )
+                    }
                 ));
-                self.selected.push((dir, files));
-                self.selected.sort_by(|(a, _), (b, _)| a.cmp(b));
+                self.selected.push((dir, files, superseded));
+                self.selected.sort_by(|(a, ..), (b, ..)| a.cmp(b));
                 self.error = None;
             }
             Err(e) => {
@@ -298,12 +375,18 @@ impl MultiFolderPick {
                 ))
                 .strong(),
             );
-            for (dir, files) in &self.selected {
+            for (dir, files, superseded) in &self.selected {
                 let name = dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| dir.display().to_string());
-                let text = RichText::new(format!("{name} — {} tiff", files.len())).size(12.0);
+                let revisions = if superseded.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (+{} old revisions)", superseded.len())
+                };
+                let text =
+                    RichText::new(format!("{name} — {} tiff{revisions}", files.len())).size(12.0);
                 if files.is_empty() {
                     ui.colored_label(Color32::from_rgb(240, 180, 60), text.text());
                 } else {
@@ -1268,6 +1351,481 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         .show(ui, |ui| {
             data_to_use_ui(ui, view);
         });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(RichText::new("Exclude images").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            exclude_images_ui(ui, view);
+        });
+}
+
+/// Manual run-number exclusion plus an intensity threshold: the integrated
+/// intensity of every image against its run number, with a draggable
+/// horizontal threshold under which images are dropped.
+fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
+    let ctx = ui.ctx().clone();
+    let files: Vec<PathBuf> = view
+        .sample
+        .selected
+        .iter()
+        .flat_map(|(_, files, _)| files.iter().cloned())
+        .collect();
+    if files.is_empty() {
+        ui.label(RichText::new("select the sample folder(s) first").weak());
+        return;
+    }
+
+    // Manual exclusion by run number.
+    ui.horizontal(|ui| {
+        ui.label("Run numbers to exclude:");
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut view.exclude_text)
+                .hint_text("e.g. 1,2,5-10 — or click dots on the plot below")
+                .desired_width(560.0),
+        );
+        if edit.changed() {
+            match white_beam::parse_run_list(&view.exclude_text) {
+                Ok(runs) => {
+                    view.excluded_runs = runs;
+                    view.exclude_error = None;
+                }
+                Err(e) => view.exclude_error = Some(e),
+            }
+        }
+        if edit.lost_focus() && !view.excluded_runs.is_empty() {
+            let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
+            sorted.sort();
+            logger::log(format!("manually excluded runs: {sorted:?}"));
+        }
+    });
+    if let Some(e) = &view.exclude_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+    ui.add_space(6.0);
+
+    // Integrated intensities (heavy: every image is read once). The scan
+    // covers the used files plus the superseded old revisions so retakes
+    // stay visible on the plot.
+    let superseded: Vec<PathBuf> = view
+        .sample
+        .selected
+        .iter()
+        .flat_map(|(_, _, old)| old.iter().cloned())
+        .collect();
+    let key = (files.len() + superseded.len(), files.first().cloned());
+    if let Some(cache) = &view.intensities
+        && (cache.total, cache.first.as_ref()) != (key.0, key.1.as_ref())
+    {
+        view.intensities = None;
+    }
+    if let Some(job) = &mut view.intensity_job {
+        if let Some(results) = job.poll() {
+            let mut values = Vec::with_capacity(results.len());
+            let mut failed = 0;
+            for result in results {
+                match result {
+                    Ok(v) => values.push(Some(v)),
+                    Err(e) => {
+                        logger::error(format!("integrated intensity: {e}"));
+                        values.push(None);
+                        failed += 1;
+                    }
+                }
+            }
+            let (min, max) = values
+                .iter()
+                .flatten()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), v| {
+                    (lo.min(v.intensity), hi.max(v.intensity))
+                });
+            let span = (max - min).max(max.abs() * 1e-3).max(1e-9);
+            // Default threshold below every value: nothing excluded yet.
+            view.threshold = min - span * 0.05;
+            view.threshold_bounds = (min - span * 0.1, max + span * 0.1);
+            logger::log(format!(
+                "integrated intensities: {} images (range {:.4e} to {:.4e}), {} failed",
+                values.len() - failed,
+                min,
+                max,
+                failed
+            ));
+            view.intensities = Some(IntensityCache {
+                total: key.0,
+                first: key.1.clone(),
+                values,
+                kept_len: files.len(),
+                failed,
+            });
+            view.intensity_job = None;
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "computing integrated intensities… {}/{}",
+                    job.done(),
+                    job.total
+                ));
+            });
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    } else if view.intensities.is_none() {
+        ui.horizontal(|ui| {
+            if ui.button("📊 Compute integrated intensities").clicked() {
+                logger::log(format!(
+                    "computing integrated intensities of {} images ({} old revisions included)…",
+                    files.len() + superseded.len(),
+                    superseded.len()
+                ));
+                let mut scan_files = files.clone();
+                scan_files.extend(superseded.iter().cloned());
+                view.intensity_job = Some(IntensityScan::start(scan_files));
+            }
+            ui.label(
+                RichText::new("(reads every image once — can take a while)")
+                    .weak()
+                    .size(11.0),
+            );
+        });
+    }
+
+    let manual_excluded_count = files
+        .iter()
+        .filter(|f| {
+            tof::run_number(&f.file_name().unwrap_or_default().to_string_lossy())
+                .is_some_and(|r| view.excluded_runs.contains(&r))
+        })
+        .count();
+
+    let Some(cache) = &view.intensities else {
+        if manual_excluded_count > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{manual_excluded_count} of {} images excluded manually",
+                    files.len()
+                ))
+                .strong(),
+            );
+        }
+        return;
+    };
+    if cache.failed > 0 {
+        ui.colored_label(
+            Color32::from_rgb(240, 180, 60),
+            format!("{} image(s) could not be read", cache.failed),
+        );
+    }
+
+    // X axis: file index after sorting the used files by angle (falls back to
+    // plain file order until the angle retrieval is set up). Old revisions
+    // sit at the same file index as the retake that replaced them.
+    let angles = view.per_file_angles(&files);
+    let kept_len = cache.kept_len.min(files.len());
+    let mut order: Vec<usize> = (0..kept_len).collect();
+    if let Some(angles) = &angles {
+        order.sort_by(|&a, &b| match (angles.get(a).copied().flatten(), angles.get(b).copied().flatten()) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(&b),
+        });
+    }
+    let mut rank = vec![0usize; order.len()];
+    for (position, &index) in order.iter().enumerate() {
+        rank[index] = position;
+    }
+    // Revision base of each used file → its (rank, index), so a superseded
+    // file lands on its replacement's x position and angle.
+    let base_of: HashMap<String, usize> = files
+        .iter()
+        .take(kept_len)
+        .enumerate()
+        .map(|(i, f)| (white_beam::revision_base(f), i))
+        .collect();
+
+    ui.checkbox(&mut view.intensity_log, "log y scale");
+    let log_scale = view.intensity_log;
+    let y_of = |v: f64| if log_scale { v.max(1e-30).log10() } else { v };
+
+    /// One dot with everything the tooltip / click handling needs.
+    #[derive(Clone)]
+    struct Dot {
+        x: f64,
+        y: f64,
+        angle: Option<f64>,
+        run: Option<u32>,
+        intensity: f64,
+        old_revision: bool,
+    }
+
+    let threshold = view.threshold;
+    let is_manual = |v: &ImageIntensity| v.run_number.is_some_and(|r| view.excluded_runs.contains(&r));
+    let mut kept: Vec<[f64; 2]> = Vec::new();
+    let mut dropped: Vec<[f64; 2]> = Vec::new();
+    let mut manual: Vec<[f64; 2]> = Vec::new();
+    let mut old_revisions: Vec<[f64; 2]> = Vec::new();
+    let mut dots: Vec<Dot> = Vec::new();
+    for (index, v) in cache.values.iter().enumerate() {
+        let Some(v) = v else { continue };
+        let old_revision = index >= kept_len;
+        // Old revisions borrow the position/angle of the retake that
+        // replaced them.
+        let kept_index = if old_revision {
+            base_of.get(&white_beam::revision_base(&v.path)).copied()
+        } else {
+            Some(index)
+        };
+        let x = kept_index
+            .and_then(|k| rank.get(k))
+            .map(|&r| r as f64)
+            .unwrap_or(rank.len() as f64);
+        let angle = kept_index
+            .and_then(|k| angles.as_ref().and_then(|a| a.get(k).copied().flatten()));
+        let point = [x, y_of(v.intensity)];
+        dots.push(Dot {
+            x: point[0],
+            y: point[1],
+            angle,
+            run: v.run_number,
+            intensity: v.intensity,
+            old_revision,
+        });
+        if old_revision {
+            old_revisions.push(point);
+        } else if is_manual(v) {
+            manual.push(point);
+        } else if v.intensity < threshold {
+            dropped.push(point);
+        } else {
+            kept.push(point);
+        }
+    }
+
+    const PLOT_HEIGHT: f32 = 340.0;
+    let mut released = false;
+    let mut hovered_dot: Option<Dot> = None;
+    let mut plot_clicked = false;
+    ui.horizontal(|ui| {
+        // In log mode the slider works in log10 space so its position always
+        // matches the plotted threshold line.
+        if log_scale {
+            let bounds = (
+                view.threshold_bounds.0.max(1e-30).log10(),
+                view.threshold_bounds.1.max(1e-30).log10(),
+            );
+            let mut value = view.threshold.max(1e-30).log10();
+            released = vertical_threshold_slider(
+                ui,
+                &mut value,
+                bounds,
+                PLOT_HEIGHT,
+                &mut view.threshold_dragging,
+            );
+            view.threshold = 10f64.powf(value);
+        } else {
+            released = vertical_threshold_slider(
+                ui,
+                &mut view.threshold,
+                view.threshold_bounds,
+                PLOT_HEIGHT,
+                &mut view.threshold_dragging,
+            );
+        }
+        let x_label = if angles.is_some() {
+            "file index (sorted by angle)"
+        } else {
+            "file index (set up the projection angles to sort)"
+        };
+        // Separate plot ids per scale: egui_plot remembers zoom/bounds per
+        // id, and the two scales live in completely different value ranges.
+        let plot_id = if log_scale {
+            "wb_intensity_plot_log"
+        } else {
+            "wb_intensity_plot_lin"
+        };
+        let plot_response = egui_plot::Plot::new(plot_id)
+            .height(PLOT_HEIGHT)
+            .x_axis_label(x_label)
+            .y_axis_label(if log_scale {
+                "integrated intensity (log scale)"
+            } else {
+                "integrated intensity"
+            })
+            // Readable ticks: scientific notation instead of a wall of
+            // zeros; in log mode the tick shows the real intensity the
+            // log10 position corresponds to.
+            .y_axis_formatter(move |mark, _range| {
+                let value = if log_scale {
+                    10f64.powf(mark.value)
+                } else {
+                    mark.value
+                };
+                if value == 0.0 {
+                    "0".to_owned()
+                } else {
+                    format!("{value:.1e}")
+                }
+            })
+            .y_axis_min_width(52.0)
+            .legend(egui_plot::Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.hline(
+                    egui_plot::HLine::new("threshold", y_of(view.threshold))
+                        .color(Color32::from_rgb(230, 100, 100))
+                        .width(1.5),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("kept", kept.clone())
+                        .radius(3.0)
+                        .color(Color32::from_rgb(100, 170, 255)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("below threshold", dropped.clone())
+                        .radius(3.0)
+                        .color(Color32::from_gray(110)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("manual", manual.clone())
+                        .radius(3.5)
+                        .color(Color32::from_rgb(255, 160, 70)),
+                );
+                plot_ui.points(
+                    egui_plot::Points::new("old revision", old_revisions.clone())
+                        .radius(3.0)
+                        .color(Color32::from_rgb(200, 120, 255)),
+                );
+                // Closest dot within 14 px of the pointer, for the tooltip
+                // and click-to-exclude.
+                if let Some(pointer) = plot_ui.pointer_coordinate() {
+                    let transform = plot_ui.transform();
+                    let pointer_pos =
+                        transform.position_from_point(&pointer);
+                    let mut best_d2 = 14.0f32 * 14.0;
+                    for dot in &dots {
+                        let screen = transform
+                            .position_from_point(&egui_plot::PlotPoint::new(dot.x, dot.y));
+                        let d2 = screen.distance_sq(pointer_pos);
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            hovered_dot = Some(dot.clone());
+                        }
+                    }
+                }
+            });
+        if let Some(dot) = &hovered_dot {
+            plot_clicked = plot_response.response.clicked();
+            plot_response.response.on_hover_ui_at_pointer(|ui| {
+                ui.label(RichText::new(format!("file index: {}", dot.x as usize)).strong());
+                ui.label(match dot.angle {
+                    Some(a) => format!("angle: {a:.3}°"),
+                    None => "angle: n/a".to_owned(),
+                });
+                ui.label(match dot.run {
+                    Some(r) => format!("run: {r}"),
+                    None => "run: n/a".to_owned(),
+                });
+                ui.label(format!("intensity: {:.4e}", dot.intensity));
+                if dot.old_revision {
+                    ui.label(
+                        RichText::new("old revision — excluded automatically")
+                            .color(Color32::from_rgb(200, 120, 255)),
+                    );
+                }
+            });
+        }
+    });
+    // A click on a dot appends its run to the manual exclusion list (old
+    // revisions are already out, and their run number is shared with the
+    // retake that replaced them — excluding it would drop the retake too).
+    if plot_clicked
+        && let Some(dot) = hovered_dot.as_ref().filter(|d| !d.old_revision)
+        && let Some(run) = dot.run
+        && !view.excluded_runs.contains(&run)
+    {
+        let trimmed = view.exclude_text.trim().trim_end_matches(',').trim();
+        view.exclude_text = if trimmed.is_empty() {
+            run.to_string()
+        } else {
+            format!("{trimmed}, {run}")
+        };
+        view.excluded_runs.insert(run);
+        view.exclude_error = None;
+        logger::log(format!("run {run} added to the exclusion list (clicked on the plot)"));
+    }
+
+    let n_kept = kept.len();
+    let line = format!(
+        "keeping {n_kept} of {} images — {} below threshold, {} excluded manually, {} old revisions",
+        kept.len() + dropped.len() + manual.len(),
+        dropped.len(),
+        manual.len(),
+        old_revisions.len()
+    );
+    if released {
+        logger::log(format!(
+            "intensity threshold set to {:.4e}: {line}",
+            view.threshold
+        ));
+    }
+    if n_kept == 0 {
+        ui.colored_label(Color32::from_rgb(240, 180, 60), format!("{line} — nothing left!"));
+    } else {
+        ui.label(RichText::new(line).strong());
+    }
+}
+
+/// A custom-painted vertical single-handle threshold slider; the zone below
+/// the handle (excluded) is tinted red. Returns `true` when a drag ends.
+fn vertical_threshold_slider(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    bounds: (f64, f64),
+    height: f32,
+    dragging: &mut bool,
+) -> bool {
+    use egui::{Pos2, Rect, Sense, Stroke, vec2};
+    const WIDTH: f32 = 34.0;
+    const HANDLE_R: f32 = 7.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(WIDTH, height), Sense::click_and_drag());
+    let span = (bounds.1 - bounds.0).max(f64::EPSILON);
+    let inner_top = rect.top() + HANDLE_R;
+    let inner_height = (rect.height() - 2.0 * HANDLE_R).max(1.0);
+    let to_y = |v: f64| inner_top + (((bounds.1 - v) / span) as f32) * inner_height;
+    let to_v = |y: f32| bounds.1 - f64::from((y - inner_top) / inner_height).clamp(0.0, 1.0) * span;
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        if response.drag_started() || response.clicked() {
+            *dragging = true;
+        }
+        if *dragging {
+            *value = to_v(pos.y);
+        }
+    }
+    let released = *dragging && response.drag_stopped();
+    if released {
+        *dragging = false;
+    }
+
+    let painter = ui.painter();
+    let cx = rect.center().x;
+    painter.line_segment(
+        [Pos2::new(cx, inner_top), Pos2::new(cx, inner_top + inner_height)],
+        Stroke::new(4.0, Color32::from_gray(70)),
+    );
+    // Excluded zone: below the handle.
+    let y = to_y(*value);
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(cx - 3.0, y),
+            Pos2::new(cx + 3.0, inner_top + inner_height),
+        ),
+        2.0,
+        Color32::from_rgba_unmultiplied(230, 100, 100, 120),
+    );
+    painter.circle_filled(Pos2::new(cx, y), HANDLE_R, Color32::from_gray(230));
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    released
 }
 
 /// The projection angles of every sample image per the chosen method —
@@ -1278,7 +1836,7 @@ fn collect_angles(view: &mut WhiteBeamView, ctx: &egui::Context) -> AngleData {
         .sample
         .selected
         .iter()
-        .flat_map(|(_, files)| files.iter().cloned())
+        .flat_map(|(_, files, _)| files.iter().cloned())
         .collect();
     if files.is_empty() {
         return AngleData::Invalid("select the sample folder(s) first".to_owned());
@@ -1520,7 +2078,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                 view.sample
                     .selected
                     .iter()
-                    .any(|(_, files)| files.contains(e))
+                    .any(|(_, files, _)| files.contains(e))
             });
             if !example_valid {
                 let example = view.first_sample_image().cloned().expect("checked above");
@@ -1546,7 +2104,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         .sample
                         .selected
                         .iter()
-                        .flat_map(|(_, files)| files.iter())
+                        .flat_map(|(_, files, _)| files.iter())
                         .collect();
                     if files.len() > 1 {
                         let nanos = std::time::SystemTime::now()
