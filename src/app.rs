@@ -16,12 +16,12 @@ use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
     RunInfo, ViewerJob,
 };
-use crate::white_beam::WbDetector;
+use crate::white_beam::{self, AngleSource, WbDetector};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How much of the log file the viewer shows, and how often it auto-refreshes.
@@ -71,11 +71,24 @@ enum WorkflowView {
 
 /// The white-beam workflow: the CCD detector drives where the sample and
 /// open-beam folders are looked for; a sample folder holds one image per
-/// projection.
+/// projection, and several folders can contribute to the same dataset.
 struct WhiteBeamView {
     detector: WbDetector,
-    sample: FolderPick,
-    ob: FolderPick,
+    sample: MultiFolderPick,
+    ob: MultiFolderPick,
+
+    // Projection angle retrieval.
+    angle_source: AngleSource,
+    /// Example file the naming-convention checkboxes were built from, and
+    /// which of its fields are checked (exactly 2 = degree + decimals).
+    nc_example: Option<PathBuf>,
+    nc_fields: Vec<String>,
+    nc_checked: Vec<bool>,
+    ascii_path: Option<PathBuf>,
+    ascii_angles: Option<Vec<f64>>,
+    ascii_error: Option<String>,
+    /// Result of the metadata "test on first image" button.
+    metadata_test: Option<Result<f64, String>>,
 }
 
 impl WhiteBeamView {
@@ -84,8 +97,8 @@ impl WhiteBeamView {
     }
 
     fn with_detector(detector: WbDetector, session: &Session) -> Self {
-        let sample = FolderPick::new("sample", detector.ct_root(&session.ipts.path));
-        let ob = FolderPick::new("open beam", detector.ob_root(&session.ipts.path));
+        let sample = MultiFolderPick::new("sample", detector.ct_root(&session.ipts.path));
+        let ob = MultiFolderPick::new("open beam", detector.ob_root(&session.ipts.path));
         logger::log(format!(
             "white beam detector: {} — sample root {} ({}), OB root {} ({})",
             detector.label(),
@@ -104,6 +117,175 @@ impl WhiteBeamView {
             detector,
             sample,
             ob,
+            angle_source: AngleSource::NamingConvention,
+            nc_example: None,
+            nc_fields: Vec::new(),
+            nc_checked: Vec::new(),
+            ascii_path: None,
+            ascii_angles: None,
+            ascii_error: None,
+            metadata_test: None,
+        }
+    }
+
+    /// First selected sample image — the naming-convention example and the
+    /// metadata test subject.
+    fn first_sample_image(&self) -> Option<&PathBuf> {
+        self.sample
+            .selected
+            .iter()
+            .flat_map(|(_, files)| files.iter())
+            .next()
+    }
+
+    fn total_sample_images(&self) -> usize {
+        self.sample.total_files()
+    }
+}
+
+/// Selection of any number of folders under a fixed root; what is kept is
+/// the list of TIFF files inside each selected folder.
+struct MultiFolderPick {
+    /// "sample" or "open beam" — used in headings and log lines.
+    kind: &'static str,
+    root: PathBuf,
+    candidates: Result<Vec<PathBuf>, String>,
+    /// Selected folders (sorted by name) and the TIFF files inside each.
+    selected: Vec<(PathBuf, Vec<PathBuf>)>,
+    error: Option<String>,
+}
+
+impl MultiFolderPick {
+    fn new(kind: &'static str, root: PathBuf) -> Self {
+        let candidates = tof::list_subdirs(&root);
+        Self {
+            kind,
+            root,
+            candidates,
+            selected: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn is_selected(&self, dir: &Path) -> bool {
+        self.selected.iter().any(|(d, _)| d == dir)
+    }
+
+    fn total_files(&self) -> usize {
+        self.selected.iter().map(|(_, files)| files.len()).sum()
+    }
+
+    /// Add (recording its TIFF files) or remove one folder.
+    fn toggle(&mut self, dir: PathBuf) {
+        if let Some(i) = self.selected.iter().position(|(d, _)| d == &dir) {
+            logger::log(format!("{} folder removed: {}", self.kind, dir.display()));
+            self.selected.remove(i);
+            return;
+        }
+        match white_beam::tiff_files_in(&dir) {
+            Ok(files) => {
+                logger::log(format!(
+                    "{} folder selected: {} ({} tiff images)",
+                    self.kind,
+                    dir.display(),
+                    files.len()
+                ));
+                self.selected.push((dir, files));
+                self.selected.sort_by(|(a, _), (b, _)| a.cmp(b));
+                self.error = None;
+            }
+            Err(e) => {
+                logger::error(format!("{} folder rejected: {e}", self.kind));
+                self.error = Some(e);
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let heading = match self.kind {
+            "sample" => "Sample (projections)",
+            _ => "Open beam",
+        };
+        ui.label(RichText::new(heading).size(16.0).strong());
+        ui.label(RichText::new(self.root.display().to_string()).weak().size(11.0));
+        ui.add_space(4.0);
+
+        let mut toggled: Option<PathBuf> = None;
+        match &self.candidates {
+            Err(e) => {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            Ok(dirs) if dirs.is_empty() => {
+                ui.label(RichText::new("no folders found").weak());
+            }
+            Ok(dirs) => {
+                egui::ScrollArea::vertical()
+                    .id_salt((self.kind, "multi_candidates"))
+                    .max_height(150.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for dir in dirs {
+                            let name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| dir.display().to_string());
+                            let mut checked = self.is_selected(dir);
+                            if ui.checkbox(&mut checked, name).changed() {
+                                toggled = Some(dir.clone());
+                            }
+                        }
+                    });
+            }
+        }
+        if let Some(dir) = toggled {
+            self.toggle(dir);
+        }
+
+        if ui.button("📂 Browse…").clicked() {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(format!("Select {} folder(s)", self.kind));
+            let start = if self.root.is_dir() {
+                Some(self.root.clone())
+            } else {
+                self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
+            };
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            for dir in dialog.pick_folders().unwrap_or_default() {
+                if !self.is_selected(&dir) {
+                    self.toggle(dir);
+                }
+            }
+        }
+
+        if let Some(e) = &self.error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        ui.add_space(6.0);
+        if self.selected.is_empty() {
+            ui.label(RichText::new("no folder selected yet").weak());
+        } else {
+            ui.label(
+                RichText::new(format!(
+                    "{} folder(s) — {} tiff images",
+                    self.selected.len(),
+                    self.total_files()
+                ))
+                .strong(),
+            );
+            for (dir, files) in &self.selected {
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string());
+                let text = RichText::new(format!("{name} — {} tiff", files.len())).size(12.0);
+                if files.is_empty() {
+                    ui.colored_label(Color32::from_rgb(240, 180, 60), text.text());
+                } else {
+                    ui.label(text.weak());
+                }
+            }
         }
     }
 }
@@ -1019,10 +1201,6 @@ fn workflow_ui(
 }
 
 fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
-    let ctx = ui.ctx().clone();
-    view.sample.poll(&ctx);
-    view.ob.poll(&ctx);
-
     // Detector — it decides where the sample and OB folders are looked for,
     // so changing it rebuilds both pickers.
     ui.horizontal(|ui| {
@@ -1053,6 +1231,213 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         view.sample.ui(&mut cols[0]);
         view.ob.ui(&mut cols[1]);
     });
+
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(RichText::new("Projection angles").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            angle_source_ui(ui, view);
+        });
+}
+
+/// How the projection angle of each image is obtained: naming convention
+/// (pick 2 file-name fields), TIFF metadata, or an imported ASCII list.
+fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
+    let mut source = view.angle_source;
+    for option in AngleSource::ALL {
+        ui.radio_value(&mut source, option, option.label());
+    }
+    if source != view.angle_source {
+        logger::log(format!("angle retrieval method: {}", source.label()));
+        view.angle_source = source;
+    }
+    ui.add_space(6.0);
+
+    match view.angle_source {
+        AngleSource::NamingConvention => {
+            let Some(example) = view.first_sample_image().cloned() else {
+                ui.label(
+                    RichText::new("select at least one sample folder to set up the convention")
+                        .weak(),
+                );
+                return;
+            };
+            // (Re)build the checkboxes when the example file changes.
+            if view.nc_example.as_ref() != Some(&example) {
+                view.nc_fields = white_beam::name_fields(&example);
+                view.nc_checked = vec![false; view.nc_fields.len()];
+                if let Some((i, j)) = white_beam::default_angle_fields(view.nc_fields.len()) {
+                    view.nc_checked[i] = true;
+                    view.nc_checked[j] = true;
+                }
+                view.nc_example = Some(example.clone());
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("File name:").strong());
+                ui.label(
+                    RichText::new(
+                        example
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    )
+                    .monospace()
+                    .size(12.0),
+                );
+            });
+            ui.label(
+                RichText::new(
+                    "check the 2 fields giving the angle value (degrees . decimals)",
+                )
+                .weak()
+                .size(12.0),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (field, checked) in view.nc_fields.iter().zip(view.nc_checked.iter_mut()) {
+                    ui.checkbox(checked, field.as_str());
+                }
+            });
+            let picked: Vec<usize> = view
+                .nc_checked
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c)
+                .map(|(i, _)| i)
+                .collect();
+            match picked.as_slice() {
+                [i, j] => match white_beam::angle_from_fields(&example, *i, *j) {
+                    Some(angle) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "angle value: {}.{} = {angle:.3}°",
+                                view.nc_fields[*i], view.nc_fields[*j]
+                            ))
+                            .strong(),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(
+                            Color32::LIGHT_RED,
+                            format!(
+                                "'{}.{}' is not a number — pick numeric fields",
+                                view.nc_fields[*i], view.nc_fields[*j]
+                            ),
+                        );
+                    }
+                },
+                _ => {
+                    ui.colored_label(Color32::LIGHT_RED, "select 2 and only 2 fields!");
+                }
+            }
+        }
+        AngleSource::Metadata => {
+            ui.label(
+                RichText::new(
+                    "the angle will be read from each image's TIFF metadata (tag 65039)",
+                )
+                .color(Color32::from_rgb(120, 200, 120)),
+            );
+            let first = view.first_sample_image().cloned();
+            match &first {
+                None => {
+                    ui.label(RichText::new("select a sample folder to test it").weak());
+                }
+                Some(file) => {
+                    if ui.button("Test on the first image").clicked() {
+                        let result = white_beam::angle_from_tiff_metadata(file);
+                        match &result {
+                            Ok(angle) => logger::log(format!(
+                                "metadata angle test: {} -> {angle:.3} deg",
+                                file.display()
+                            )),
+                            Err(e) => logger::error(format!("metadata angle test failed: {e}")),
+                        }
+                        view.metadata_test = Some(result);
+                    }
+                }
+            }
+            match &view.metadata_test {
+                Some(Ok(angle)) => {
+                    ui.label(RichText::new(format!("first image angle: {angle:.3}°")).strong());
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                None => {}
+            }
+        }
+        AngleSource::AsciiFile => {
+            ui.horizontal(|ui| {
+                if ui.button("📂 Select ASCII file…").clicked() {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title("Select the ASCII file containing the list of angles")
+                        .add_filter("Text files", &["txt"])
+                        .add_filter("All files", &["*"]);
+                    if let Some(dir) = view.sample.root.parent().filter(|p| p.is_dir()) {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        match white_beam::angles_from_ascii(&path) {
+                            Ok(angles) => {
+                                logger::log(format!(
+                                    "angle list imported: {} ({} angles)",
+                                    path.display(),
+                                    angles.len()
+                                ));
+                                view.ascii_angles = Some(angles);
+                                view.ascii_error = None;
+                            }
+                            Err(e) => {
+                                logger::error(format!("angle list rejected: {e}"));
+                                view.ascii_angles = None;
+                                view.ascii_error = Some(e);
+                            }
+                        }
+                        view.ascii_path = Some(path);
+                    }
+                }
+                if let Some(path) = &view.ascii_path {
+                    ui.label(
+                        RichText::new(path.display().to_string())
+                            .weak()
+                            .size(11.0),
+                    );
+                }
+            });
+            if let Some(e) = &view.ascii_error {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            if let Some(angles) = &view.ascii_angles {
+                let n_images = view.total_sample_images();
+                let preview: Vec<String> =
+                    angles.iter().take(5).map(|a| format!("{a:.3}")).collect();
+                ui.label(format!(
+                    "{} angles ({}{})",
+                    angles.len(),
+                    preview.join(", "),
+                    if angles.len() > 5 { ", …" } else { "" }
+                ));
+                if n_images == 0 {
+                    ui.label(RichText::new("select the sample folder(s) to validate").weak());
+                } else if angles.len() == n_images {
+                    ui.label(
+                        RichText::new(format!(
+                            "matches the {n_images} sample images ✔",
+                        ))
+                        .color(Color32::from_rgb(120, 200, 120)),
+                    );
+                } else {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        format!(
+                            "{} angles but {n_images} sample images — they must match",
+                            angles.len()
+                        ),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
