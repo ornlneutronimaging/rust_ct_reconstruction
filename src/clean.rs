@@ -235,6 +235,7 @@ impl CleanJob {
                 sample,
                 ob,
                 metadata,
+                center_of_rotation: stack.center_of_rotation,
             };
             let _ = tx.send((cleaned, stats));
         });

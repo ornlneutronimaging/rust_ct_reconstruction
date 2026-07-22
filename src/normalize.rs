@@ -326,6 +326,7 @@ fn run_normalization(
             sample,
             ob: stack.ob.clone(),
             metadata,
+            center_of_rotation: stack.center_of_rotation,
         },
         summary,
     ))

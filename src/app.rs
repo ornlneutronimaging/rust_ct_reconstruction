@@ -6,7 +6,7 @@
 
 use crate::combine::{
     self, CombineOutput, CombineScan, ImageSelection, LoadJob, LoadedStack, RunToCombine,
-    SaveJob, SaveMeta,
+    SaveJob, SaveMeta, StackSaveJob,
 };
 use crate::clean::{self, CleanJob, CleanSettings, CleanStats};
 use crate::config;
@@ -70,6 +70,107 @@ enum Screen {
     /// Pre-processing of a stack of projections loaded from a previously
     /// saved HDF5 file.
     Stack(StackView),
+    /// Evaluating the reconstruction of a pre-processed stack.
+    Recon(ReconView),
+}
+
+struct ReconView {
+    stack: std::sync::Arc<LoadedStack>,
+    /// Center of rotation in px; `None` = the horizontal center.
+    cor: Option<f64>,
+}
+
+/// The reconstruction evaluation screen (the algorithms come next); returns
+/// `true` to go back to the setup screen.
+fn recon_ui(
+    ui: &mut egui::Ui,
+    view: &mut ReconView,
+    logo: Option<&egui::TextureHandle>,
+    log_open: &mut bool,
+) -> bool {
+    let mut back = false;
+    ui.horizontal(|ui| {
+        if ui.button("↩ Back").clicked() {
+            back = true;
+        }
+        ui.label(
+            RichText::new(format!(
+                "Evaluate the reconstruction — {}",
+                view.stack
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ))
+            .size(15.0)
+            .strong(),
+        );
+        top_right_bar(ui, logo, log_open, 28.0);
+    });
+    ui.add_space(10.0);
+
+    let stack = &view.stack;
+    let angles: Vec<f64> = stack.sample.iter().filter_map(|p| p.angle_deg).collect();
+    let dims = stack
+        .sample
+        .first()
+        .map(|p| format!("{}x{}", p.height, p.width))
+        .unwrap_or_default();
+    let default_center = stack
+        .sample
+        .first()
+        .map(|p| (p.width as f64 - 1.0) / 2.0)
+        .unwrap_or(0.0);
+    ui.label(
+        RichText::new(format!(
+            "{} projections ({dims}), angles {} — center of rotation: {}",
+            stack.sample.len(),
+            match (angles.first(), angles.last()) {
+                (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
+                _ => "unknown".to_owned(),
+            },
+            match view.cor {
+                Some(cor) => format!("{cor:.2} px (from the pre-processing)"),
+                None => format!("{default_center:.1} px (horizontal center)"),
+            }
+        ))
+        .strong(),
+    );
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(RichText::new("Provenance").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            for (name, value) in &stack.metadata {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    ui.label(RichText::new(value).size(12.0));
+                });
+            }
+        });
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new("The reconstruction algorithms evaluation comes next.")
+                .weak()
+                .size(15.0),
+        );
+    });
+    back
+}
+
+/// `true` when a loaded file is a pre-processing checkpoint and can go
+/// straight to the reconstruction evaluation.
+fn stack_is_preprocessed(stack: &LoadedStack) -> bool {
+    let stage = stack
+        .metadata
+        .iter()
+        .find(|(name, _)| name == "processing_stage")
+        .map(|(_, value)| value.as_str());
+    match stage {
+        Some(stage) => stage == "preprocessed",
+        // Older files without the flag: normalized means pre-processed.
+        None => stack.metadata.iter().any(|(name, _)| name == "normalization"),
+    }
 }
 
 /// The accordion sections of the pre-processing screen — one open at a time.
@@ -83,6 +184,19 @@ enum StackSection {
     Tilt,
     Cor,
     Sinogram,
+}
+
+/// Shown on a section's header: whether the step was run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionStatus {
+    /// Informational section, no run state.
+    NoStatus,
+    /// The step was run (green check).
+    Done,
+    /// Optional step, not run.
+    NotRun,
+    /// Mandatory step, still to be run.
+    Required,
 }
 
 struct StackView {
@@ -171,12 +285,19 @@ struct StackView {
     cor_overlay: bool,
     /// Preview texture, keyed by (stack, frame or MAX for overlay, cor bits).
     cor_tex: Option<((usize, usize, u64), egui::TextureHandle)>,
+
+    // Saving the pre-processing checkpoint.
+    stack_save_job: Option<StackSaveJob>,
+    stack_save_status: Option<Result<String, String>>,
+    /// Set by the "evaluate the reconstruction" button; the main loop picks
+    /// it up and switches screens.
+    goto_recon: bool,
 }
 
 impl StackView {
     fn new(stack: LoadedStack) -> Self {
         let stack = std::sync::Arc::new(stack);
-        Self {
+        let mut view = Self {
             open_section: Some(StackSection::Normalize),
             original: std::sync::Arc::clone(&stack),
             stack,
@@ -222,7 +343,64 @@ impl StackView {
             cor_frame: None,
             cor_overlay: false,
             cor_tex: None,
+            stack_save_job: None,
+            stack_save_status: None,
+            goto_recon: false,
+        };
+
+        // A pre-processing checkpoint restores its state: a stack saved
+        // after normalization reopens ready for the next steps.
+        let meta = |name: &str| -> Option<String> {
+            view.stack
+                .metadata
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        if let Some(desc) = meta("normalization") {
+            view.normalized = true;
+            view.unrotated = Some(std::sync::Arc::clone(&view.stack));
+            view.norm_summary = Some(format!("restored from the loaded file ({desc})"));
+            view.open_section = Some(StackSection::Rotate);
         }
+        if let Some(rotation) = meta("rotation")
+            && let Some(deg) = rotation
+                .split('°')
+                .next()
+                .and_then(|d| d.trim().parse::<usize>().ok())
+        {
+            view.rotation_quarters = (deg / 90) % 4;
+            view.rotation_applied = view.rotation_quarters;
+        }
+        if let Some(tilt) = meta("tilt_correction") {
+            // "tilt {:.4} deg, axis shift {} px (…)"
+            let mut words = tilt.split_whitespace();
+            let deg = words.nth(1).and_then(|v| v.parse::<f64>().ok());
+            let shift = tilt
+                .split("shift")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|v| v.parse::<i64>().ok());
+            if let (Some(tilt_deg), Some(shift_px)) = (deg, shift) {
+                view.tilt_applied = Some(TiltResult {
+                    tilt_deg,
+                    shift_px,
+                    slope: 2.0 * tilt_deg.to_radians().tan(),
+                    intercept: 0.0,
+                    rows_used: 0,
+                });
+            }
+        }
+        // The numeric dataset is authoritative; older checkpoints may only
+        // have a metadata string.
+        if let Some(cor) = view.stack.center_of_rotation {
+            view.cor_result = Some(cor);
+        } else if let Some(cor) = meta("center_of_rotation")
+            && let Ok(value) = cor.trim().parse::<f64>()
+        {
+            view.cor_result = Some(value);
+        }
+        view
     }
 
     fn clear_cor(&mut self) {
@@ -1683,9 +1861,22 @@ fn stack_ui(
          view: &mut StackView,
          which: StackSection,
          title: &str,
+         status: SectionStatus,
          body: &mut dyn FnMut(&mut egui::Ui, &mut StackView)| {
+            let header = match status {
+                SectionStatus::NoStatus => RichText::new(title).strong(),
+                SectionStatus::Done => RichText::new(format!("✔ {title}"))
+                    .strong()
+                    .color(Color32::from_rgb(120, 200, 120)),
+                SectionStatus::NotRun => RichText::new(format!("{title} — not run"))
+                    .strong()
+                    .color(Color32::from_gray(150)),
+                SectionStatus::Required => RichText::new(format!("{title} — required"))
+                    .strong()
+                    .color(Color32::from_rgb(240, 180, 60)),
+            };
             let open = view.open_section == Some(which);
-            let response = egui::CollapsingHeader::new(RichText::new(title).strong())
+            let response = egui::CollapsingHeader::new(header)
                 .open(Some(open))
                 .show(ui, |ui| body(ui, view));
             if response.header_response.clicked() {
@@ -1693,48 +1884,103 @@ fn stack_ui(
             }
             ui.add_space(4.0);
         };
-    section(ui, view, StackSection::Provenance, "Provenance", &mut |ui, view| {
-        for (name, value) in &view.stack.metadata {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
-                ui.label(RichText::new(value).size(12.0));
-            });
+    let run_status = |ran: bool| {
+        if ran {
+            SectionStatus::Done
+        } else {
+            SectionStatus::NotRun
         }
-    });
-    section(ui, view, StackSection::Crop, "Crop", &mut |ui, view| {
-        crop_section_ui(ui, view);
-    });
-    section(ui, view, StackSection::Clean, "Remove outliers", &mut |ui, view| {
-        clean_section_ui(ui, view);
-    });
+    };
+    section(
+        ui,
+        view,
+        StackSection::Provenance,
+        "Provenance",
+        SectionStatus::NoStatus,
+        &mut |ui, view| {
+            for (name, value) in &view.stack.metadata {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    ui.label(RichText::new(value).size(12.0));
+                });
+            }
+        },
+    );
+    section(
+        ui,
+        view,
+        StackSection::Crop,
+        "Crop",
+        run_status(view.crop.is_some()),
+        &mut |ui, view| {
+            crop_section_ui(ui, view);
+        },
+    );
+    section(
+        ui,
+        view,
+        StackSection::Clean,
+        "Remove outliers",
+        run_status(view.clean_stats.is_some()),
+        &mut |ui, view| {
+            clean_section_ui(ui, view);
+        },
+    );
     section(
         ui,
         view,
         StackSection::Normalize,
         "Normalization (mandatory)",
+        if view.normalized {
+            SectionStatus::Done
+        } else {
+            SectionStatus::Required
+        },
         &mut |ui, view| {
             normalization_section_ui(ui, view);
         },
     );
     if view.normalized {
-        section(ui, view, StackSection::Rotate, "Rotate the data", &mut |ui, view| {
-            rotation_section_ui(ui, view);
-        });
-        section(ui, view, StackSection::Tilt, "Tilt correction", &mut |ui, view| {
-            tilt_section_ui(ui, view);
-        });
+        section(
+            ui,
+            view,
+            StackSection::Rotate,
+            "Rotate the data",
+            run_status(view.rotation_applied != 0),
+            &mut |ui, view| {
+                rotation_section_ui(ui, view);
+            },
+        );
+        section(
+            ui,
+            view,
+            StackSection::Tilt,
+            "Tilt correction",
+            run_status(view.tilt_applied.is_some()),
+            &mut |ui, view| {
+                tilt_section_ui(ui, view);
+            },
+        );
         section(
             ui,
             view,
             StackSection::Cor,
             "Center of rotation",
+            run_status(view.cor_result.is_some()),
             &mut |ui, view| {
                 cor_section_ui(ui, view);
             },
         );
-        section(ui, view, StackSection::Sinogram, "Sinogram", &mut |ui, view| {
-            sinogram_section_ui(ui, view);
-        });
+        section(
+            ui,
+            view,
+            StackSection::Sinogram,
+            "Sinogram",
+            SectionStatus::NoStatus,
+            &mut |ui, view| {
+                sinogram_section_ui(ui, view);
+            },
+        );
     }
     if let Some(which) = clicked {
         view.open_section = if view.open_section == Some(which) {
@@ -1743,14 +1989,102 @@ fn stack_ui(
             Some(which)
         };
     }
+    // Checkpoint: save the pre-processed stack so a later session can load
+    // it and start directly at the reconstruction step.
+    if view.normalized {
+        ui.separator();
+        if let Some(job) = &mut view.stack_save_job {
+            match job.poll() {
+                Some(Ok(msg)) => {
+                    logger::log(format!("pre-processing checkpoint saved: {msg}"));
+                    view.stack_save_status = Some(Ok(msg));
+                    view.stack_save_job = None;
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("saving the checkpoint failed: {e}"));
+                    view.stack_save_status = Some(Err(e));
+                    view.stack_save_job = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("writing the checkpoint HDF5…");
+                    });
+                    ui.ctx().request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    view.stack_save_job.is_none(),
+                    egui::Button::new("💾 Save the pre-processed stack…"),
+                )
+                .on_hover_text(
+                    "writes an HDF5 checkpoint (with the whole provenance, including the \
+                     center of rotation) that can be loaded later from the setup screen to \
+                     start directly at the reconstruction step",
+                )
+                .clicked()
+            {
+                let default_name = view
+                    .stack
+                    .path
+                    .file_stem()
+                    .map(|n| {
+                        format!(
+                            "{}_preprocessed.h5",
+                            n.to_string_lossy().trim_end_matches("_preprocessed")
+                        )
+                    })
+                    .unwrap_or_else(|| "ct_preprocessed.h5".to_owned());
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Save the pre-processed stack")
+                    .add_filter("HDF5", &["h5", "hdf5"])
+                    .set_file_name(default_name);
+                if let Some(dir) = view.stack.path.parent().filter(|p| p.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.save_file() {
+                    logger::log(format!(
+                        "saving the pre-processing checkpoint to {} (cor: {:?})",
+                        path.display(),
+                        view.cor_result
+                    ));
+                    view.stack_save_status = None;
+                    view.stack_save_job = Some(StackSaveJob::start(
+                        path,
+                        std::sync::Arc::clone(&view.stack),
+                        view.cor_result,
+                        Vec::new(),
+                    ));
+                }
+            }
+            if ui
+                .button("🚀 Evaluate the reconstruction")
+                .on_hover_text("continue with this stack right away — saving is optional")
+                .clicked()
+            {
+                view.goto_recon = true;
+            }
+            ui.label(
+                RichText::new("loading a saved checkpoint later starts directly at the \
+                               reconstruction")
+                    .weak()
+                    .size(11.0),
+            );
+        });
+        match &view.stack_save_status {
+            Some(Ok(msg)) => {
+                ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+            }
+            Some(Err(e)) => {
+                ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+            }
+            None => {}
+        }
+    }
     ui.add_space(24.0);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new("The next pre-processing steps of the stack come after.")
-                .weak()
-                .size(15.0),
-        );
-    });
     back
 }
 
@@ -5403,14 +5737,28 @@ impl eframe::App for CtApp {
             if let Some(job) = &mut self.load_job {
                 match job.poll() {
                     Some(Ok(stack)) => {
+                        let preprocessed = stack_is_preprocessed(&stack);
                         logger::log(format!(
-                            "stack loaded: {} — {} projections, {} ob — jumping to pre-processing",
+                            "stack loaded: {} — {} projections, {} ob — jumping to {}",
                             stack.path.display(),
                             stack.sample.len(),
-                            stack.ob.len()
+                            stack.ob.len(),
+                            if preprocessed {
+                                "the reconstruction evaluation (pre-processing checkpoint)"
+                            } else {
+                                "pre-processing"
+                            }
                         ));
                         self.load_job = None;
-                        self.screen = Screen::Stack(StackView::new(stack));
+                        self.screen = if preprocessed {
+                            let cor = stack.center_of_rotation;
+                            Screen::Recon(ReconView {
+                                stack: std::sync::Arc::new(stack),
+                                cor,
+                            })
+                        } else {
+                            Screen::Stack(StackView::new(stack))
+                        };
                     }
                     Some(Err(e)) => {
                         logger::error(format!("loading saved stack failed: {e}"));
@@ -5457,6 +5805,9 @@ impl eframe::App for CtApp {
                 Screen::Stack(view) => {
                     back = stack_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
+                Screen::Recon(view) => {
+                    back = recon_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                }
                 Screen::Setup => {}
             });
             // A workflow's "continue to pre-processing" button hands its
@@ -5472,7 +5823,21 @@ impl eframe::App for CtApp {
                 } => wb_view.goto_preprocess.take(),
                 _ => None,
             };
-            if let Some(stack) = pending {
+            // Same for pre-processing → reconstruction evaluation.
+            let recon = match &mut self.screen {
+                Screen::Stack(view) if view.goto_recon => {
+                    view.goto_recon = false;
+                    Some(ReconView {
+                        stack: std::sync::Arc::clone(&view.stack),
+                        cor: view.cor_result.or(view.stack.center_of_rotation),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(view) = recon {
+                logger::log("continuing to the reconstruction evaluation");
+                self.screen = Screen::Recon(view);
+            } else if let Some(stack) = pending {
                 self.screen = Screen::Stack(StackView::new(stack));
             } else if back {
                 logger::log("returned to setup screen");

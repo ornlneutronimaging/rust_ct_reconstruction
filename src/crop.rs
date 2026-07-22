@@ -248,6 +248,8 @@ pub fn apply_crop(stack: &LoadedStack, rect: &CropRect) -> Result<LoadedStack, S
         sample: sample?,
         ob: ob?,
         metadata,
+        // The crop moves the x coordinates: a stored center of rotation is void.
+        center_of_rotation: None,
     })
 }
 
@@ -422,6 +424,7 @@ mod tests {
             sample: vec![projection("s", 4, 3)],
             ob: vec![projection("ob", 4, 3)],
             metadata: vec![("method".to_owned(), "mean".to_owned())],
+            center_of_rotation: None,
         };
         let rect = CropRect { x: 0, y: 0, width: 2, height: 3 };
         let cropped = apply_crop(&stack, &rect).unwrap();

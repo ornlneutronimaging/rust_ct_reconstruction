@@ -390,6 +390,14 @@ fn write_stack(
         .create("angles_deg")
         .and_then(|ds| ds.write_raw(&angles))
         .map_err(|e| err("angles_deg", e))?;
+    // Radians alongside, for the reconstruction algorithms.
+    let angles_rad: Vec<f64> = angles.iter().map(|a| a.to_radians()).collect();
+    group
+        .new_dataset::<f64>()
+        .shape(n)
+        .create("angles_rad")
+        .and_then(|ds| ds.write_raw(&angles_rad))
+        .map_err(|e| err("angles_rad", e))?;
     let runs: Vec<i64> = projections
         .iter()
         .map(|p| p.run_number.map(i64::from).unwrap_or(-1))
@@ -445,6 +453,9 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
             .map_err(|e| format!("write metadata/{name}: {e}"))
     };
     put("method", "mean")?;
+    // Routes the file when loaded again: this stage still needs the
+    // pre-processing screen.
+    put("processing_stage", "combined")?;
     put("instrument", &meta.instrument)?;
     put("ipts", &meta.ipts)?;
     put("detector", &meta.detector)?;
@@ -501,6 +512,7 @@ pub fn stack_from_output(
         sample: output.sample.clone(),
         ob: output.ob.clone(),
         metadata,
+        center_of_rotation: None,
     }
 }
 
@@ -512,6 +524,8 @@ pub struct LoadedStack {
     pub ob: Vec<Projection>,
     /// `/metadata` entries as (name, value) strings, sorted by name.
     pub metadata: Vec<(String, String)>,
+    /// `/center_of_rotation` (px), when the file carries one.
+    pub center_of_rotation: Option<f64>,
 }
 
 fn read_stack(group: &hdf5_metno::Group, what: &str) -> Result<Vec<Projection>, String> {
@@ -593,12 +607,100 @@ pub fn load_hdf5(path: &Path) -> Result<LoadedStack, String> {
         }
     }
     metadata.sort();
+    let center_of_rotation = file
+        .dataset("center_of_rotation")
+        .and_then(|ds| ds.read_scalar::<f64>())
+        .ok();
     Ok(LoadedStack {
         path: path.to_path_buf(),
         sample,
         ob,
         metadata,
+        center_of_rotation,
     })
+}
+
+/// Write a [`LoadedStack`] back to HDF5 in the exact layout [`load_hdf5`]
+/// reads, carrying its metadata plus `extra` entries (which override same-
+/// named ones) — the pre-processing checkpoint file.
+pub fn save_stack_hdf5(
+    path: &Path,
+    stack: &LoadedStack,
+    center_of_rotation: Option<f64>,
+    extra: &[(String, String)],
+) -> Result<String, String> {
+    use hdf5_metno::types::VarLenUnicode;
+    if stack.sample.is_empty() {
+        return Err("nothing to save: the stack has no projections".to_owned());
+    }
+    let file = hdf5_metno::File::create(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    write_stack(&file, None, &stack.sample)?;
+    if !stack.ob.is_empty() {
+        write_stack(&file, Some("ob"), &stack.ob)?;
+    }
+    if let Some(cor) = center_of_rotation {
+        file.new_dataset::<f64>()
+            .create("center_of_rotation")
+            .and_then(|ds| ds.write_scalar(&cor))
+            .map_err(|e| format!("write center_of_rotation: {e}"))?;
+    }
+    let metadata = file
+        .create_group("metadata")
+        .map_err(|e| format!("create metadata group: {e}"))?;
+    let mut entries: Vec<(String, String)> = stack
+        .metadata
+        .iter()
+        .filter(|(name, _)| {
+            name != "processing_stage" && !extra.iter().any(|(e, _)| e == name)
+        })
+        .cloned()
+        .collect();
+    entries.extend(extra.iter().cloned());
+    // Routes the file when loaded again: a checkpoint goes straight to the
+    // reconstruction evaluation.
+    entries.push(("processing_stage".to_owned(), "preprocessed".to_owned()));
+    entries.sort();
+    for (name, value) in &entries {
+        let v: VarLenUnicode = value.parse().unwrap_or_default();
+        metadata
+            .new_dataset::<VarLenUnicode>()
+            .create(name.as_str())
+            .and_then(|ds| ds.write_scalar(&v))
+            .map_err(|e| format!("write metadata/{name}: {e}"))?;
+    }
+    Ok(format!(
+        "{} — {} projections ({}x{}), {} ob",
+        path.display(),
+        stack.sample.len(),
+        stack.sample[0].height,
+        stack.sample[0].width,
+        stack.ob.len()
+    ))
+}
+
+/// Saving a checkpoint on a background thread.
+pub struct StackSaveJob {
+    rx: Receiver<Result<String, String>>,
+}
+
+impl StackSaveJob {
+    pub fn start(
+        path: PathBuf,
+        stack: Arc<LoadedStack>,
+        center_of_rotation: Option<f64>,
+        extra: Vec<(String, String)>,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(save_stack_hdf5(&path, &stack, center_of_rotation, &extra));
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<String, String>> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Loading on a background thread (the stack can be many GB).
@@ -759,6 +861,44 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "detector_offset_us" && v == "12.5"));
         assert!(load_hdf5(Path::new("/nonexistent.h5")).is_err());
+    }
+
+    #[test]
+    fn stack_checkpoint_roundtrip() {
+        let stack = LoadedStack {
+            path: PathBuf::from("/x.h5"),
+            sample: vec![projection("p0", Some(0.0), 1, 0.5, 10.0)],
+            ob: Vec::new(),
+            metadata: vec![("normalization".to_owned(), "NeuNorm".to_owned())],
+            center_of_rotation: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ct_recon_checkpoint_{}.h5",
+            std::process::id()
+        ));
+        save_stack_hdf5(
+            &path,
+            &stack,
+            Some(261.34),
+            &[("extra_note".to_owned(), "checkpoint".to_owned())],
+        )
+        .unwrap();
+        let loaded = load_hdf5(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.sample.len(), 1);
+        assert!(loaded.ob.is_empty());
+        // The center of rotation survives as a numeric dataset, and the
+        // angles are stored in degrees and radians.
+        assert_eq!(loaded.center_of_rotation, Some(261.34));
+        assert!(loaded.metadata.iter().any(|(k, _)| k == "normalization"));
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "processing_stage" && v == "preprocessed"));
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "extra_note" && v == "checkpoint"));
     }
 
     #[test]

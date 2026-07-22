@@ -82,6 +82,9 @@ impl RotateJob {
                 sample: rotate_all(&baseline.sample),
                 ob: rotate_all(&baseline.ob),
                 metadata,
+                // A quarter turn changes the geometry: any stored center of
+                // rotation is void.
+                center_of_rotation: None,
             });
         });
         Self { rx }
