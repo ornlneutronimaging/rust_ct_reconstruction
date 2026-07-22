@@ -111,7 +111,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         key: "astra_fbp",
         label: "ASTRA FBP",
         description: "filtered back projection — fast, GPU support",
-        binary: None,
+        binary: Some(
+            "/SNS/VENUS/shared/software/git/rust_astra_optimizer/target/release/astra_optimizer",
+        ),
     },
     ReconAlgorithm {
         key: "tomopy_fbp",
