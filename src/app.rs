@@ -8,7 +8,7 @@ use crate::combine::{
     self, CombineOutput, CombineScan, ImageSelection, LoadJob, LoadedStack, RunToCombine,
     SaveJob, SaveMeta, StackSaveJob,
 };
-use crate::clean::{self, CleanJob, CleanSettings, CleanStats};
+use crate::clean::{self, CleanJob, CleanSettings, CleanStats, LogConvertJob, LogStats};
 use crate::config;
 use crate::crop::{CropJob, CropRect};
 use crate::instrument::Instrument;
@@ -16,6 +16,7 @@ use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
 use crate::rotate::{self, RotateJob};
+use crate::stripes::{self, StripeAlgo, StripeApplyJob, StripeTestJob};
 use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
@@ -180,10 +181,12 @@ enum StackSection {
     Crop,
     Clean,
     Normalize,
+    Stripes,
     Rotate,
     Tilt,
     Cor,
     Sinogram,
+    Log,
 }
 
 /// Shown on a section's header: whether the step was run.
@@ -286,6 +289,30 @@ struct StackView {
     /// Preview texture, keyed by (stack, frame or MAX for overlay, cor bits).
     cor_tex: Option<((usize, usize, u64), egui::TextureHandle)>,
 
+    // Remove stripes (after normalization; tomopy via the pixi python).
+    stripe_algos: Vec<StripeAlgo>,
+    /// Row band (y0, y1) the test run works on.
+    stripe_range: Option<(usize, usize)>,
+    stripe_test_job: Option<StripeTestJob>,
+    /// Test result: (n, band_h, w, y0, before, after) volumes.
+    stripe_test: Option<(usize, usize, usize, usize, Vec<f32>, Vec<f32>)>,
+    /// Row (absolute) whose before/after sinograms are shown.
+    stripe_test_row: usize,
+    stripe_test_tex: Option<((usize, usize), egui::TextureHandle, egui::TextureHandle)>,
+    stripe_apply_job: Option<StripeApplyJob>,
+    /// The stack before the stripe removal, kept so it can be re-run.
+    unstriped: Option<std::sync::Arc<LoadedStack>>,
+    stripes_applied: Option<String>,
+    stripe_error: Option<String>,
+
+    // Log conversion (mandatory before saving): transmission -> -log.
+    log_job: Option<LogConvertJob>,
+    log_converted: bool,
+    log_stats: Option<LogStats>,
+    log_visualize_job: Option<VisualizeJob>,
+    /// The transmission stack, kept so the conversion can be undone.
+    unlogged: Option<std::sync::Arc<LoadedStack>>,
+
     // Saving the pre-processing checkpoint.
     stack_save_job: Option<StackSaveJob>,
     stack_save_status: Option<Result<String, String>>,
@@ -343,6 +370,21 @@ impl StackView {
             cor_frame: None,
             cor_overlay: false,
             cor_tex: None,
+            stripe_algos: stripes::default_algorithms(),
+            stripe_range: None,
+            stripe_test_job: None,
+            stripe_test: None,
+            stripe_test_row: 0,
+            stripe_test_tex: None,
+            stripe_apply_job: None,
+            unstriped: None,
+            stripes_applied: None,
+            stripe_error: None,
+            log_job: None,
+            log_converted: false,
+            log_stats: None,
+            log_visualize_job: None,
+            unlogged: None,
             stack_save_job: None,
             stack_save_status: None,
             goto_recon: false,
@@ -391,6 +433,12 @@ impl StackView {
                 });
             }
         }
+        if let Some(desc) = meta("remove_stripes") {
+            view.stripes_applied = Some(desc);
+        }
+        if meta("log_conversion").is_some() {
+            view.log_converted = true;
+        }
         // The numeric dataset is authoritative; older checkpoints may only
         // have a metadata string.
         if let Some(cor) = view.stack.center_of_rotation {
@@ -401,6 +449,25 @@ impl StackView {
             view.cor_result = Some(value);
         }
         view
+    }
+
+    fn clear_log(&mut self) {
+        self.log_job = None;
+        self.log_converted = false;
+        self.log_stats = None;
+        self.log_visualize_job = None;
+        self.unlogged = None;
+    }
+
+    fn clear_stripes(&mut self) {
+        self.stripe_range = None;
+        self.stripe_test_job = None;
+        self.stripe_test = None;
+        self.stripe_test_tex = None;
+        self.stripe_apply_job = None;
+        self.unstriped = None;
+        self.stripes_applied = None;
+        self.stripe_error = None;
     }
 
     fn clear_cor(&mut self) {
@@ -1827,6 +1894,8 @@ fn stack_ui(
             view.rotation_applied = 0;
             view.rot_tex = None;
             view.clear_tilt();
+            view.clear_stripes();
+            view.clear_log();
             view.clear_cor();
         }
         top_right_bar(ui, logo, log_open, 28.0);
@@ -1944,6 +2013,16 @@ fn stack_ui(
         section(
             ui,
             view,
+            StackSection::Stripes,
+            "Remove stripes",
+            run_status(view.stripes_applied.is_some()),
+            &mut |ui, view| {
+                stripes_section_ui(ui, view);
+            },
+        );
+        section(
+            ui,
+            view,
             StackSection::Rotate,
             "Rotate the data",
             run_status(view.rotation_applied != 0),
@@ -1981,6 +2060,20 @@ fn stack_ui(
                 sinogram_section_ui(ui, view);
             },
         );
+        section(
+            ui,
+            view,
+            StackSection::Log,
+            "Log conversion (mandatory)",
+            if view.log_converted {
+                SectionStatus::Done
+            } else {
+                SectionStatus::Required
+            },
+            &mut |ui, view| {
+                log_section_ui(ui, view);
+            },
+        );
     }
     if let Some(which) = clicked {
         view.open_section = if view.open_section == Some(which) {
@@ -2014,10 +2107,20 @@ fn stack_ui(
                 }
             }
         }
+        let savable = view.log_converted;
+        if !savable {
+            ui.label(
+                RichText::new(
+                    "the log conversion (last section) is mandatory before saving or \
+                     evaluating the reconstruction",
+                )
+                .color(Color32::from_rgb(240, 180, 60)),
+            );
+        }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    view.stack_save_job.is_none(),
+                    savable && view.stack_save_job.is_none(),
                     egui::Button::new("💾 Save the pre-processed stack…"),
                 )
                 .on_hover_text(
@@ -2061,7 +2164,7 @@ fn stack_ui(
                 }
             }
             if ui
-                .button("🚀 Evaluate the reconstruction")
+                .add_enabled(savable, egui::Button::new("🚀 Evaluate the reconstruction"))
                 .on_hover_text("continue with this stack right away — saving is optional")
                 .clicked()
             {
@@ -2457,6 +2560,8 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_applied = 0;
                 view.rot_tex = None;
                 view.clear_tilt();
+                view.clear_stripes();
+                view.clear_log();
                 view.clear_cor();
                 view.open_section = Some(StackSection::Rotate);
             }
@@ -2782,6 +2887,7 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             view.stack = std::sync::Arc::new(corrected);
             view.tilt_applied = applied;
             view.tilt_apply = None;
+            view.clear_log();
         } else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -3027,6 +3133,373 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         );
     }
     if let Some(e) = &view.tilt_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
+/// Log conversion (mandatory before saving): the notebook's
+/// `log_conversion_and_cleaning` — transmission to attenuation via -log,
+/// with tomopy-style outlier removal and negatives set to 0 on the way.
+fn log_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.log_job {
+        if let Some((converted, stats)) = job.poll() {
+            logger::log(format!(
+                "log conversion done: {} outliers replaced, {} negatives zeroed",
+                stats.outliers_replaced, stats.negatives_zeroed
+            ));
+            if view.unlogged.is_none() {
+                view.unlogged = Some(std::sync::Arc::clone(&view.stack));
+            }
+            view.stack = std::sync::Arc::new(converted);
+            view.log_converted = true;
+            view.log_stats = Some(stats);
+            view.log_job = None;
+        } else {
+            let done = job.done();
+            let frac = (done as f32 / job.total.max(1) as f32).min(1.0);
+            ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{} images", job.total)));
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+    }
+
+    if view.log_converted {
+        let stats = view.log_stats;
+        ui.label(
+            RichText::new(format!(
+                "converted to attenuation ✔ — -log(T){}",
+                stats
+                    .map(|s| format!(
+                        " ({} outliers replaced, {} negatives zeroed)",
+                        s.outliers_replaced, s.negatives_zeroed
+                    ))
+                    .unwrap_or_default()
+            ))
+            .color(Color32::from_rgb(120, 200, 120)),
+        );
+        // Visualize the attenuation data in the sibling TIFF viewer.
+        if let Some(job) = &mut view.log_visualize_job {
+            match job.poll() {
+                Some(Ok(())) => {
+                    logger::log("attenuation-data viewer closed");
+                    view.log_visualize_job = None;
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("visualizing the attenuation data failed: {e}"));
+                    view.log_visualize_job = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("TIFF viewer is open on the attenuation images");
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            if view.log_visualize_job.is_none()
+                && ui
+                    .button("👁 Visualize the attenuation data")
+                    .on_hover_text("opens the stack in rust_tiff_viewer, on the single-image view")
+                    .clicked()
+            {
+                logger::log("opening the TIFF viewer on the attenuation stack (single-image view)");
+                view.log_visualize_job =
+                    Some(VisualizeJob::start(std::sync::Arc::clone(&view.stack)));
+            }
+            if view.unlogged.is_some() && ui.button("↩ Back to transmission").clicked() {
+                logger::log("log conversion undone: back to the transmission stack");
+                view.stack = view.unlogged.take().expect("checked above");
+                view.log_converted = false;
+                view.log_stats = None;
+            }
+        });
+        return;
+    }
+
+    ui.label(
+        "converts the transmission data to attenuation (-log), the form the \
+         reconstruction algorithms need, and cleans it on the way (tomopy outlier \
+         removal, diff 0.2, and negatives set to 0)",
+    );
+    ui.label(
+        RichText::new("this step is mandatory before saving the checkpoint — run every \
+                       other correction first, this is the last one")
+            .weak()
+            .size(11.0),
+    );
+    if ui
+        .add_enabled(
+            view.log_job.is_none(),
+            egui::Button::new("▶ Convert to attenuation (-log)"),
+        )
+        .clicked()
+    {
+        logger::log(format!(
+            "converting {} projections to attenuation (-log)…",
+            view.stack.sample.len()
+        ));
+        view.log_job = Some(LogConvertJob::start(std::sync::Arc::clone(&view.stack)));
+    }
+}
+
+/// "Remove stripes": the tomopy stripe-removal algorithms of the Python
+/// notebook — pick and order the algorithms, test them on a band of rows
+/// (before/after sinograms), then apply to the whole stack.
+fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    // Fold finished background work into the view.
+    if let Some(job) = &mut view.stripe_test_job {
+        match job.poll() {
+            Some(Ok((before, after, n, band_h, w))) => {
+                let y0 = view.stripe_range.map(|(y0, _)| y0).unwrap_or(0);
+                logger::log(format!(
+                    "stripe removal test done on rows {y0}..{} ({})",
+                    y0 + band_h - 1,
+                    stripes::describe(&view.stripe_algos)
+                ));
+                view.stripe_test = Some((n, band_h, w, y0, before, after));
+                view.stripe_test_tex = None;
+                view.stripe_error = None;
+                view.stripe_test_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("stripe removal test failed: {e}"));
+                view.stripe_error = Some(e);
+                view.stripe_test_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("tomopy is running on the test band…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+    if let Some(job) = &mut view.stripe_apply_job {
+        match job.poll() {
+            Some(Ok(cleaned)) => {
+                let desc = stripes::describe(&view.stripe_algos);
+                logger::log(format!("stripes removed from the whole stack: {desc}"));
+                if view.unstriped.is_none() {
+                    view.unstriped = Some(std::sync::Arc::clone(&view.stack));
+                }
+                view.stack = std::sync::Arc::new(cleaned);
+                view.stripes_applied = Some(desc);
+                view.stripe_error = None;
+                view.stripe_apply_job = None;
+                view.clear_log();
+            }
+            Some(Err(e)) => {
+                logger::error(format!("stripe removal failed: {e}"));
+                view.stripe_error = Some(e);
+                view.stripe_apply_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("tomopy is running on the whole stack…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+
+    let Some(first) = view.stack.sample.first() else {
+        return;
+    };
+    let h = first.height;
+
+    // Algorithm list (applied in this order), with their parameters.
+    ui.label(
+        RichText::new("tomopy algorithms — the checked ones are applied in this order")
+            .weak()
+            .size(12.0),
+    );
+    for algo in &mut view.stripe_algos {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut algo.enabled, algo.name)
+                .on_hover_text(algo.help);
+        });
+        if algo.enabled {
+            ui.indent(algo.name, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for param in &mut algo.params {
+                        ui.label(format!("{}:", param.name));
+                        match &mut param.value {
+                            stripes::ParamValue::Int(v) => {
+                                let widget = egui::DragValue::new(v).range(0..=999);
+                                let response = ui.add(widget);
+                                if param.zero_means_auto {
+                                    response.on_hover_text("0 = auto");
+                                }
+                            }
+                            stripes::ParamValue::Float(v) => {
+                                ui.add(egui::DragValue::new(v).speed(0.1).range(0.0..=999.0));
+                            }
+                            stripes::ParamValue::Bool(v) => {
+                                ui.checkbox(v, "");
+                            }
+                        }
+                    }
+                });
+            });
+        }
+    }
+    let any_enabled = view.stripe_algos.iter().any(|a| a.enabled);
+    if !any_enabled {
+        ui.label(RichText::new("select at least one algorithm").weak());
+    }
+
+    // Test band + buttons.
+    let (mut y0, mut y1) = view
+        .stripe_range
+        .unwrap_or((h / 3, (2 * h / 3).min(h - 1)));
+    ui.horizontal(|ui| {
+        ui.label("test on rows:");
+        ui.add(egui::DragValue::new(&mut y0).range(0..=h.saturating_sub(2)));
+        ui.label("to");
+        ui.add(egui::DragValue::new(&mut y1).range(1..=h - 1));
+        let busy = view.stripe_test_job.is_some() || view.stripe_apply_job.is_some();
+        if ui
+            .add_enabled(any_enabled && !busy, egui::Button::new("🧪 Test on this band"))
+            .clicked()
+        {
+            logger::log(format!(
+                "testing stripe removal on rows {y0}..{y1}: {}",
+                stripes::describe(&view.stripe_algos)
+            ));
+            view.stripe_error = None;
+            view.stripe_test = None;
+            view.stripe_test_tex = None;
+            view.stripe_test_job = Some(StripeTestJob::start(
+                std::sync::Arc::clone(&view.stack),
+                y0.min(h - 2),
+                y1.clamp(y0 + 1, h - 1),
+                view.stripe_algos.clone(),
+            ));
+        }
+        if ui
+            .add_enabled(
+                any_enabled && !busy,
+                egui::Button::new("▶ Apply to the whole stack"),
+            )
+            .clicked()
+        {
+            let input = view
+                .unstriped
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::clone(&view.stack));
+            logger::log(format!(
+                "removing stripes from the whole stack: {}",
+                stripes::describe(&view.stripe_algos)
+            ));
+            view.stripe_error = None;
+            view.stripe_apply_job = Some(StripeApplyJob::start(input, view.stripe_algos.clone()));
+        }
+    });
+    y1 = y1.clamp(y0 + 1, h - 1);
+    view.stripe_range = Some((y0, y1));
+
+    // Test result: before/after sinograms of a row inside the band.
+    if let Some((n, band_h, w, band_y0, before, after)) = &view.stripe_test {
+        let (n, band_h, w, band_y0) = (*n, *band_h, *w, *band_y0);
+        view.stripe_test_row = view.stripe_test_row.clamp(band_y0, band_y0 + band_h - 1);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut view.stripe_test_row, band_y0..=band_y0 + band_h - 1)
+                    .text("sinogram row"),
+            );
+        });
+        let key = (view.stripe_test_row, view.stripe_algos.len());
+        if view.stripe_test_tex.as_ref().map(|(k, ..)| *k) != Some(key) {
+            let row = view.stripe_test_row - band_y0;
+            let stride = (w / 1024).max(1);
+            let sino_w = w.div_ceil(stride);
+            let build = |volume: &[f32]| -> Vec<f32> {
+                let mut values = Vec::with_capacity(n * sino_w);
+                for i in 0..n {
+                    let line = &volume[(i * band_h + row) * w..(i * band_h + row) * w + w];
+                    for x in (0..w).step_by(stride) {
+                        values.push(line[x]);
+                    }
+                }
+                values
+            };
+            let sino_before = build(before);
+            let sino_after = build(after);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in sino_before.iter().chain(&sino_after) {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            let span = (hi - lo).max(1e-6);
+            let to_tex = |values: &[f32], name: &str| {
+                let pixels: Vec<Color32> = values
+                    .iter()
+                    .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+                    .collect();
+                ctx.load_texture(
+                    name.to_owned(),
+                    egui::ColorImage {
+                        size: [sino_w, n],
+                        source_size: egui::vec2(sino_w as f32, n as f32),
+                        pixels,
+                    },
+                    egui::TextureOptions::NEAREST,
+                )
+            };
+            view.stripe_test_tex = Some((
+                key,
+                to_tex(&sino_before, "stripe_before"),
+                to_tex(&sino_after, "stripe_after"),
+            ));
+        }
+        if let Some((_, before_tex, after_tex)) = &view.stripe_test_tex {
+            ui.columns(2, |cols| {
+                for (col, tex, title) in [
+                    (0usize, before_tex, "before"),
+                    (1, after_tex, "after"),
+                ] {
+                    let ui = &mut cols[col];
+                    ui.label(RichText::new(title).strong().size(13.0));
+                    let size = tex.size_vec2();
+                    let width = (ui.available_width() - 12.0).clamp(200.0, 500.0);
+                    let height = (size.y * 3.0).clamp(240.0, 420.0);
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(width, height)),
+                    );
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "sinograms of the selected row — vertical lines are the stripes the \
+                     algorithms should remove",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+    }
+
+    if let Some(desc) = &view.stripes_applied {
+        ui.label(
+            RichText::new(format!("stripes removed ✔ — {desc}"))
+                .color(Color32::from_rgb(120, 200, 120)),
+        );
+        ui.label(
+            RichText::new("re-applying runs the current selection on the pre-removal stack")
+                .weak()
+                .size(11.0),
+        );
+    }
+    if let Some(e) = &view.stripe_error {
         ui.colored_label(Color32::LIGHT_RED, e);
     }
 }
@@ -3415,6 +3888,8 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_applied = 0;
                 view.rot_tex = None;
                 view.clear_tilt();
+                view.clear_stripes();
+                view.clear_log();
                 view.clear_cor();
             }
             Some(Ok(None)) => {

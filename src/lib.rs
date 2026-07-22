@@ -15,6 +15,7 @@ pub mod logger;
 pub mod normalize;
 pub mod rotate;
 pub mod session;
+pub mod stripes;
 pub mod tilt;
 pub mod tof;
 pub mod white_beam;

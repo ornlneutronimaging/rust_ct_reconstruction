@@ -50,7 +50,7 @@ impl NormSettings {
     }
 }
 
-fn scratch_dir(stack: &LoadedStack, tag: &str) -> Result<PathBuf, String> {
+pub(crate) fn scratch_dir(stack: &LoadedStack, tag: &str) -> Result<PathBuf, String> {
     let base = stack
         .path
         .parent()

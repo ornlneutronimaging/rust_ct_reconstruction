@@ -255,6 +255,104 @@ impl CleanJob {
     }
 }
 
+/// Statistics of the log conversion (the notebook's
+/// `log_conversion_and_cleaning`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogStats {
+    pub outliers_replaced: usize,
+    pub negatives_zeroed: usize,
+}
+
+/// Convert the sample stack from transmission to attenuation and clean it —
+/// the notebook's `log_conversion_and_cleaning`: a 1e-6 offset guards
+/// `log(0)` (negatives clamped first), `-ln(T)`, then tomopy-style bright
+/// outlier removal (3×3 median, diff 0.2) and negatives set to 0.
+pub struct LogConvertJob {
+    rx: Receiver<(LoadedStack, LogStats)>,
+    progress: Arc<AtomicUsize>,
+    pub total: usize,
+}
+
+/// The tomopy diff threshold of the notebook's post-log cleaning
+/// (`TOMOPY_DIFF` in its config).
+const LOG_CLEAN_DIFF: f32 = 0.2;
+
+impl LogConvertJob {
+    pub fn start(stack: Arc<LoadedStack>) -> Self {
+        let (tx, rx) = channel();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let thread_progress = Arc::clone(&progress);
+        let total = stack.sample.len();
+        std::thread::spawn(move || {
+            let results: Vec<(Projection, LogStats)> = stack
+                .sample
+                .par_iter()
+                .map(|p| {
+                    let mut p = Projection::clone(p);
+                    // Offset against log(0), then the Beer-Lambert -log.
+                    for v in &mut p.mean {
+                        *v = -((v.max(0.0) + 1e-6).ln());
+                    }
+                    let mut stats = LogStats {
+                        outliers_replaced: clean_tomopy(&mut p, LOG_CLEAN_DIFF),
+                        negatives_zeroed: 0,
+                    };
+                    for v in &mut p.mean {
+                        if *v < 0.0 {
+                            *v = 0.0;
+                            stats.negatives_zeroed += 1;
+                        }
+                    }
+                    let sum: f64 = p.mean.iter().map(|v| f64::from(*v)).sum();
+                    p.total_counts = sum * p.n_images_used.max(1) as f64;
+                    thread_progress.fetch_add(1, Ordering::Relaxed);
+                    (p, stats)
+                })
+                .collect();
+            let mut sample = Vec::with_capacity(results.len());
+            let mut stats = LogStats::default();
+            for (p, s) in results {
+                stats.outliers_replaced += s.outliers_replaced;
+                stats.negatives_zeroed += s.negatives_zeroed;
+                sample.push(p);
+            }
+            let mut metadata = stack.metadata.clone();
+            metadata.retain(|(name, _)| name != "log_conversion");
+            metadata.push((
+                "log_conversion".to_owned(),
+                format!(
+                    "-log(max(T, 0) + 1e-6), tomopy outlier removal (diff {LOG_CLEAN_DIFF}), \
+                     negatives set to 0"
+                ),
+            ));
+            metadata.sort();
+            let _ = tx.send((
+                LoadedStack {
+                    path: stack.path.clone(),
+                    sample,
+                    ob: stack.ob.clone(),
+                    metadata,
+                    center_of_rotation: stack.center_of_rotation,
+                },
+                stats,
+            ));
+        });
+        Self {
+            rx,
+            progress,
+            total,
+        }
+    }
+
+    pub fn done(&self) -> usize {
+        self.progress.load(Ordering::Relaxed)
+    }
+
+    pub fn poll(&mut self) -> Option<(LoadedStack, LogStats)> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// Histogram of `values` over `bins` equal bins spanning `[min, max]`;
 /// values outside land in the first/last bin. `(min, max, counts)`.
 pub fn histogram_range(values: &[f32], bins: usize, min: f64, max: f64) -> (f64, f64, Vec<u64>) {
@@ -347,6 +445,21 @@ mod tests {
             ..settings
         };
         assert_eq!(clean_in_house(&mut p2, &none), 0);
+    }
+
+    #[test]
+    fn log_conversion_math() {
+        // -ln(0.5 + 1e-6) ≈ 0.6931; a negative transmission clamps to the
+        // offset and a T > 1 gives a negative attenuation zeroed afterwards.
+        let t: f32 = 0.5;
+        let a = -((t.max(0.0) + 1e-6).ln());
+        assert!((a - 0.693145).abs() < 1e-4);
+        let neg: f32 = -0.2;
+        let a_neg = -((neg.max(0.0) + 1e-6f32).ln());
+        assert!(a_neg > 13.0); // ~ -ln(1e-6)
+        let bright: f32 = 1.2;
+        let a_bright = -((bright.max(0.0) + 1e-6).ln());
+        assert!(a_bright < 0.0);
     }
 
     #[test]
