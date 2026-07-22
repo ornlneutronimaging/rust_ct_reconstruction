@@ -135,6 +135,13 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
     },
 ];
 
+/// The accordion sections of the reconstruction screen — one open at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconSection {
+    Evaluate,
+    Run,
+}
+
 struct ReconView {
     stack: std::sync::Arc<LoadedStack>,
     /// Center of rotation in px; `None` = the horizontal center.
@@ -145,6 +152,11 @@ struct ReconView {
     /// parameters.
     reload_job: Option<LoadJob>,
     opt_error: Option<String>,
+    /// The accordion section currently open.
+    open_section: Option<ReconSection>,
+    /// Algorithm chosen for the full reconstruction (index into
+    /// `RECON_ALGORITHMS`).
+    selected_algo: usize,
 }
 
 impl ReconView {
@@ -155,12 +167,15 @@ impl ReconView {
             optimizer_job: None,
             reload_job: None,
             opt_error: None,
+            open_section: Some(ReconSection::Evaluate),
+            selected_algo: 0,
         }
     }
 }
 
-/// The reconstruction evaluation screen (the algorithms come next); returns
-/// `true` to go back to the setup screen.
+/// The reconstruction screen: evaluate the algorithms (optional), then pick
+/// the one to use for the full reconstruction; returns `true` to go back to
+/// the setup screen.
 fn recon_ui(
     ui: &mut egui::Ui,
     view: &mut ReconView,
@@ -174,7 +189,7 @@ fn recon_ui(
         }
         ui.label(
             RichText::new(format!(
-                "Evaluate the reconstruction — {}",
+                "Reconstruction — {}",
                 view.stack
                     .path
                     .file_name()
@@ -273,39 +288,120 @@ fn recon_ui(
         }
     }
 
-    ui.label(RichText::new("Reconstruction algorithms").strong());
     let on_disk = view.stack.path.is_file();
-    if !on_disk {
-        ui.colored_label(
-            Color32::from_rgb(240, 180, 60),
-            "the stack is not saved to a file yet — save the checkpoint first to \
-             evaluate the algorithms",
-        );
-    }
     let busy = view.optimizer_job.is_some() || view.reload_job.is_some();
+    let evaluated = view
+        .stack
+        .metadata
+        .iter()
+        .filter(|(name, _)| name.ends_with("_config"))
+        .count();
     let mut launch: Option<(&'static str, String)> = None;
-    for algo in &RECON_ALGORITHMS {
-        ui.horizontal(|ui| {
-            let available = algo.binary.is_some();
-            let response = ui
-                .add_enabled(
-                    available && on_disk && !busy,
-                    egui::Button::new(format!(
-                        "🧮 Evaluate the {} reconstruction",
-                        algo.label
-                    )),
-                )
-                .on_hover_text(algo.description)
-                .on_disabled_hover_text(if available {
-                    "save the checkpoint first"
-                } else {
-                    "the evaluator for this algorithm is not built yet"
-                });
-            if response.clicked()
-                && let Some(binary) = algo.binary
-            {
-                launch = Some((binary, algo.label.to_owned()));
+    let mut clicked: Option<ReconSection> = None;
+    let mut section = |ui: &mut egui::Ui,
+                       view: &mut ReconView,
+                       which: ReconSection,
+                       header: RichText,
+                       body: &mut dyn FnMut(&mut egui::Ui, &mut ReconView)| {
+        let open = view.open_section == Some(which);
+        let response = egui::CollapsingHeader::new(header)
+            .open(Some(open))
+            .show(ui, |ui| body(ui, view));
+        if response.header_response.clicked() {
+            clicked = Some(which);
+        }
+        ui.add_space(4.0);
+    };
+
+    // First section: evaluate the algorithms on two test slices (optional);
+    // each evaluator saves its tuned parameters into the checkpoint.
+    let evaluate_header = if evaluated > 0 {
+        RichText::new(format!("✔ Evaluate the algorithms (optional) — {evaluated} evaluated"))
+            .strong()
+            .color(Color32::from_rgb(120, 200, 120))
+    } else {
+        RichText::new("Evaluate the algorithms (optional)").strong()
+    };
+    section(ui, view, ReconSection::Evaluate, evaluate_header, &mut |ui, view| {
+        ui.label(
+            RichText::new(
+                "tune each algorithm on two test slices; the saved parameters are \
+                 picked up by the full reconstruction below",
+            )
+            .weak()
+            .size(11.0),
+        );
+        if !on_disk {
+            ui.colored_label(
+                Color32::from_rgb(240, 180, 60),
+                "the stack is not saved to a file yet — save the checkpoint first to \
+                 evaluate the algorithms",
+            );
+        }
+        for algo in &RECON_ALGORITHMS {
+            ui.horizontal(|ui| {
+                let available = algo.binary.is_some();
+                let response = ui
+                    .add_enabled(
+                        available && on_disk && !busy,
+                        egui::Button::new(format!(
+                            "🧮 Evaluate the {} reconstruction",
+                            algo.label
+                        )),
+                    )
+                    .on_hover_text(algo.description)
+                    .on_disabled_hover_text(if available {
+                        "save the checkpoint first"
+                    } else {
+                        "the evaluator for this algorithm is not built yet"
+                    });
+                if response.clicked()
+                    && let Some(binary) = algo.binary
+                {
+                    launch = Some((binary, algo.label.to_owned()));
+                }
+                let config_key = format!("{}_config", algo.key);
+                match view
+                    .stack
+                    .metadata
+                    .iter()
+                    .find(|(name, _)| *name == config_key)
+                {
+                    Some((_, json)) => {
+                        ui.label(
+                            RichText::new(format!("saved parameters: {json}"))
+                                .color(Color32::from_rgb(120, 200, 120))
+                                .size(11.0),
+                        );
+                    }
+                    None if available => {
+                        ui.label(RichText::new("no saved parameters yet").weak().size(11.0));
+                    }
+                    None => {
+                        ui.label(RichText::new("coming soon").weak().size(11.0));
+                    }
+                }
+            });
+        }
+    });
+
+    // Second section: pick the algorithm for the full reconstruction; its
+    // parameters come from the evaluation when one was run.
+    section(
+        ui,
+        view,
+        ReconSection::Run,
+        RichText::new("Run the reconstruction").strong(),
+        &mut |ui, view| {
+            for (i, algo) in RECON_ALGORITHMS.iter().enumerate() {
+                ui.radio_value(
+                    &mut view.selected_algo,
+                    i,
+                    format!("{} — {}", algo.label, algo.description),
+                );
             }
+            ui.add_space(6.0);
+            let algo = &RECON_ALGORITHMS[view.selected_algo.min(RECON_ALGORITHMS.len() - 1)];
             let config_key = format!("{}_config", algo.key);
             match view
                 .stack
@@ -315,19 +411,61 @@ fn recon_ui(
             {
                 Some((_, json)) => {
                     ui.label(
-                        RichText::new(format!("saved parameters: {json}"))
-                            .color(Color32::from_rgb(120, 200, 120))
-                            .size(11.0),
+                        RichText::new(format!("{} parameters (from the evaluation):", algo.label))
+                            .strong()
+                            .size(12.0),
                     );
-                }
-                None if available => {
-                    ui.label(RichText::new("no saved parameters yet").weak().size(11.0));
+                    match serde_json::from_str::<serde_json::Value>(json) {
+                        Ok(serde_json::Value::Object(map)) => {
+                            for (name, value) in &map {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("    {name}:")).strong().size(12.0),
+                                    );
+                                    ui.label(RichText::new(value.to_string()).size(12.0));
+                                });
+                            }
+                        }
+                        _ => {
+                            ui.label(RichText::new(json).size(12.0));
+                        }
+                    }
                 }
                 None => {
-                    ui.label(RichText::new("coming soon").weak().size(11.0));
+                    ui.label(
+                        RichText::new(format!(
+                            "no saved {} parameters — the defaults will be used; run the \
+                             evaluation above to tune them first",
+                            algo.label
+                        ))
+                        .weak()
+                        .size(12.0),
+                    );
                 }
             }
-        });
+            if matches!(algo.key, "svmbir" | "mbirjax") {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "ℹ the full volume is too large for a single pass with this \
+                         algorithm: it will be split into several sub-reconstructions \
+                         and stitched back together at the end",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            }
+            ui.add_space(6.0);
+            ui.add_enabled(false, egui::Button::new("▶ Run the full reconstruction"))
+                .on_disabled_hover_text("coming soon");
+        },
+    );
+    if let Some(which) = clicked {
+        view.open_section = if view.open_section == Some(which) {
+            None
+        } else {
+            Some(which)
+        };
     }
     if let Some((binary, label)) = launch {
         logger::log(format!(
@@ -2365,7 +2503,7 @@ fn stack_ui(
                 }
             }
             if ui
-                .add_enabled(savable, egui::Button::new("🚀 Evaluate the reconstruction"))
+                .add_enabled(savable, egui::Button::new("🚀 Reconstruction"))
                 .on_hover_text("continue with this stack right away — saving is optional")
                 .clicked()
             {
@@ -6507,6 +6645,8 @@ impl eframe::App for CtApp {
                         optimizer_job: None,
                         reload_job: None,
                         opt_error: None,
+                        open_section: Some(ReconSection::Evaluate),
+                        selected_algo: 0,
                     })
                 }
                 _ => None,
