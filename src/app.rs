@@ -75,10 +75,32 @@ enum Screen {
     Recon(ReconView),
 }
 
+/// The SVMBIR optimizer of the sibling repo.
+const SVMBIR_OPTIMIZER_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_svmbir_optimizer/target/release/svmbir_optimizer";
+
 struct ReconView {
     stack: std::sync::Arc<LoadedStack>,
     /// Center of rotation in px; `None` = the horizontal center.
     cor: Option<f64>,
+    /// SVMBIR optimizer session in flight.
+    optimizer_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// Reloading the file after the optimizer closes, to pick up the saved
+    /// parameters.
+    reload_job: Option<LoadJob>,
+    opt_error: Option<String>,
+}
+
+impl ReconView {
+    fn new(stack: LoadedStack, cor: Option<f64>) -> Self {
+        Self {
+            stack: std::sync::Arc::new(stack),
+            cor,
+            optimizer_job: None,
+            reload_job: None,
+            opt_error: None,
+        }
+    }
 }
 
 /// The reconstruction evaluation screen (the algorithms come next); returns
@@ -6227,10 +6249,7 @@ impl eframe::App for CtApp {
                         self.load_job = None;
                         self.screen = if preprocessed {
                             let cor = stack.center_of_rotation;
-                            Screen::Recon(ReconView {
-                                stack: std::sync::Arc::new(stack),
-                                cor,
-                            })
+                            Screen::Recon(ReconView::new(stack, cor))
                         } else {
                             Screen::Stack(StackView::new(stack))
                         };
@@ -6302,9 +6321,13 @@ impl eframe::App for CtApp {
             let recon = match &mut self.screen {
                 Screen::Stack(view) if view.goto_recon => {
                     view.goto_recon = false;
+                    let cor = view.cor_result.or(view.stack.center_of_rotation);
                     Some(ReconView {
                         stack: std::sync::Arc::clone(&view.stack),
-                        cor: view.cor_result.or(view.stack.center_of_rotation),
+                        cor,
+                        optimizer_job: None,
+                        reload_job: None,
+                        opt_error: None,
                     })
                 }
                 _ => None,
