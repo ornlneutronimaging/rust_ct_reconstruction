@@ -223,6 +223,9 @@ struct ReconView {
     run_job: Option<crate::recon_run::RunJob>,
     /// Outcome of the last run (output folder or error).
     run_result: Option<Result<PathBuf, String>>,
+    /// A rust_tiff_viewer session showing the reconstructed slices.
+    viewer_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    viewer_error: Option<String>,
 }
 
 impl ReconView {
@@ -243,6 +246,8 @@ impl ReconView {
             output_base: None,
             run_job: None,
             run_result: None,
+            viewer_job: None,
+            viewer_error: None,
         }
     }
 }
@@ -927,29 +932,27 @@ fn recon_ui(
                         view.output_base = Some(dir);
                     }
                 }
+                ui.label(RichText::new("output folder:").strong().size(12.0));
                 match &view.output_base {
                     Some(dir) => {
                         ui.label(RichText::new(dir.display().to_string()).size(12.0));
                     }
                     None => {
-                        ui.label(
-                            RichText::new("no output folder selected yet")
-                                .weak()
-                                .size(12.0),
-                        );
+                        ui.label(RichText::new("not selected yet").weak().size(12.0));
                     }
                 }
             });
             let sample_base = sample_base_name(&view.stack);
-            ui.label(
-                RichText::new(format!(
-                    "the slices are written into <output folder>/{sample_base}_{}\
-                     _reconstructed_data_<date and time>",
-                    algo.key
-                ))
-                .weak()
-                .size(11.0),
-            );
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("folder created:").strong().size(12.0));
+                ui.label(
+                    RichText::new(format!(
+                        "{sample_base}_{}_reconstructed_data_<date and time>",
+                        algo.key
+                    ))
+                    .size(12.0),
+                );
+            });
             if let Some(job) = &mut view.run_job {
                 match job.poll() {
                     Some(result) => {
@@ -1044,17 +1047,81 @@ fn recon_ui(
                     },
                 ));
             }
+            if let Some(rx) = &view.viewer_job {
+                match rx.try_recv() {
+                    Ok(Ok(())) => view.viewer_job = None,
+                    Ok(Err(e)) => {
+                        logger::error(format!("slice viewer failed: {e}"));
+                        view.viewer_error = Some(e);
+                        view.viewer_job = None;
+                    }
+                    Err(_) => ui.ctx().request_repaint_after(Duration::from_millis(500)),
+                }
+            }
             match &view.run_result {
                 Some(Ok(dir)) => {
-                    ui.colored_label(
-                        Color32::from_rgb(120, 200, 120),
-                        format!("reconstruction written into {}", dir.display()),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            Color32::from_rgb(120, 200, 120),
+                            format!("reconstruction written into {}", dir.display()),
+                        );
+                        let viewing = view.viewer_job.is_some();
+                        if ui
+                            .add_enabled(
+                                !viewing,
+                                egui::Button::new("🖼 2D slices"),
+                            )
+                            .on_hover_text(
+                                "browse the reconstructed slices in rust_tiff_viewer",
+                            )
+                            .clicked()
+                        {
+                            logger::log(format!(
+                                "opening rust_tiff_viewer on {}",
+                                dir.display()
+                            ));
+                            view.viewer_error = None;
+                            let dir = dir.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let result = std::process::Command::new(
+                                    crate::normalize::TIFF_VIEWER_BIN,
+                                )
+                                .arg(&dir)
+                                .arg("--single-image")
+                                .output();
+                                let _ = tx.send(match result {
+                                    Err(e) => Err(format!(
+                                        "cannot launch {}: {e}",
+                                        crate::normalize::TIFF_VIEWER_BIN
+                                    )),
+                                    Ok(out) if !out.status.success() => Err(format!(
+                                        "rust_tiff_viewer failed ({}): {}",
+                                        out.status,
+                                        String::from_utf8_lossy(&out.stderr).trim()
+                                    )),
+                                    Ok(_) => Ok(()),
+                                });
+                            });
+                            view.viewer_job = Some(rx);
+                        }
+                        ui.add_enabled(false, egui::Button::new("📦 3D view"))
+                            .on_disabled_hover_text(
+                                "volume rendering of the reconstruction — coming soon",
+                            );
+                        if viewing {
+                            ui.spinner();
+                            ui.label(RichText::new("viewer open").weak().size(11.0));
+                        }
+                    });
                 }
                 Some(Err(e)) => {
                     ui.colored_label(Color32::LIGHT_RED, e);
                 }
                 None => {}
+            }
+            if let Some(e) = &view.viewer_error {
+                ui.colored_label(Color32::LIGHT_RED, e);
             }
         },
     );
@@ -7253,6 +7320,8 @@ impl eframe::App for CtApp {
                         output_base: None,
                         run_job: None,
                         run_result: None,
+                        viewer_job: None,
+                        viewer_error: None,
                     })
                 }
                 _ => None,
