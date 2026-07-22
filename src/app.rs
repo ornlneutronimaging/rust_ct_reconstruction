@@ -127,13 +127,17 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         key: "algotom_fbp",
         label: "AlgoTom FBP",
         description: "filtered back projection — optimized for large data",
-        binary: None,
+        binary: Some(
+            "/SNS/VENUS/shared/software/git/rust_algotom_fbp_optimizer/target/release/algotom_fbp_optimizer",
+        ),
     },
     ReconAlgorithm {
         key: "algotom_gridrec",
         label: "AlgoTom GridRec",
         description: "very fast — good for quick previews",
-        binary: None,
+        binary: Some(
+            "/SNS/VENUS/shared/software/git/rust_algotom_gridrec_optimizer/target/release/algotom_gridrec_optimizer",
+        ),
     },
 ];
 
