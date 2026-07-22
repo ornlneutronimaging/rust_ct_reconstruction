@@ -4,7 +4,7 @@
 
 use crate::combine::LoadedStack;
 use crate::crop::write_npy;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{Receiver, channel};
@@ -230,21 +230,76 @@ pub fn save_recon_settings(path: &Path, json: &str) -> Result<(), String> {
 pub struct RunJob {
     rx: Receiver<Result<PathBuf, String>>,
     pub progress: Arc<Mutex<String>>,
+    /// Everything the Python side prints (stdout except the progress
+    /// lines, plus stderr), appended live.
+    pub output: Arc<Mutex<String>>,
+    /// PID of the running Python process (0 = not spawned yet or done).
+    child_pid: Arc<std::sync::atomic::AtomicU32>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunJob {
     pub fn start(stack: Arc<LoadedStack>, spec: RunSpec) -> Self {
         let (tx, rx) = channel();
         let progress = Arc::new(Mutex::new("preparing the data…".to_owned()));
+        let output = Arc::new(Mutex::new(String::new()));
+        let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let progress_thread = Arc::clone(&progress);
+        let output_thread = Arc::clone(&output);
+        let pid_thread = Arc::clone(&child_pid);
+        let cancelled_thread = Arc::clone(&cancelled);
         std::thread::spawn(move || {
-            let _ = tx.send(run(&stack, &spec, &progress_thread));
+            let _ = tx.send(run(
+                &stack,
+                &spec,
+                &progress_thread,
+                &output_thread,
+                &pid_thread,
+                &cancelled_thread,
+            ));
         });
-        Self { rx, progress }
+        Self {
+            rx,
+            progress,
+            output,
+            child_pid,
+            cancelled,
+        }
     }
 
     pub fn poll(&mut self) -> Option<Result<PathBuf, String>> {
         self.rx.try_recv().ok()
+    }
+
+    /// Interrupt the reconstruction: the Python process is terminated and
+    /// the job resolves to an error explaining the stop.
+    pub fn cancel(&self) {
+        use std::sync::atomic::Ordering;
+        self.cancelled.store(true, Ordering::SeqCst);
+        let pid = self.child_pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+
+    pub fn cancelling(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Append a line to a captured terminal output, trimming the front when
+/// it grows past half a megabyte.
+pub(crate) fn append_output(buffer: &Arc<Mutex<String>>, line: &str) {
+    let mut text = buffer.lock().unwrap();
+    text.push_str(line);
+    text.push('\n');
+    if text.len() > 512 * 1024 {
+        let cut = text.len() - 256 * 1024;
+        let cut = text[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
+        text.drain(..cut);
     }
 }
 
@@ -252,7 +307,11 @@ fn run(
     stack: &LoadedStack,
     spec: &RunSpec,
     progress: &Arc<Mutex<String>>,
+    output: &Arc<Mutex<String>>,
+    child_pid: &Arc<std::sync::atomic::AtomicU32>,
+    cancelled: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<PathBuf, String> {
+    use std::sync::atomic::Ordering;
     let first = stack
         .sample
         .first()
@@ -325,6 +384,9 @@ fn run(
         std::fs::write(&script, RUN_SCRIPT)
             .map_err(|e| format!("write {}: {e}", script.display()))?;
 
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("reconstruction stopped by the user".to_owned());
+        }
         *progress.lock().unwrap() = "starting the reconstruction…".to_owned();
         let mut child = std::process::Command::new(RECON_PYTHON)
             .arg(&script)
@@ -334,26 +396,47 @@ fn run(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot launch {RECON_PYTHON}: {e}"))?;
+        child_pid.store(child.id(), Ordering::SeqCst);
+        // A stop request may have arrived between the check and the spawn.
+        if cancelled.load(Ordering::SeqCst) {
+            let _ = child.kill();
+        }
         let stdout = child.stdout.take().expect("piped stdout");
         let progress_lines = Arc::clone(progress);
+        let stdout_buffer = Arc::clone(output);
         let stdout_reader = std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Some(msg) = line.strip_prefix("PROGRESS ") {
                     *progress_lines.lock().unwrap() = msg.to_owned();
+                } else {
+                    append_output(&stdout_buffer, &line);
                 }
             }
         });
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stderr_buffer = Arc::clone(output);
         let stderr_reader = std::thread::spawn(move || {
             let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                append_output(&stderr_buffer, &line);
+                text.push_str(&line);
+                text.push('\n');
+            }
             text
         });
         let status = child
             .wait()
             .map_err(|e| format!("waiting for the reconstruction: {e}"))?;
+        child_pid.store(0, Ordering::SeqCst);
         let _ = stdout_reader.join();
         let stderr_text = stderr_reader.join().unwrap_or_default();
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(
+                "reconstruction stopped by the user — the slices already written stay \
+                 in the output folder"
+                    .to_owned(),
+            );
+        }
         if !status.success() {
             let tail: Vec<&str> = stderr_text.trim().lines().rev().take(4).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();

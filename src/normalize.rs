@@ -199,15 +199,19 @@ np.save(out_file, np.asarray(o_norm.get_normalized_data(), dtype=np.float32))
 /// way back. Resolves to the normalized stack and a summary line.
 pub struct NormJob {
     rx: Receiver<Result<(LoadedStack, String), String>>,
+    /// Everything NeuNorm prints (stdout and stderr), appended live.
+    pub output: Arc<std::sync::Mutex<String>>,
 }
 
 impl NormJob {
     pub fn start(stack: Arc<LoadedStack>, settings: NormSettings) -> Self {
         let (tx, rx) = channel();
+        let output = Arc::new(std::sync::Mutex::new(String::new()));
+        let output_thread = Arc::clone(&output);
         std::thread::spawn(move || {
-            let _ = tx.send(run_normalization(&stack, &settings));
+            let _ = tx.send(run_normalization(&stack, &settings, &output_thread));
         });
-        Self { rx }
+        Self { rx, output }
     }
 
     pub fn poll(&mut self) -> Option<Result<(LoadedStack, String), String>> {
@@ -218,6 +222,7 @@ impl NormJob {
 fn run_normalization(
     stack: &LoadedStack,
     settings: &NormSettings,
+    captured: &Arc<std::sync::Mutex<String>>,
 ) -> Result<(LoadedStack, String), String> {
     if stack.ob.is_empty() {
         return Err("no open beam in this stack — normalization needs at least one".to_owned());
@@ -257,27 +262,59 @@ fn run_normalization(
         write_npy_stack(&ob_npy, &ob_refs)?;
         std::fs::write(&script, NEUNORM_SCRIPT)
             .map_err(|e| format!("write {}: {e}", script.display()))?;
-        let mut cmd = std::process::Command::new(PYTHON);
-        cmd.arg(&script).arg(&sample_npy).arg(&ob_npy).arg(&out_npy);
+        let mut args: Vec<String> = vec![
+            script.display().to_string(),
+            sample_npy.display().to_string(),
+            ob_npy.display().to_string(),
+            out_npy.display().to_string(),
+        ];
         if settings.beam_fluctuation
             && let Some(roi) = &settings.roi
         {
             for v in [roi.x, roi.y, roi.x + roi.width - 1, roi.y + roi.height - 1] {
-                cmd.arg(v.to_string());
+                args.push(v.to_string());
             }
         }
-        let output = cmd
-            .output()
+        // The exact command, in the log file and at the top of the captured
+        // terminal output.
+        let cmdline = format!("{PYTHON} {}", args.join(" "));
+        crate::logger::log(format!("NeuNorm command: {cmdline}"));
+        crate::recon_run::append_output(captured, &format!("$ {cmdline}"));
+        let mut cmd = std::process::Command::new(PYTHON);
+        cmd.args(&args);
+        use std::io::BufRead;
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("cannot launch {PYTHON}: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: Vec<&str> = stderr.trim().lines().rev().take(4).collect();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stdout_buffer = Arc::clone(captured);
+        let stdout_reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                crate::recon_run::append_output(&stdout_buffer, &line);
+            }
+        });
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stderr_buffer = Arc::clone(captured);
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                crate::recon_run::append_output(&stderr_buffer, &line);
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text
+        });
+        let status = child
+            .wait()
+            .map_err(|e| format!("waiting for NeuNorm: {e}"))?;
+        let _ = stdout_reader.join();
+        let stderr_text = stderr_reader.join().unwrap_or_default();
+        if !status.success() {
+            let tail: Vec<&str> = stderr_text.trim().lines().rev().take(4).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
-            return Err(format!(
-                "NeuNorm failed ({}): {}",
-                output.status,
-                tail.join(" | ")
-            ));
+            return Err(format!("NeuNorm failed ({status}): {}", tail.join(" | ")));
         }
         let (shape, values) = read_npy(&out_npy)?;
         if shape != [stack.sample.len(), h, w] {

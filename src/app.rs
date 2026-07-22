@@ -75,6 +75,37 @@ enum Screen {
     Recon(ReconView),
 }
 
+/// Navigation requested by a screen's header buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nav {
+    Stay,
+    /// Back to the starting (setup) view, dropping the history.
+    Home,
+    /// Back to the previous view, exactly as it was left.
+    Previous,
+}
+
+/// The home and previous-view buttons of every screen header; returns the
+/// requested navigation.
+fn nav_buttons(ui: &mut egui::Ui) -> Nav {
+    let mut nav = Nav::Stay;
+    if ui
+        .button("🏠 Home")
+        .on_hover_text("back to the starting view")
+        .clicked()
+    {
+        nav = Nav::Home;
+    }
+    if ui
+        .button("↩ Previous")
+        .on_hover_text("back to the previous view, exactly as it was left")
+        .clicked()
+    {
+        nav = Nav::Previous;
+    }
+    nav
+}
+
 /// The SVMBIR optimizer of the sibling repo.
 const SVMBIR_OPTIMIZER_BIN: &str =
     "/SNS/VENUS/shared/software/git/rust_svmbir_optimizer/target/release/svmbir_optimizer";
@@ -191,6 +222,9 @@ enum ReconSection {
 
 struct ReconView {
     stack: std::sync::Arc<LoadedStack>,
+    /// The checkpoint file on disk backing this stack — the loaded file,
+    /// or the checkpoint saved at the end of pre-processing.
+    path: PathBuf,
     /// Center of rotation in px; `None` = the horizontal center.
     cor: Option<f64>,
     /// An algorithm evaluator session in flight, with its label.
@@ -228,6 +262,10 @@ struct ReconView {
     viewer_error: Option<String>,
     /// Outcome of saving the reconstruction setup into the checkpoint.
     settings_save_status: Option<Result<String, String>>,
+    /// Terminal output of the (last) reconstruction run, kept after the
+    /// job finishes.
+    run_output: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    show_run_output: bool,
 }
 
 impl ReconView {
@@ -239,8 +277,10 @@ impl ReconView {
     /// slice range, split, output folder) saved in the checkpoint's
     /// `recon_settings` metadata when there is one.
     fn from_arc(stack: std::sync::Arc<LoadedStack>, cor: Option<f64>) -> Self {
+        let path = stack.path.clone();
         let mut view = Self {
             stack,
+            path,
             cor,
             optimizer_job: None,
             reload_job: None,
@@ -258,6 +298,8 @@ impl ReconView {
             viewer_job: None,
             viewer_error: None,
             settings_save_status: None,
+            run_output: None,
+            show_run_output: false,
         };
         if let Some((_, json)) = view
             .stack
@@ -352,6 +394,45 @@ fn split_ranges(h: usize, n: usize, overlap: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// A `>_` toggle button plus the live-captured terminal output of a Python
+/// job (shared by the normalization and the full reconstruction).
+fn terminal_output_ui(
+    ui: &mut egui::Ui,
+    id: &str,
+    hover: &str,
+    output: &std::sync::Arc<std::sync::Mutex<String>>,
+    show: &mut bool,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Button::new(RichText::new(">_").monospace().strong()))
+            .on_hover_text(hover)
+            .clicked()
+        {
+            *show = !*show;
+        }
+        ui.label(RichText::new("terminal output").weak().size(11.0));
+    });
+    if *show {
+        let text = output.lock().unwrap().clone();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(id.to_owned())
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if text.is_empty() {
+                        ui.label(RichText::new("(nothing printed yet)").weak().size(11.0));
+                    } else {
+                        ui.label(RichText::new(text).monospace().size(11.0));
+                    }
+                });
+        });
+    }
+}
+
 /// Show a saved `<algorithm>_config` JSON as one "name: value" row per
 /// field.
 fn config_json_rows(ui: &mut egui::Ui, json: &str) {
@@ -371,24 +452,21 @@ fn config_json_rows(ui: &mut egui::Ui, json: &str) {
 }
 
 /// The reconstruction screen: evaluate the algorithms (optional), then pick
-/// the one to use for the full reconstruction; returns `true` to go back to
-/// the setup screen.
+/// the one to use for the full reconstruction; returns the requested
+/// navigation.
 fn recon_ui(
     ui: &mut egui::Ui,
     view: &mut ReconView,
     logo: Option<&egui::TextureHandle>,
     log_open: &mut bool,
-) -> bool {
-    let mut back = false;
+) -> Nav {
+    let mut nav = Nav::Stay;
     ui.horizontal(|ui| {
-        if ui.button("↩ Back").clicked() {
-            back = true;
-        }
+        nav = nav_buttons(ui);
         ui.label(
             RichText::new(format!(
                 "Reconstruction — {}",
-                view.stack
-                    .path
+                view.path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
@@ -448,8 +526,8 @@ fn recon_ui(
             Ok(Ok(())) => {
                 logger::log(format!("{label} evaluator closed — reloading the checkpoint"));
                 view.optimizer_job = None;
-                if view.stack.path.is_file() {
-                    view.reload_job = Some(LoadJob::start(view.stack.path.clone()));
+                if view.path.is_file() {
+                    view.reload_job = Some(LoadJob::start(view.path.clone()));
                 }
             }
             Ok(Err(e)) => {
@@ -474,6 +552,7 @@ fn recon_ui(
             Some(Ok(stack)) => {
                 view.cor = stack.center_of_rotation.or(view.cor);
                 view.stack = std::sync::Arc::new(stack);
+                view.path = view.stack.path.clone();
                 view.reload_job = None;
             }
             Some(Err(e)) => {
@@ -494,7 +573,7 @@ fn recon_ui(
         .map(|p| p.width as f64)
         .unwrap_or(0.0);
     let cor_px = view.cor.unwrap_or(width_px / 2.0);
-    let on_disk = view.stack.path.is_file();
+    let on_disk = view.path.is_file();
     let busy = view.optimizer_job.is_some() || view.reload_job.is_some();
     let evaluated = view
         .stack
@@ -1012,6 +1091,19 @@ fn recon_ui(
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(job.progress.lock().unwrap().clone());
+                            if job.cancelling() {
+                                ui.label(RichText::new("stopping…").weak().size(11.0));
+                            } else if ui
+                                .button("Stop")
+                                .on_hover_text(
+                                    "interrupt the reconstruction — slices already \
+                                     written stay in the output folder",
+                                )
+                                .clicked()
+                            {
+                                logger::log("stopping the reconstruction…");
+                                job.cancel();
+                            }
                         });
                         ui.ctx().request_repaint_after(Duration::from_millis(300));
                     }
@@ -1021,7 +1113,7 @@ fn recon_ui(
             ui.add_space(4.0);
             if ui
                 .add_enabled(
-                    view.stack.path.is_file(),
+                    view.path.is_file(),
                     egui::Button::new("💾 Update the HDF5 with this setup"),
                 )
                 .on_hover_text(
@@ -1041,7 +1133,7 @@ fn recon_ui(
                         .as_ref()
                         .map(|p| p.display().to_string()),
                 });
-                let path = view.stack.path.clone();
+                let path = view.path.clone();
                 let result = crate::recon_run::save_recon_settings(&path, &doc.to_string())
                     .map(|()| format!("reconstruction setup saved into {}", path.display()));
                 match &result {
@@ -1113,7 +1205,7 @@ fn recon_ui(
                     output_folder.display()
                 ));
                 view.run_result = None;
-                view.run_job = Some(crate::recon_run::RunJob::start(
+                let job = crate::recon_run::RunJob::start(
                     std::sync::Arc::clone(&view.stack),
                     crate::recon_run::RunSpec {
                         algo_key: algo.key.to_owned(),
@@ -1124,7 +1216,9 @@ fn recon_ui(
                         overlap: SPLIT_OVERLAP,
                         output_folder,
                     },
-                ));
+                );
+                view.run_output = Some(std::sync::Arc::clone(&job.output));
+                view.run_job = Some(job);
             }
             if let Some(rx) = &view.viewer_job {
                 match rx.try_recv() {
@@ -1202,6 +1296,15 @@ fn recon_ui(
             if let Some(e) = &view.viewer_error {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
+            if let Some(output) = view.run_output.clone() {
+                terminal_output_ui(
+                    ui,
+                    "run_terminal_output",
+                    "show or hide what the reconstruction prints in the terminal",
+                    &output,
+                    &mut view.show_run_output,
+                );
+            }
         },
     );
     if let Some(which) = clicked {
@@ -1214,10 +1317,10 @@ fn recon_ui(
     if let Some((binary, label)) = launch {
         logger::log(format!(
             "opening the {label} evaluator on {}",
-            view.stack.path.display()
+            view.path.display()
         ));
         view.opt_error = None;
-        let path = view.stack.path.clone();
+        let path = view.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = std::process::Command::new(binary)
@@ -1239,7 +1342,7 @@ fn recon_ui(
     if let Some(e) = &view.opt_error {
         ui.colored_label(Color32::LIGHT_RED, e);
     }
-    back
+    nav
 }
 
 /// `true` when a loaded file is a pre-processing checkpoint and can go
@@ -1322,6 +1425,9 @@ struct StackView {
     normalized: bool,
     norm_summary: Option<String>,
     norm_error: Option<String>,
+    /// Terminal output of the (last) NeuNorm run, kept after it finishes.
+    norm_output: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    show_norm_output: bool,
     visualize_job: Option<VisualizeJob>,
 
     // Rotation (after normalization; the rotation axis must be vertical).
@@ -1399,6 +1505,9 @@ struct StackView {
     // Saving the pre-processing checkpoint.
     stack_save_job: Option<StackSaveJob>,
     stack_save_status: Option<Result<String, String>>,
+    /// Path of the last pre-processing checkpoint save, handed to the
+    /// reconstruction screen as the real checkpoint path.
+    stack_saved_path: Option<PathBuf>,
     /// Set by the "evaluate the reconstruction" button; the main loop picks
     /// it up and switches screens.
     goto_recon: bool,
@@ -1428,6 +1537,8 @@ impl StackView {
             normalized: false,
             norm_summary: None,
             norm_error: None,
+            norm_output: None,
+            show_norm_output: false,
             visualize_job: None,
             unrotated: None,
             rotation_quarters: 0,
@@ -1470,6 +1581,7 @@ impl StackView {
             unlogged: None,
             stack_save_job: None,
             stack_save_status: None,
+            stack_saved_path: None,
             goto_recon: false,
         };
 
@@ -1593,7 +1705,18 @@ enum WorkflowView {
 /// The white-beam workflow: the CCD detector drives where the sample and
 /// open-beam folders are looked for; a sample folder holds one image per
 /// projection, and several folders can contribute to the same dataset.
+/// The accordion sections of the white-beam workflow — one open at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WbSection {
+    Angles,
+    DataToUse,
+    Exclude,
+    Save,
+}
+
 struct WhiteBeamView {
+    /// The accordion section currently open.
+    open_section: Option<WbSection>,
     detector: WbDetector,
     sample: MultiFolderPick,
     ob: MultiFolderPick,
@@ -1638,9 +1761,15 @@ struct WhiteBeamView {
     processed: Option<std::sync::Arc<CombineOutput>>,
     save_job: Option<SaveJob>,
     save_status: Option<Result<String, String>>,
+    /// Path of the last HDF5 save, handed to pre-processing as the real
+    /// checkpoint path.
+    saved_path: Option<PathBuf>,
     /// Set by the "continue to pre-processing" button; the main loop picks
     /// it up and switches to the pre-processing screen.
     goto_preprocess: Option<LoadedStack>,
+    /// 1 = show the wait spinner this frame, 2 = build the stack next
+    /// frame (so the spinner is on screen during the heavy copy).
+    preprocess_pending: u8,
 }
 
 /// Integrated intensities cached per selection: the scan covers the used
@@ -1716,7 +1845,10 @@ impl WhiteBeamView {
             processed: None,
             save_job: None,
             save_status: None,
+            saved_path: None,
             goto_preprocess: None,
+            preprocess_pending: 0,
+            open_section: Some(WbSection::Angles),
         }
     }
 
@@ -2013,7 +2145,18 @@ impl MultiFolderPick {
 /// The TOF workflow: detector choice drives where the sample and open-beam
 /// folders are looked for; selecting a folder inventories the images of each
 /// of its subfolders (one per projection / OB run).
+/// The accordion sections of the TOF workflow — one open at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TofSection {
+    ProtonCharge,
+    Runs,
+    Combine,
+    Process,
+}
+
 struct TofView {
+    /// The accordion section currently open.
+    open_section: Option<TofSection>,
     detector: Detector,
     sample: FolderPick,
     ob: FolderPick,
@@ -2051,9 +2194,15 @@ struct TofView {
     processed: Option<std::sync::Arc<CombineOutput>>,
     save_job: Option<SaveJob>,
     save_status: Option<Result<String, String>>,
+    /// Path of the last HDF5 save, handed to pre-processing as the real
+    /// checkpoint path.
+    saved_path: Option<PathBuf>,
     /// Set by the "continue to pre-processing" button; the main loop picks
     /// it up and switches to the pre-processing screen.
     goto_preprocess: Option<LoadedStack>,
+    /// 1 = show the wait spinner this frame, 2 = build the stack next
+    /// frame (so the spinner is on screen during the heavy copy).
+    preprocess_pending: u8,
 }
 
 impl TofView {
@@ -2101,7 +2250,10 @@ impl TofView {
             processed: None,
             save_job: None,
             save_status: None,
+            saved_path: None,
             goto_preprocess: None,
+            preprocess_pending: 0,
+            open_section: Some(TofSection::ProtonCharge),
         }
     }
 
@@ -2279,6 +2431,9 @@ enum Scan {
 
 pub struct CtApp {
     screen: Screen,
+    /// Screens left behind by forward navigation, restored by the
+    /// "previous" button exactly as they were (their data stays in memory).
+    back_stack: Vec<Screen>,
     instrument: Instrument,
     /// One scan (or its cached result) per instrument, started on demand the
     /// first time the instrument is shown.
@@ -2350,6 +2505,7 @@ impl CtApp {
             load_error: None,
             logo: None,
             log_view_open: false,
+            back_stack: Vec::new(),
             log_auto_refresh: true,
             log_text: String::new(),
             log_last_read: None,
@@ -2924,15 +3080,15 @@ fn top_right_bar(
     });
 }
 
-/// Pre-processing of a loaded stack of projections; returns `true` to go
-/// back to the setup screen.
+/// Pre-processing of a loaded stack of projections; returns the requested
+/// navigation.
 fn stack_ui(
     ui: &mut egui::Ui,
     view: &mut StackView,
     logo: Option<&egui::TextureHandle>,
     log_open: &mut bool,
-) -> bool {
-    let mut back = false;
+) -> Nav {
+    let mut nav = Nav::Stay;
     let title_name = view
         .stack
         .path
@@ -2940,9 +3096,7 @@ fn stack_ui(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     ui.horizontal(|ui| {
-        if ui.button("↩ Back").clicked() {
-            back = true;
-        }
+        nav = nav_buttons(ui);
         ui.label(
             RichText::new(format!("Pre-processing — {title_name}"))
                 .size(15.0)
@@ -3238,6 +3392,7 @@ fn stack_ui(
                         view.cor_result
                     ));
                     view.stack_save_status = None;
+                    view.stack_saved_path = Some(path.clone());
                     view.stack_save_job = Some(StackSaveJob::start(
                         path,
                         std::sync::Arc::clone(&view.stack),
@@ -3247,8 +3402,12 @@ fn stack_ui(
                 }
             }
             if ui
-                .add_enabled(savable, egui::Button::new("🚀 Reconstruction"))
-                .on_hover_text("continue with this stack right away — saving is optional")
+                .add_enabled(
+                    matches!(view.stack_save_status, Some(Ok(_))),
+                    egui::Button::new("🚀 Reconstruction"),
+                )
+                .on_hover_text("continue to the reconstruction of the saved checkpoint")
+                .on_disabled_hover_text("save the pre-processed stack to HDF5 first")
                 .clicked()
             {
                 view.goto_recon = true;
@@ -3271,7 +3430,7 @@ fn stack_ui(
         }
     }
     ui.add_space(24.0);
-    back
+    nav
 }
 
 /// "Remove outliers": the three cleaning methods of the Python
@@ -3659,6 +3818,14 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     ui.label("NeuNorm is running…");
                 });
                 ctx.request_repaint_after(Duration::from_millis(300));
+                let output = std::sync::Arc::clone(&job.output);
+                terminal_output_ui(
+                    ui,
+                    "norm_terminal_output",
+                    "show or hide what NeuNorm prints in the terminal",
+                    &output,
+                    &mut view.show_norm_output,
+                );
                 return;
             }
         }
@@ -3776,16 +3943,27 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             view.norm_settings.describe()
         ));
         view.norm_error = None;
-        view.norm_job = Some(NormJob::start(
+        let job = NormJob::start(
             std::sync::Arc::clone(&view.stack),
             view.norm_settings.clone(),
-        ));
+        );
+        view.norm_output = Some(std::sync::Arc::clone(&job.output));
+        view.norm_job = Some(job);
     }
     if missing_roi {
         ui.label(RichText::new("the checked corrections need a ROI first").weak());
     }
     if let Some(e) = &view.norm_error {
         ui.colored_label(Color32::LIGHT_RED, e);
+    }
+    if let Some(output) = view.norm_output.clone() {
+        terminal_output_ui(
+            ui,
+            "norm_terminal_output",
+            "show or hide what NeuNorm prints in the terminal",
+            &output,
+            &mut view.show_norm_output,
+        );
     }
 }
 
@@ -4657,34 +4835,10 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             .weak()
             .size(12.0),
         );
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::Slider::new(&mut slice_row, 0..=h - 1)
-                    .text("slice used for the estimation"),
-            );
-            let busy = view.cor_job.is_some();
-            if ui
-                .add_enabled(!busy, egui::Button::new("🧮 Calculate the center of rotation"))
-                .clicked()
-            {
-                logger::log(format!(
-                    "calculating the center of rotation from {} (0°) and {} (180°), slice {slice_row}",
-                    stack.sample[i0].name, stack.sample[i180].name
-                ));
-                view.cor_error = None;
-                view.cor_job = Some(CorJob::start(
-                    std::sync::Arc::clone(&stack),
-                    i0,
-                    i180,
-                    slice_row,
-                ));
-            }
-            if view.cor_result.is_some() && ui.button("use the horizontal center instead").clicked()
-            {
-                logger::log("center of rotation reset to the horizontal center");
-                view.cor_result = None;
-            }
-        });
+        ui.add(
+            egui::Slider::new(&mut slice_row, 0..=h - 1)
+                .text("slice used for the estimation"),
+        );
         view.cor_slice = Some(slice_row.min(h - 1));
     } else {
         ui.colored_label(
@@ -4760,11 +4914,22 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 hi = hi.max(*v);
             }
             let span = (hi - lo).max(1e-6);
+            // Transmission data has a bright background and a dark sample;
+            // invert it so the FEATURES (not the background) carry the red
+            // and cyan colors — otherwise the mirrored 180° image is barely
+            // visible.
+            let mean_norm = s0.iter().map(|v| (v - lo) / span).sum::<f32>()
+                / s0.len().max(1) as f32;
+            let invert = mean_norm > 0.5;
+            let shade = |v: f32| {
+                let v = ((v - lo) / span).clamp(0.0, 1.0);
+                if invert { 1.0 - v } else { v }
+            };
             let cor_small = cor / stride as f64;
             let mut pixels = Vec::with_capacity(sw * sh);
             for y in 0..sh {
                 for x in 0..sw {
-                    let v0 = (s0[y * sw + x] - lo) / span;
+                    let v0 = shade(s0[y * sw + x]);
                     // 180° mirrored about the center of rotation, with
                     // linear interpolation.
                     let sx = 2.0 * cor_small - x as f64;
@@ -4773,11 +4938,11 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     let clamp = |v: f64| (v.max(0.0) as usize).min(sw - 1);
                     let a = s180[y * sw + clamp(x0)];
                     let b = s180[y * sw + clamp(x0 + 1.0)];
-                    let v180 = ((a * (1.0 - f) + b * f) - lo) / span;
+                    let v180 = shade(a * (1.0 - f) + b * f);
                     pixels.push(Color32::from_rgb(
-                        (v0.clamp(0.0, 1.0) * 255.0) as u8,
-                        (v180.clamp(0.0, 1.0) * 255.0) as u8,
-                        (v180.clamp(0.0, 1.0) * 255.0) as u8,
+                        (v0 * 255.0) as u8,
+                        (v180 * 255.0) as u8,
+                        (v180 * 255.0) as u8,
                     ));
                 }
             }
@@ -4843,8 +5008,9 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
     ui.label(
         RichText::new(if overlay {
-            "red: 0° — cyan: 180° mirrored about the center of rotation — features turn \
-             gray when the center is correct, red/cyan ghosting means it is off"
+            "red: the 0° sample — cyan: the 180° sample mirrored about the center of \
+             rotation — features turn gray/white when the center is correct, separate \
+             red and cyan ghosts mean it is off"
         } else if view.cor_result.is_some() {
             "green: calculated center of rotation — dashes: the slice used to estimate it"
         } else {
@@ -4854,6 +5020,33 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         .weak()
         .size(11.0),
     );
+    if let (Some(i0), Some(i180)) = indices {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let busy = view.cor_job.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("🧮 Calculate the center of rotation"))
+                .clicked()
+            {
+                logger::log(format!(
+                    "calculating the center of rotation from {} (0°) and {} (180°), slice {slice_row}",
+                    stack.sample[i0].name, stack.sample[i180].name
+                ));
+                view.cor_error = None;
+                view.cor_job = Some(CorJob::start(
+                    std::sync::Arc::clone(&stack),
+                    i0,
+                    i180,
+                    slice_row,
+                ));
+            }
+            if view.cor_result.is_some() && ui.button("use the horizontal center instead").clicked()
+            {
+                logger::log("center of rotation reset to the horizontal center");
+                view.cor_result = None;
+            }
+        });
+    }
     if let Some(e) = &view.cor_error {
         ui.colored_label(Color32::LIGHT_RED, e);
     }
@@ -5036,8 +5229,10 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
     ui.label(
         RichText::new(
-            "(an evenly sub-sampled ~10% of the projections is handed to the crop tool; \
-             the region comes back and is applied to the full sample stack and the open beams)",
+            "(the crop tool always shows the original, uncropped data — an evenly \
+             sub-sampled ~10% of the projections; the region comes back and is applied \
+             to every sample projection and open beam, and all later steps work on the \
+             cropped data only)",
         )
         .weak()
         .size(11.0),
@@ -5055,14 +5250,12 @@ fn workflow_ui(
     view: &mut WorkflowView,
     logo: Option<&egui::TextureHandle>,
     log_open: &mut bool,
-) -> bool {
-    let mut back = false;
-    // One compact header row: back, session recap, log toggle and a small
-    // logo — the vertical space belongs to the workflow itself.
+) -> Nav {
+    let mut nav = Nav::Stay;
+    // One compact header row: navigation, session recap, log toggle and a
+    // small logo — the vertical space belongs to the workflow itself.
     ui.horizontal(|ui| {
-        if ui.button("↩ Back").clicked() {
-            back = true;
-        }
+        nav = nav_buttons(ui);
         ui.label(
             RichText::new(format!(
                 "{} — {} — {}",
@@ -5090,7 +5283,7 @@ fn workflow_ui(
                 .show(ui, |ui| tof_ui(ui, session, tof_view));
         }
     }
-    back
+    nav
 }
 
 fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
@@ -5126,29 +5319,49 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
     });
 
     ui.add_space(10.0);
-    egui::CollapsingHeader::new(RichText::new("Projection angles").strong())
-        .default_open(true)
+    let mut clicked: Option<WbSection> = None;
+    let open = egui::CollapsingHeader::new(RichText::new("Projection angles").strong())
+        .open(Some(view.open_section == Some(WbSection::Angles)))
         .show(ui, |ui| {
             angle_source_ui(ui, view);
         });
+    if open.header_response.clicked() {
+        clicked = Some(WbSection::Angles);
+    }
     ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Data to use").strong())
-        .default_open(true)
+    let open = egui::CollapsingHeader::new(RichText::new("Data to use").strong())
+        .open(Some(view.open_section == Some(WbSection::DataToUse)))
         .show(ui, |ui| {
             data_to_use_ui(ui, view);
         });
+    if open.header_response.clicked() {
+        clicked = Some(WbSection::DataToUse);
+    }
     ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Exclude images").strong())
-        .default_open(true)
+    let open = egui::CollapsingHeader::new(RichText::new("Exclude images").strong())
+        .open(Some(view.open_section == Some(WbSection::Exclude)))
         .show(ui, |ui| {
             exclude_images_ui(ui, view);
         });
+    if open.header_response.clicked() {
+        clicked = Some(WbSection::Exclude);
+    }
     ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Save to HDF5").strong())
-        .default_open(true)
+    let open = egui::CollapsingHeader::new(RichText::new("Save to HDF5").strong())
+        .open(Some(view.open_section == Some(WbSection::Save)))
         .show(ui, |ui| {
             wb_save_ui(ui, session, view);
         });
+    if open.header_response.clicked() {
+        clicked = Some(WbSection::Save);
+    }
+    if let Some(which) = clicked {
+        view.open_section = if view.open_section == Some(which) {
+            None
+        } else {
+            Some(which)
+        };
+    }
 }
 
 /// Read the final selection (one image per projection, exclusions applied,
@@ -5334,6 +5547,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 if let Some(path) = dialog.save_file() {
                     logger::log(format!("saving white beam data to {}", path.display()));
                     view.save_status = None;
+                    view.saved_path = Some(path.clone());
                     view.save_job = Some(SaveJob::start(
                         path,
                         std::sync::Arc::clone(output),
@@ -5342,18 +5556,40 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 }
             }
             jump = ui
-                .button("🚀 Continue to pre-processing")
-                .on_hover_text("work on the stacked projections right away — saving is optional")
+                .add_enabled(
+                    matches!(view.save_status, Some(Ok(_))),
+                    egui::Button::new("🚀 Continue to pre-processing"),
+                )
+                .on_hover_text("work on the saved stack of projections")
+                .on_disabled_hover_text("save to HDF5 first")
                 .clicked();
         });
         if jump {
-            logger::log("continuing to pre-processing with the white beam stack");
-            let pseudo = session
-                .ipts
-                .path
-                .join("shared")
-                .join("white_beam_combined (not saved).h5");
-            view.goto_preprocess = Some(combine::stack_from_output(output, &meta, pseudo));
+            view.preprocess_pending = 1;
+        }
+        // Draw the spinner one frame before the heavy stack copy, so the
+        // user sees the button did something.
+        if view.preprocess_pending > 0 {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("preparing the pre-processing…");
+            });
+            if view.preprocess_pending == 1 {
+                view.preprocess_pending = 2;
+                ui.ctx().request_repaint();
+            } else {
+                view.preprocess_pending = 0;
+                logger::log("continuing to pre-processing with the white beam stack");
+                let path = view.saved_path.clone().unwrap_or_else(|| {
+                    session
+                        .ipts
+                        .path
+                        .join("shared")
+                        .join("white_beam_combined (not saved).h5")
+                });
+                view.goto_preprocess =
+                    Some(combine::stack_from_output(output, &meta, path));
+            }
         }
         if saving {
             ui.horizontal(|ui| {
@@ -6418,32 +6654,52 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
     if view.preprocessed.is_some() {
         ui.separator();
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(RichText::new("Proton charge selection").strong())
-            .default_open(true)
+        let mut clicked: Option<TofSection> = None;
+        let open = egui::CollapsingHeader::new(RichText::new("Proton charge selection").strong())
+            .open(Some(view.open_section == Some(TofSection::ProtonCharge)))
             .show(ui, |ui| {
                 preprocess_summary_ui(ui, view.preprocessed.as_ref().unwrap());
                 proton_charge_section(ui, view);
             });
+        if open.header_response.clicked() {
+            clicked = Some(TofSection::ProtonCharge);
+        }
         ui.add_space(4.0);
-        egui::CollapsingHeader::new(RichText::new("Runs going to the next step").strong())
-            .default_open(true)
+        let open = egui::CollapsingHeader::new(RichText::new("Runs going to the next step").strong())
+            .open(Some(view.open_section == Some(TofSection::Runs)))
             .show(ui, |ui| {
                 runs_selection_ui(ui, view);
             });
+        if open.header_response.clicked() {
+            clicked = Some(TofSection::Runs);
+        }
         ui.add_space(4.0);
-        egui::CollapsingHeader::new(RichText::new("Combine images (TOF range)").strong())
-            .default_open(true)
+        let open = egui::CollapsingHeader::new(RichText::new("Combine images (TOF range)").strong())
+            .open(Some(view.open_section == Some(TofSection::Combine)))
             .show(ui, |ui| {
                 combine_section_ui(ui, &ctx, view);
             });
+        if open.header_response.clicked() {
+            clicked = Some(TofSection::Combine);
+        }
         ui.add_space(4.0);
-        egui::CollapsingHeader::new(
+        let open = egui::CollapsingHeader::new(
             RichText::new("Combine the TOF images of each run (save to HDF5)").strong(),
         )
-        .default_open(true)
+        .open(Some(view.open_section == Some(TofSection::Process)))
         .show(ui, |ui| {
             process_section_ui(ui, &ctx, session, view);
         });
+        if open.header_response.clicked() {
+            clicked = Some(TofSection::Process);
+        }
+        if let Some(which) = clicked {
+            view.open_section = if view.open_section == Some(which) {
+                None
+            } else {
+                Some(which)
+            };
+        }
     }
 }
 
@@ -6708,6 +6964,7 @@ fn process_section_ui(
                 if let Some(path) = dialog.save_file() {
                     logger::log(format!("saving combined data to {}", path.display()));
                     view.save_status = None;
+                    view.saved_path = Some(path.clone());
                     view.save_job = Some(SaveJob::start(
                         path,
                         std::sync::Arc::clone(output),
@@ -6716,18 +6973,40 @@ fn process_section_ui(
                 }
             }
             jump = ui
-                .button("🚀 Continue to pre-processing")
-                .on_hover_text("work on the combined stack right away — saving is optional")
+                .add_enabled(
+                    matches!(view.save_status, Some(Ok(_))),
+                    egui::Button::new("🚀 Continue to pre-processing"),
+                )
+                .on_hover_text("work on the saved combined stack")
+                .on_disabled_hover_text("save to HDF5 first")
                 .clicked();
         });
         if jump {
-            logger::log("continuing to pre-processing with the combined TOF stack");
-            let pseudo = session
-                .ipts
-                .path
-                .join("shared")
-                .join("tof_combined (not saved).h5");
-            view.goto_preprocess = Some(combine::stack_from_output(output, &meta, pseudo));
+            view.preprocess_pending = 1;
+        }
+        // Draw the spinner one frame before the heavy stack copy, so the
+        // user sees the button did something.
+        if view.preprocess_pending > 0 {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("preparing the pre-processing…");
+            });
+            if view.preprocess_pending == 1 {
+                view.preprocess_pending = 2;
+                ui.ctx().request_repaint();
+            } else {
+                view.preprocess_pending = 0;
+                logger::log("continuing to pre-processing with the combined TOF stack");
+                let path = view.saved_path.clone().unwrap_or_else(|| {
+                    session
+                        .ipts
+                        .path
+                        .join("shared")
+                        .join("tof_combined (not saved).h5")
+                });
+                view.goto_preprocess =
+                    Some(combine::stack_from_output(output, &meta, path));
+            }
         }
         if saving {
             ui.horizontal(|ui| {
@@ -7308,6 +7587,7 @@ impl eframe::App for CtApp {
                             }
                         ));
                         self.load_job = None;
+                        self.back_stack.clear();
                         self.screen = if preprocessed {
                             let cor = stack.center_of_rotation;
                             Screen::Recon(ReconView::new(stack, cor))
@@ -7352,16 +7632,16 @@ impl eframe::App for CtApp {
                 self.screen = Screen::Workflow { session, view };
             }
         } else {
-            let mut back = false;
+            let mut nav = Nav::Stay;
             egui::CentralPanel::default().show(ui, |ui| match &mut self.screen {
                 Screen::Workflow { session, view } => {
-                    back = workflow_ui(ui, session, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = workflow_ui(ui, session, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
                 Screen::Stack(view) => {
-                    back = stack_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = stack_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
                 Screen::Recon(view) => {
-                    back = recon_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = recon_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
                 }
                 Screen::Setup => {}
             });
@@ -7383,21 +7663,42 @@ impl eframe::App for CtApp {
                 Screen::Stack(view) if view.goto_recon => {
                     view.goto_recon = false;
                     let cor = view.cor_result.or(view.stack.center_of_rotation);
-                    Some(ReconView::from_arc(
-                        std::sync::Arc::clone(&view.stack),
-                        cor,
-                    ))
+                    let mut recon =
+                        ReconView::from_arc(std::sync::Arc::clone(&view.stack), cor);
+                    if let Some(saved) = view.stack_saved_path.clone() {
+                        recon.path = saved;
+                    }
+                    Some(recon)
                 }
                 _ => None,
             };
             if let Some(view) = recon {
                 logger::log("continuing to the reconstruction evaluation");
-                self.screen = Screen::Recon(view);
+                let old = std::mem::replace(&mut self.screen, Screen::Recon(view));
+                self.back_stack.push(old);
             } else if let Some(stack) = pending {
-                self.screen = Screen::Stack(StackView::new(stack));
-            } else if back {
-                logger::log("returned to setup screen");
-                self.screen = Screen::Setup;
+                let old =
+                    std::mem::replace(&mut self.screen, Screen::Stack(StackView::new(stack)));
+                self.back_stack.push(old);
+            } else {
+                match nav {
+                    Nav::Home => {
+                        logger::log("returned to the setup screen");
+                        self.back_stack.clear();
+                        self.screen = Screen::Setup;
+                    }
+                    Nav::Previous => match self.back_stack.pop() {
+                        Some(previous) => {
+                            logger::log("returned to the previous view");
+                            self.screen = previous;
+                        }
+                        None => {
+                            logger::log("returned to the setup screen");
+                            self.screen = Screen::Setup;
+                        }
+                    },
+                    Nav::Stay => {}
+                }
             }
         }
     }
