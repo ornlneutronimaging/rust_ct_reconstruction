@@ -16,7 +16,7 @@ use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
 use crate::rotate::{self, RotateJob};
-use crate::tilt::{TiltApplyJob, TiltCalcJob, TiltResult};
+use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
@@ -81,6 +81,7 @@ enum StackSection {
     Normalize,
     Rotate,
     Tilt,
+    Cor,
     Sinogram,
 }
 
@@ -156,6 +157,20 @@ struct StackView {
     tilt_apply: Option<TiltApplyJob>,
     tilt_applied: Option<TiltResult>,
     tilt_error: Option<String>,
+
+    // Center of rotation (optional; the horizontal center otherwise).
+    /// Slice (row) the estimation compares the 0°/180° projections on.
+    cor_slice: Option<usize>,
+    cor_job: Option<CorJob>,
+    /// Calculated center of rotation; `None` = use the horizontal center.
+    cor_result: Option<f64>,
+    cor_error: Option<String>,
+    /// Frame shown by the preview (`None` = the 0° projection).
+    cor_frame: Option<usize>,
+    /// Show the 0° + mirrored-180° overlay instead of a single image.
+    cor_overlay: bool,
+    /// Preview texture, keyed by (stack, frame or MAX for overlay, cor bits).
+    cor_tex: Option<((usize, usize, u64), egui::TextureHandle)>,
 }
 
 impl StackView {
@@ -200,7 +215,24 @@ impl StackView {
             tilt_apply: None,
             tilt_applied: None,
             tilt_error: None,
+            cor_slice: None,
+            cor_job: None,
+            cor_result: None,
+            cor_error: None,
+            cor_frame: None,
+            cor_overlay: false,
+            cor_tex: None,
         }
+    }
+
+    fn clear_cor(&mut self) {
+        self.cor_slice = None;
+        self.cor_job = None;
+        self.cor_result = None;
+        self.cor_error = None;
+        self.cor_frame = None;
+        self.cor_overlay = false;
+        self.cor_tex = None;
     }
 
     fn clear_tilt(&mut self) {
@@ -1617,6 +1649,7 @@ fn stack_ui(
             view.rotation_applied = 0;
             view.rot_tex = None;
             view.clear_tilt();
+            view.clear_cor();
         }
         top_right_bar(ui, logo, log_open, 28.0);
     });
@@ -1690,6 +1723,15 @@ fn stack_ui(
         section(ui, view, StackSection::Tilt, "Tilt correction", &mut |ui, view| {
             tilt_section_ui(ui, view);
         });
+        section(
+            ui,
+            view,
+            StackSection::Cor,
+            "Center of rotation",
+            &mut |ui, view| {
+                cor_section_ui(ui, view);
+            },
+        );
         section(ui, view, StackSection::Sinogram, "Sinogram", &mut |ui, view| {
             sinogram_section_ui(ui, view);
         });
@@ -2081,6 +2123,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_applied = 0;
                 view.rot_tex = None;
                 view.clear_tilt();
+                view.clear_cor();
                 view.open_section = Some(StackSection::Rotate);
             }
             Some(Err(e)) => {
@@ -2259,14 +2302,14 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Rotation:").strong());
-        ui.add(
-            egui::Slider::new(&mut view.rotation_quarters, 0..=3)
-                .custom_formatter(|v, _| format!("{}°", (v as usize % 4) * 90))
-                .custom_parser(|s| {
-                    s.trim().trim_end_matches('°').parse::<f64>().ok().map(|d| d / 90.0)
-                }),
-        )
-        .on_hover_text("clockwise, in 90° steps — the rotation axis must end up vertical");
+        for quarters in 0..=3 {
+            ui.radio_value(
+                &mut view.rotation_quarters,
+                quarters,
+                format!("{}°", quarters * 90),
+            )
+            .on_hover_text("clockwise — the rotation axis must end up vertical");
+        }
         ui.label(
             RichText::new(if view.rotation_applied == view.rotation_quarters {
                 format!("applied: {}°", view.rotation_applied * 90)
@@ -2654,6 +2697,278 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
 }
 
+/// Center of rotation — optional: without running it, the horizontal center
+/// of the detector is used; running it compares the 0° and 180° projections
+/// on a band around the chosen slice (the reconstruction will use the
+/// resulting value).
+fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.cor_job {
+        match job.poll() {
+            Some(Ok(cor)) => {
+                logger::log(format!("center of rotation calculated: {cor:.2} px"));
+                view.cor_result = Some(cor);
+                view.cor_error = None;
+                view.cor_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("center of rotation failed: {e}"));
+                view.cor_error = Some(e);
+                view.cor_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("comparing the 0° and 180° projections…");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+
+    let stack = std::sync::Arc::clone(&view.stack);
+    let Some(first) = stack.sample.first() else {
+        return;
+    };
+    let (w, h) = (first.width, first.height);
+    let default_center = (w as f64 - 1.0) / 2.0;
+    let cor = view.cor_result.unwrap_or(default_center);
+    ui.label(match view.cor_result {
+        Some(value) => RichText::new(format!(
+            "center of rotation: {value:.2} px (calculated — {:+.2} px from the center)",
+            value - default_center
+        ))
+        .strong()
+        .color(Color32::from_rgb(120, 200, 120)),
+        None => RichText::new(format!(
+            "center of rotation: {default_center:.1} px (horizontal center — default until calculated)"
+        ))
+        .strong(),
+    });
+
+    // The projections closest to 0° and 180°.
+    let nearest = |target: f64| -> Option<usize> {
+        stack
+            .sample
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.angle_deg.map(|a| (i, (a - target).abs())))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+    };
+    let indices = (nearest(0.0), nearest(180.0));
+    let mut slice_row = view.cor_slice.unwrap_or(h / 2);
+    if let (Some(i0), Some(i180)) = indices {
+        ui.label(
+            RichText::new(
+                "the slice selected below is the one used to estimate the center of rotation",
+            )
+            .weak()
+            .size(12.0),
+        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut slice_row, 0..=h - 1)
+                    .text("slice used for the estimation"),
+            );
+            let busy = view.cor_job.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("🧮 Calculate the center of rotation"))
+                .clicked()
+            {
+                logger::log(format!(
+                    "calculating the center of rotation from {} (0°) and {} (180°), slice {slice_row}",
+                    stack.sample[i0].name, stack.sample[i180].name
+                ));
+                view.cor_error = None;
+                view.cor_job = Some(CorJob::start(
+                    std::sync::Arc::clone(&stack),
+                    i0,
+                    i180,
+                    slice_row,
+                ));
+            }
+            if view.cor_result.is_some() && ui.button("use the horizontal center instead").clicked()
+            {
+                logger::log("center of rotation reset to the horizontal center");
+                view.cor_result = None;
+            }
+        });
+        view.cor_slice = Some(slice_row.min(h - 1));
+    } else {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            "the projections carry no angles — only the horizontal center can be used",
+        );
+    }
+
+    // Preview: a single projection (frame slider, starting on the 0° one),
+    // or the 0° + mirrored-180° overlay that verifies the center directly.
+    let n = stack.sample.len();
+    let overlay_possible = indices.0.is_some() && indices.1.is_some();
+    ui.horizontal(|ui| {
+        if ui.selectable_label(!view.cor_overlay, "single image").clicked() {
+            view.cor_overlay = false;
+        }
+        if ui
+            .add_enabled(
+                overlay_possible,
+                egui::Button::selectable(view.cor_overlay, "0° + 180° overlay"),
+            )
+            .on_hover_text(
+                "the 180° projection is mirrored about the center of rotation and blended \
+                 with the 0° one: features coincide when the center is correct",
+            )
+            .clicked()
+        {
+            view.cor_overlay = true;
+        }
+    });
+    let overlay = view.cor_overlay && overlay_possible;
+    let mut preview_index = view.cor_frame.unwrap_or_else(|| indices.0.unwrap_or(0)).min(n - 1);
+    if !overlay {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut preview_index, 0..=n - 1).text("image"));
+            let p = &stack.sample[preview_index];
+            ui.label(
+                RichText::new(match p.angle_deg {
+                    Some(a) => format!("{} — {a:.3}°", p.name),
+                    None => p.name.clone(),
+                })
+                .weak()
+                .size(11.0),
+            );
+        });
+        view.cor_frame = Some(preview_index);
+    }
+    let tex_key = (
+        std::sync::Arc::as_ptr(&stack) as usize,
+        if overlay { usize::MAX } else { preview_index },
+        if overlay { cor.to_bits() } else { 0 },
+    );
+    if view.cor_tex.as_ref().map(|(k, _)| *k) != Some(tex_key) {
+        let downsample = |p: &crate::combine::Projection, stride: usize| -> Vec<f32> {
+            let mut small =
+                Vec::with_capacity(p.width.div_ceil(stride) * p.height.div_ceil(stride));
+            for y in (0..p.height).step_by(stride) {
+                for x in (0..p.width).step_by(stride) {
+                    small.push(p.mean[y * p.width + x]);
+                }
+            }
+            small
+        };
+        let stride = (w.max(h) / 512).max(1);
+        let (sw, sh) = (w.div_ceil(stride), h.div_ceil(stride));
+        let image = if overlay {
+            let (i0, i180) = (indices.0.expect("overlay"), indices.1.expect("overlay"));
+            let s0 = downsample(&stack.sample[i0], stride);
+            let s180 = downsample(&stack.sample[i180], stride);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in s0.iter().chain(&s180) {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            let span = (hi - lo).max(1e-6);
+            let cor_small = cor / stride as f64;
+            let mut pixels = Vec::with_capacity(sw * sh);
+            for y in 0..sh {
+                for x in 0..sw {
+                    let v0 = (s0[y * sw + x] - lo) / span;
+                    // 180° mirrored about the center of rotation, with
+                    // linear interpolation.
+                    let sx = 2.0 * cor_small - x as f64;
+                    let x0 = sx.floor();
+                    let f = (sx - x0) as f32;
+                    let clamp = |v: f64| (v.max(0.0) as usize).min(sw - 1);
+                    let a = s180[y * sw + clamp(x0)];
+                    let b = s180[y * sw + clamp(x0 + 1.0)];
+                    let v180 = ((a * (1.0 - f) + b * f) - lo) / span;
+                    pixels.push(Color32::from_rgb(
+                        (v0.clamp(0.0, 1.0) * 255.0) as u8,
+                        (v180.clamp(0.0, 1.0) * 255.0) as u8,
+                        (v180.clamp(0.0, 1.0) * 255.0) as u8,
+                    ));
+                }
+            }
+            egui::ColorImage {
+                size: [sw, sh],
+                source_size: egui::vec2(sw as f32, sh as f32),
+                pixels,
+            }
+        } else {
+            let small = downsample(&stack.sample[preview_index], stride);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in &small {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            let span = (hi - lo).max(1e-6);
+            let pixels: Vec<Color32> = small
+                .iter()
+                .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+                .collect();
+            egui::ColorImage {
+                size: [sw, sh],
+                source_size: egui::vec2(sw as f32, sh as f32),
+                pixels,
+            }
+        };
+        let tex = ctx.load_texture("cor_preview", image, egui::TextureOptions::LINEAR);
+        view.cor_tex = Some((tex_key, tex));
+    }
+    if let Some((_, tex)) = &view.cor_tex {
+        let size = tex.size_vec2();
+        let scale = (440.0 / size.x.max(size.y)).min(2.0);
+        let response = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
+        let rect = response.rect;
+        let painter = ui.painter_at(rect);
+        // The center of rotation as a vertical line.
+        let x = rect.left() + (cor / w as f64) as f32 * rect.width();
+        let color = if view.cor_result.is_some() {
+            Color32::from_rgb(120, 200, 120)
+        } else {
+            Color32::from_rgb(100, 170, 255)
+        };
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(2.0, color),
+        );
+        // The slice used by the calculation, as a dashed horizontal guide.
+        if indices.0.is_some() {
+            let y = rect.top() + (slice_row as f64 / h as f64) as f32 * rect.height();
+            let dash = 8.0;
+            let mut x0 = rect.left();
+            while x0 < rect.right() {
+                painter.line_segment(
+                    [
+                        egui::pos2(x0, y),
+                        egui::pos2((x0 + dash * 0.6).min(rect.right()), y),
+                    ],
+                    egui::Stroke::new(1.0, Color32::from_gray(150)),
+                );
+                x0 += dash;
+            }
+        }
+    }
+    ui.label(
+        RichText::new(if overlay {
+            "red: 0° — cyan: 180° mirrored about the center of rotation — features turn \
+             gray when the center is correct, red/cyan ghosting means it is off"
+        } else if view.cor_result.is_some() {
+            "green: calculated center of rotation — dashes: the slice used to estimate it"
+        } else {
+            "blue: horizontal center (used until a calculation is run) — dashes: the slice \
+             the estimation would use"
+        })
+        .weak()
+        .size(11.0),
+    );
+    if let Some(e) = &view.cor_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
 /// The sinogram of one detector row of the current (normalized, possibly
 /// rotated) stack: one line per projection, in stack order (increasing
 /// angle), against the detector column.
@@ -2766,6 +3081,7 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.rotation_applied = 0;
                 view.rot_tex = None;
                 view.clear_tilt();
+                view.clear_cor();
             }
             Some(Ok(None)) => {
                 logger::log("crop tool closed without saving a region");

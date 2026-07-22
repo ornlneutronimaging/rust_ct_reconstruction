@@ -115,6 +115,111 @@ pub fn find_cor(
     })
 }
 
+/// Center of rotation from the 0° / 180° projections: on each row of a band
+/// around `slice_row`, the horizontally-flipped 180° row is registered
+/// against the 0° row (RMSE over every integer shift, then a parabolic
+/// sub-pixel refinement of the minimum); the axis column follows from
+/// `c = (w - 1 - t) / 2` and the median over the band is returned.
+pub fn find_center(
+    proj_0: &[f32],
+    proj_180: &[f32],
+    width: usize,
+    height: usize,
+    slice_row: usize,
+    half_band: usize,
+) -> Result<f64, String> {
+    if proj_0.len() != width * height || proj_180.len() != width * height {
+        return Err("projection buffers do not match the given size".to_owned());
+    }
+    let slice_row = slice_row.min(height - 1);
+    let y0 = slice_row.saturating_sub(half_band);
+    let y1 = (slice_row + half_band).min(height - 1);
+    let w = width as isize;
+    let t_min = -(w / 2);
+    let t_max = w - w / 2;
+
+    let centers: Vec<f64> = (y0..=y1)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&row| {
+            let p0 = &proj_0[row * width..(row + 1) * width];
+            let p180 = &proj_180[row * width..(row + 1) * width];
+            let rmse = |t: isize| -> f64 {
+                let mut sum = 0.0f64;
+                for i in 0..w {
+                    let rolled = p0[(i - t).rem_euclid(w) as usize];
+                    let flipped = p180[(w - 1 - i) as usize];
+                    let d = f64::from(rolled - flipped);
+                    sum += d * d;
+                }
+                sum
+            };
+            let mut best = (f64::MAX, t_min);
+            for t in t_min..=t_max {
+                let e = rmse(t);
+                if e <= best.0 {
+                    best = (e, t);
+                }
+            }
+            // Parabolic refinement around the integer minimum.
+            let t = best.1;
+            let mut t_sub = t as f64;
+            if t > t_min && t < t_max {
+                let (e0, e1, e2) = (rmse(t - 1), best.0, rmse(t + 1));
+                let denominator = e0 - 2.0 * e1 + e2;
+                if denominator > 1e-12 {
+                    t_sub += 0.5 * (e0 - e2) / denominator;
+                }
+            }
+            (width as f64 - 1.0 - t_sub) / 2.0
+        })
+        .collect();
+    if centers.is_empty() {
+        return Err("no rows available for the center of rotation".to_owned());
+    }
+    let mut sorted = centers.clone();
+    sorted.sort_by(f64::total_cmp);
+    Ok(sorted[sorted.len() / 2])
+}
+
+/// The center-of-rotation estimation on a background thread.
+pub struct CorJob {
+    rx: Receiver<Result<f64, String>>,
+}
+
+impl CorJob {
+    pub fn start(
+        stack: Arc<LoadedStack>,
+        index_0: usize,
+        index_180: usize,
+        slice_row: usize,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let p0 = stack
+                    .sample
+                    .get(index_0)
+                    .ok_or("0-degree projection not found")?;
+                let p180 = stack
+                    .sample
+                    .get(index_180)
+                    .ok_or("180-degree projection not found")?;
+                if (p0.width, p0.height) != (p180.width, p180.height) {
+                    return Err("the 0 and 180 degree projections differ in size".to_owned());
+                }
+                find_center(&p0.mean, &p180.mean, p0.width, p0.height, slice_row, 10)
+            })();
+            let _ = tx.send(result);
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<f64, String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// Rotate an image by `theta_deg` around its center (bilinear interpolation,
 /// edge-clamped like neutompy's edge padding) and then roll it horizontally
 /// by `shift` pixels.
@@ -277,6 +382,15 @@ mod tests {
             }
         }
         (p0, p180)
+    }
+
+    #[test]
+    fn center_of_rotation_is_recovered() {
+        // Straight axis offset 7.3 px from the detector center.
+        let c0 = W as f64 / 2.0 + 7.3;
+        let (p0, p180) = synthetic_pair(c0, 0.0, 12.0);
+        let cor = find_center(&p0, &p180, W, H, H / 2, 10).unwrap();
+        assert!((cor - c0).abs() < 0.5, "cor {cor} expected {c0}");
     }
 
     #[test]
