@@ -216,6 +216,13 @@ struct ReconView {
     preview_frame: usize,
     /// Cached preview texture, keyed by (stack pointer, frame).
     preview_tex: Option<((usize, usize), egui::TextureHandle)>,
+    /// Base output folder picked by the user; the run creates a named
+    /// subfolder inside it.
+    output_base: Option<PathBuf>,
+    /// The full reconstruction in flight.
+    run_job: Option<crate::recon_run::RunJob>,
+    /// Outcome of the last run (output folder or error).
+    run_result: Option<Result<PathBuf, String>>,
 }
 
 impl ReconView {
@@ -233,8 +240,41 @@ impl ReconView {
             slice_to: usize::MAX,
             preview_frame: 0,
             preview_tex: None,
+            output_base: None,
+            run_job: None,
+            run_result: None,
         }
     }
+}
+
+/// Overlap in slices between consecutive svmbir/mbirjax jobs, cut in the
+/// middle when the pieces are stitched back together.
+const SPLIT_OVERLAP: usize = 10;
+
+/// Per-job slice cap for the algorithms whose reconstruction is split.
+fn split_cap_for(key: &str) -> Option<usize> {
+    match key {
+        "svmbir" => Some(50),
+        "mbirjax" => Some(100),
+        _ => None,
+    }
+}
+
+/// Base name of the (first) sample folder recorded in the checkpoint, used
+/// to name the output folder like the Python pipeline.
+fn sample_base_name(stack: &LoadedStack) -> String {
+    stack
+        .metadata
+        .iter()
+        .find(|(name, _)| name == "sample_folder")
+        .and_then(|(_, value)| {
+            let first = value.split(';').next()?.trim();
+            Path::new(first)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "reconstruction".to_owned())
 }
 
 /// The valid job-count range for splitting `h` slices into jobs of at most
@@ -601,12 +641,8 @@ fn recon_ui(
                 // The svmbir/mbirjax volume is reconstructed in slice-range
                 // jobs (with an overlap so the stitching has context on both
                 // sides), then stitched back together.
-                const OVERLAP: usize = 10;
-                let split_cap: Option<usize> = match algo.key {
-                    "svmbir" => Some(50),
-                    "mbirjax" => Some(100),
-                    _ => None,
-                };
+                const OVERLAP: usize = SPLIT_OVERLAP;
+                let split_cap = split_cap_for(algo.key);
                 // The slice range to reconstruct — defaults to everything.
                 view.slice_to = view.slice_to.min(h - 1);
                 view.slice_from = view.slice_from.min(view.slice_to);
@@ -877,9 +913,149 @@ fn recon_ui(
                     }
                 });
             }
-            ui.add_space(6.0);
-            ui.add_enabled(false, egui::Button::new("▶ Run the full reconstruction"))
-                .on_disabled_hover_text("coming soon");
+            // Output folder and the run itself.
+            ui.add_space(8.0);
+            ui.label(RichText::new("Output").strong().size(12.0));
+            ui.horizontal(|ui| {
+                if ui.button("📂 Select the output folder…").clicked() {
+                    let mut dialog =
+                        rfd::FileDialog::new().set_title("Select the output folder");
+                    if let Some(dir) = view.output_base.as_deref().filter(|p| p.is_dir()) {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(dir) = dialog.pick_folder() {
+                        view.output_base = Some(dir);
+                    }
+                }
+                match &view.output_base {
+                    Some(dir) => {
+                        ui.label(RichText::new(dir.display().to_string()).size(12.0));
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("no output folder selected yet")
+                                .weak()
+                                .size(12.0),
+                        );
+                    }
+                }
+            });
+            let sample_base = sample_base_name(&view.stack);
+            ui.label(
+                RichText::new(format!(
+                    "the slices are written into <output folder>/{sample_base}_{}\
+                     _reconstructed_data_<date and time>",
+                    algo.key
+                ))
+                .weak()
+                .size(11.0),
+            );
+            if let Some(job) = &mut view.run_job {
+                match job.poll() {
+                    Some(result) => {
+                        match &result {
+                            Ok(dir) => logger::log(format!(
+                                "full {} reconstruction written into {}",
+                                algo.label,
+                                dir.display()
+                            )),
+                            Err(e) => {
+                                logger::error(format!("full reconstruction failed: {e}"))
+                            }
+                        }
+                        view.run_result = Some(result);
+                        view.run_job = None;
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(job.progress.lock().unwrap().clone());
+                        });
+                        ui.ctx().request_repaint_after(Duration::from_millis(300));
+                    }
+                }
+            }
+            let running = view.run_job.is_some();
+            ui.add_space(4.0);
+            if ui
+                .add_enabled(
+                    view.output_base.is_some() && !running && h > 0,
+                    egui::Button::new("▶ Run the full reconstruction"),
+                )
+                .on_disabled_hover_text(if running {
+                    "a reconstruction is already running"
+                } else {
+                    "select the output folder first"
+                })
+                .clicked()
+            {
+                let (from, to) = (
+                    view.slice_from.min(h - 1),
+                    view.slice_to.min(h - 1),
+                );
+                let span = to - from + 1;
+                let jobs: Vec<(usize, usize)> = match split_cap_for(algo.key) {
+                    Some(cap) if span > SPLIT_OVERLAP => {
+                        let (n_min, n_max) = split_job_bounds(span, cap, SPLIT_OVERLAP);
+                        let n = view.split_jobs.clamp(n_min, n_max);
+                        split_ranges(span, n, SPLIT_OVERLAP)
+                            .into_iter()
+                            .map(|(a, b)| (a + from, b + from))
+                            .collect()
+                    }
+                    _ => vec![(from, to + 1)],
+                };
+                let config_key = format!("{}_config", algo.key);
+                let params_json = view
+                    .stack
+                    .metadata
+                    .iter()
+                    .find(|(name, _)| *name == config_key)
+                    .map(|(_, json)| json.clone())
+                    .unwrap_or_else(|| algo_default_config(algo, cor_px, width_px));
+                let ts = chrono::Local::now().format("%mm_%dd_%Yy_%Hh_%Mmn");
+                let output_folder = view
+                    .output_base
+                    .clone()
+                    .expect("checked above")
+                    .join(format!(
+                        "{sample_base}_{}_reconstructed_data_{ts}",
+                        algo.key
+                    ));
+                logger::log(format!(
+                    "starting the full {} reconstruction of slices {from} to {to} \
+                     ({} job{}) into {}",
+                    algo.label,
+                    jobs.len(),
+                    if jobs.len() == 1 { "" } else { "s" },
+                    output_folder.display()
+                ));
+                view.run_result = None;
+                view.run_job = Some(crate::recon_run::RunJob::start(
+                    std::sync::Arc::clone(&view.stack),
+                    crate::recon_run::RunSpec {
+                        algo_key: algo.key.to_owned(),
+                        params_json,
+                        slice_from: from,
+                        slice_to: to,
+                        jobs,
+                        overlap: SPLIT_OVERLAP,
+                        output_folder,
+                    },
+                ));
+            }
+            match &view.run_result {
+                Some(Ok(dir)) => {
+                    ui.colored_label(
+                        Color32::from_rgb(120, 200, 120),
+                        format!("reconstruction written into {}", dir.display()),
+                    );
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                None => {}
+            }
         },
     );
     if let Some(which) = clicked {
@@ -7074,6 +7250,9 @@ impl eframe::App for CtApp {
                         slice_to: usize::MAX,
                         preview_frame: 0,
                         preview_tex: None,
+                        output_base: None,
+                        run_job: None,
+                        run_result: None,
                     })
                 }
                 _ => None,

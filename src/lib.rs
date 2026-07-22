@@ -13,6 +13,7 @@ pub mod instrument;
 pub mod ipts;
 pub mod logger;
 pub mod normalize;
+pub mod recon_run;
 pub mod rotate;
 pub mod session;
 pub mod stripes;
