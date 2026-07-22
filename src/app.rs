@@ -536,6 +536,17 @@ fn recon_ui(
                     config_json_rows(ui, &algo_default_config(algo, cor_px, width_px));
                 }
             }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "ℹ these parameters cannot be edited here — to modify them, run the \
+                     {} evaluation tool in the section above and save (or return) from \
+                     there",
+                    algo.label
+                ))
+                .weak()
+                .size(11.0),
+            );
             if matches!(algo.key, "svmbir" | "mbirjax") {
                 ui.add_space(4.0);
                 ui.label(
