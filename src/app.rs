@@ -90,6 +90,29 @@ struct ReconAlgorithm {
     description: &'static str,
     /// The standalone evaluator binary, when it exists already.
     binary: Option<&'static str>,
+    /// The evaluator's default parameters (mirroring its `Default` impl),
+    /// shown when no evaluation was run yet. The center field is added
+    /// dynamically from the checkpoint.
+    defaults: &'static str,
+    /// Name of the center-of-rotation field of the config.
+    center_key: &'static str,
+    /// `true` when the center field is an offset from the detector center
+    /// (`-(width/2 - cor)`) rather than an absolute column.
+    center_is_offset: bool,
+}
+
+/// The configuration the evaluator would save with its defaults: the static
+/// defaults plus the center field derived from the checkpoint.
+fn algo_default_config(algo: &ReconAlgorithm, cor: f64, width: f64) -> String {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(algo.defaults).unwrap_or_else(|_| serde_json::json!({}));
+    let value = if algo.center_is_offset {
+        -(width / 2.0 - cor)
+    } else {
+        cor
+    };
+    doc[algo.center_key] = serde_json::Value::from(value);
+    doc.to_string()
 }
 
 const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
@@ -98,6 +121,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         label: "SVMBIR",
         description: "sparse-view model-based iterative — high quality",
         binary: Some(SVMBIR_OPTIMIZER_BIN),
+        defaults: "{\"sharpness\":0.0,\"snr_db\":30.0,\"positivity\":true,\"max_iterations\":20,\"max_resolutions\":3}",
+        center_key: "center_offset",
+        center_is_offset: true,
     },
     ReconAlgorithm {
         key: "mbirjax",
@@ -106,6 +132,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_mbirjax_optimizer/target/release/mbirjax_optimizer",
         ),
+        defaults: "{\"sharpness\":1.0,\"snr_db\":30.0,\"positivity\":false,\"max_iterations\":15,\"row_scale\":1.0,\"col_scale\":1.0}",
+        center_key: "det_channel_offset",
+        center_is_offset: true,
     },
     ReconAlgorithm {
         key: "astra_fbp",
@@ -114,6 +143,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_astra_optimizer/target/release/astra_optimizer",
         ),
+        defaults: "{\"method\":\"SIRT_CUDA\",\"num_iter\":300,\"filter_name\":\"hann\",\"ratio\":1.0,\"pad\":null}",
+        center_key: "center",
+        center_is_offset: false,
     },
     ReconAlgorithm {
         key: "tomopy_fbp",
@@ -122,6 +154,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_tomopy_optimizer/target/release/tomopy_optimizer",
         ),
+        defaults: "{\"algorithm\":\"fbp\",\"filter_name\":\"hann\"}",
+        center_key: "center",
+        center_is_offset: false,
     },
     ReconAlgorithm {
         key: "algotom_fbp",
@@ -130,6 +165,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_algotom_fbp_optimizer/target/release/algotom_fbp_optimizer",
         ),
+        defaults: "{\"filter_name\":\"hann\",\"gpu\":false,\"ratio\":1.0,\"pad\":null,\"pad_mode\":\"edge\"}",
+        center_key: "center",
+        center_is_offset: false,
     },
     ReconAlgorithm {
         key: "algotom_gridrec",
@@ -138,6 +176,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_algotom_gridrec_optimizer/target/release/algotom_gridrec_optimizer",
         ),
+        defaults: "{\"filter_name\":\"shepp\",\"ratio\":1.0,\"pad\":100,\"filter_par\":0.9}",
+        center_key: "center",
+        center_is_offset: false,
     },
 ];
 
@@ -175,6 +216,24 @@ impl ReconView {
             opt_error: None,
             open_section: Some(ReconSection::Evaluate),
             selected_algo: 0,
+        }
+    }
+}
+
+/// Show a saved `<algorithm>_config` JSON as one "name: value" row per
+/// field.
+fn config_json_rows(ui: &mut egui::Ui, json: &str) {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(map)) => {
+            for (name, value) in &map {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    ui.label(RichText::new(value.to_string()).size(12.0));
+                });
+            }
+        }
+        _ => {
+            ui.label(RichText::new(json).size(12.0));
         }
     }
 }
@@ -294,6 +353,15 @@ fn recon_ui(
         }
     }
 
+    // For the default-parameter display: the center the evaluators would
+    // seed from this checkpoint.
+    let width_px = view
+        .stack
+        .sample
+        .first()
+        .map(|p| p.width as f64)
+        .unwrap_or(0.0);
+    let cor_px = view.cor.unwrap_or(width_px / 2.0);
     let on_disk = view.stack.path.is_file();
     let busy = view.optimizer_job.is_some() || view.reload_job.is_some();
     let evaluated = view
@@ -367,25 +435,57 @@ fn recon_ui(
                     launch = Some((binary, algo.label.to_owned()));
                 }
                 let config_key = format!("{}_config", algo.key);
-                match view
+                let config = view
                     .stack
                     .metadata
                     .iter()
                     .find(|(name, _)| *name == config_key)
-                {
-                    Some((_, json)) => {
+                    .map(|(_, json)| json.clone());
+                if available {
+                    let icon = if config.is_some() {
+                        RichText::new("👁").color(Color32::from_rgb(120, 200, 120))
+                    } else {
+                        RichText::new("👁").weak()
+                    };
+                    ui.menu_button(icon, |ui| {
+                        ui.set_max_width(380.0);
                         ui.label(
-                            RichText::new(format!("saved parameters: {json}"))
+                            RichText::new(format!(
+                                "{} parameters for the full reconstruction",
+                                algo.label
+                            ))
+                            .strong(),
+                        );
+                        match &config {
+                            Some(json) => config_json_rows(ui, json),
+                            None => {
+                                ui.label(
+                                    RichText::new(
+                                        "default parameters (no evaluation run yet — \
+                                         evaluate to tune them):",
+                                    )
+                                    .weak(),
+                                );
+                                config_json_rows(
+                                    ui,
+                                    &algo_default_config(algo, cor_px, width_px),
+                                );
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("check the parameters used for the full reconstruction");
+                    if config.is_some() {
+                        ui.label(
+                            RichText::new("parameters saved")
                                 .color(Color32::from_rgb(120, 200, 120))
                                 .size(11.0),
                         );
-                    }
-                    None if available => {
+                    } else {
                         ui.label(RichText::new("no saved parameters yet").weak().size(11.0));
                     }
-                    None => {
-                        ui.label(RichText::new("coming soon").weak().size(11.0));
-                    }
+                } else {
+                    ui.label(RichText::new("coming soon").weak().size(11.0));
                 }
             });
         }
@@ -421,32 +521,19 @@ fn recon_ui(
                             .strong()
                             .size(12.0),
                     );
-                    match serde_json::from_str::<serde_json::Value>(json) {
-                        Ok(serde_json::Value::Object(map)) => {
-                            for (name, value) in &map {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("    {name}:")).strong().size(12.0),
-                                    );
-                                    ui.label(RichText::new(value.to_string()).size(12.0));
-                                });
-                            }
-                        }
-                        _ => {
-                            ui.label(RichText::new(json).size(12.0));
-                        }
-                    }
+                    config_json_rows(ui, json);
                 }
                 None => {
                     ui.label(
                         RichText::new(format!(
-                            "no saved {} parameters — the defaults will be used; run the \
-                             evaluation above to tune them first",
+                            "{} default parameters (no evaluation run — these will be \
+                             used; run the evaluation above to tune them):",
                             algo.label
                         ))
                         .weak()
                         .size(12.0),
                     );
+                    config_json_rows(ui, &algo_default_config(algo, cor_px, width_px));
                 }
             }
             if matches!(algo.key, "svmbir" | "mbirjax") {
