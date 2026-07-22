@@ -79,12 +79,64 @@ enum Screen {
 const SVMBIR_OPTIMIZER_BIN: &str =
     "/SNS/VENUS/shared/software/git/rust_svmbir_optimizer/target/release/svmbir_optimizer";
 
+/// The reconstruction algorithms of the pipeline (the Python
+/// `ReconstructionAlgorithm` list); each gets its own standalone evaluation
+/// application, launched from the reconstruction screen.
+struct ReconAlgorithm {
+    /// Configuration key: the saved parameters live in the checkpoint's
+    /// metadata as `<key>_config`.
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+    /// The standalone evaluator binary, when it exists already.
+    binary: Option<&'static str>,
+}
+
+const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
+    ReconAlgorithm {
+        key: "svmbir",
+        label: "SVMBIR",
+        description: "sparse-view model-based iterative — high quality",
+        binary: Some(SVMBIR_OPTIMIZER_BIN),
+    },
+    ReconAlgorithm {
+        key: "mbirjax",
+        label: "MBIRJAX",
+        description: "JAX-based model-based iterative — GPU accelerated",
+        binary: None,
+    },
+    ReconAlgorithm {
+        key: "astra_fbp",
+        label: "ASTRA FBP",
+        description: "filtered back projection — fast, GPU support",
+        binary: None,
+    },
+    ReconAlgorithm {
+        key: "tomopy_fbp",
+        label: "TomoPy FBP",
+        description: "filtered back projection — versatile, well tested",
+        binary: None,
+    },
+    ReconAlgorithm {
+        key: "algotom_fbp",
+        label: "AlgoTom FBP",
+        description: "filtered back projection — optimized for large data",
+        binary: None,
+    },
+    ReconAlgorithm {
+        key: "algotom_gridrec",
+        label: "AlgoTom GridRec",
+        description: "very fast — good for quick previews",
+        binary: None,
+    },
+];
+
 struct ReconView {
     stack: std::sync::Arc<LoadedStack>,
     /// Center of rotation in px; `None` = the horizontal center.
     cor: Option<f64>,
-    /// SVMBIR optimizer session in flight.
-    optimizer_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// An algorithm evaluator session in flight, with its label.
+    optimizer_job: Option<(String, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Reloading the file after the optimizer closes, to pick up the saved
     /// parameters.
     reload_job: Option<LoadJob>,
@@ -170,14 +222,137 @@ fn recon_ui(
                 });
             }
         });
-    ui.add_space(24.0);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new("The reconstruction algorithms evaluation comes next.")
-                .weak()
-                .size(15.0),
+    ui.add_space(10.0);
+    // The algorithms: one standalone evaluator per method, launched from
+    // here; the saved parameters live in the checkpoint's metadata.
+    let ctx = ui.ctx().clone();
+    if let Some((label, rx)) = &view.optimizer_job {
+        let label = label.clone();
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                logger::log(format!("{label} evaluator closed — reloading the checkpoint"));
+                view.optimizer_job = None;
+                if view.stack.path.is_file() {
+                    view.reload_job = Some(LoadJob::start(view.stack.path.clone()));
+                }
+            }
+            Ok(Err(e)) => {
+                logger::error(format!("{label} evaluator failed: {e}"));
+                view.opt_error = Some(e);
+                view.optimizer_job = None;
+            }
+            Err(_) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "{label} evaluator is open — tune, evaluate, then save the \
+                         parameters there"
+                    ));
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+            }
+        }
+    }
+    if let Some(job) = &mut view.reload_job {
+        match job.poll() {
+            Some(Ok(stack)) => {
+                view.cor = stack.center_of_rotation.or(view.cor);
+                view.stack = std::sync::Arc::new(stack);
+                view.reload_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("reloading the checkpoint failed: {e}"));
+                view.opt_error = Some(e);
+                view.reload_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+
+    ui.label(RichText::new("Reconstruction algorithms").strong());
+    let on_disk = view.stack.path.is_file();
+    if !on_disk {
+        ui.colored_label(
+            Color32::from_rgb(240, 180, 60),
+            "the stack is not saved to a file yet — save the checkpoint first to \
+             evaluate the algorithms",
         );
-    });
+    }
+    let busy = view.optimizer_job.is_some() || view.reload_job.is_some();
+    let mut launch: Option<(&'static str, String)> = None;
+    for algo in &RECON_ALGORITHMS {
+        ui.horizontal(|ui| {
+            let available = algo.binary.is_some();
+            let response = ui
+                .add_enabled(
+                    available && on_disk && !busy,
+                    egui::Button::new(format!(
+                        "🧮 Evaluate the {} reconstruction",
+                        algo.label
+                    )),
+                )
+                .on_hover_text(algo.description)
+                .on_disabled_hover_text(if available {
+                    "save the checkpoint first"
+                } else {
+                    "the evaluator for this algorithm is not built yet"
+                });
+            if response.clicked()
+                && let Some(binary) = algo.binary
+            {
+                launch = Some((binary, algo.label.to_owned()));
+            }
+            let config_key = format!("{}_config", algo.key);
+            match view
+                .stack
+                .metadata
+                .iter()
+                .find(|(name, _)| *name == config_key)
+            {
+                Some((_, json)) => {
+                    ui.label(
+                        RichText::new(format!("saved parameters: {json}"))
+                            .color(Color32::from_rgb(120, 200, 120))
+                            .size(11.0),
+                    );
+                }
+                None if available => {
+                    ui.label(RichText::new("no saved parameters yet").weak().size(11.0));
+                }
+                None => {
+                    ui.label(RichText::new("coming soon").weak().size(11.0));
+                }
+            }
+        });
+    }
+    if let Some((binary, label)) = launch {
+        logger::log(format!(
+            "opening the {label} evaluator on {}",
+            view.stack.path.display()
+        ));
+        view.opt_error = None;
+        let path = view.stack.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::process::Command::new(binary)
+                .arg(&path)
+                .arg("--called-from-app")
+                .output();
+            let _ = tx.send(match result {
+                Err(e) => Err(format!("cannot launch {binary}: {e}")),
+                Ok(out) if !out.status.success() => Err(format!(
+                    "evaluator failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Ok(_) => Ok(()),
+            });
+        });
+        view.optimizer_job = Some((label, rx));
+    }
+    if let Some(e) = &view.opt_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
     back
 }
 
