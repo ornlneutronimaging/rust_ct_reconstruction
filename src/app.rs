@@ -204,6 +204,14 @@ struct ReconView {
     /// Algorithm chosen for the full reconstruction (index into
     /// `RECON_ALGORITHMS`).
     selected_algo: usize,
+    /// Number of slice-range jobs the svmbir/mbirjax reconstruction is
+    /// split into; 0 = automatic (the smallest count that fits the
+    /// per-job cap). Clamped to the valid range every frame.
+    split_jobs: usize,
+    /// Projection browsed in the split-coverage preview.
+    preview_frame: usize,
+    /// Cached preview texture, keyed by (stack pointer, frame).
+    preview_tex: Option<((usize, usize), egui::TextureHandle)>,
 }
 
 impl ReconView {
@@ -216,8 +224,42 @@ impl ReconView {
             opt_error: None,
             open_section: Some(ReconSection::Evaluate),
             selected_algo: 0,
+            split_jobs: 0,
+            preview_frame: 0,
+            preview_tex: None,
         }
     }
+}
+
+/// The valid job-count range for splitting `h` slices into jobs of at most
+/// `cap` slices with a fixed `overlap`: the smallest count whose longest job
+/// fits the cap, and the largest that keeps every job at least twice the
+/// overlap.
+fn split_job_bounds(h: usize, cap: usize, overlap: usize) -> (usize, usize) {
+    let n_min = (1..=h)
+        .find(|n| (h + overlap * (n - 1)).div_ceil(*n) <= cap)
+        .unwrap_or(1);
+    let n_max = (n_min..=h)
+        .take_while(|n| (h + overlap * (n - 1)) / n >= 2 * overlap)
+        .last()
+        .unwrap_or(n_min);
+    (n_min, n_max)
+}
+
+/// The slice ranges (start, end-exclusive) of `n` jobs covering `h` slices,
+/// consecutive jobs overlapping by exactly `overlap`; lengths differ by at
+/// most one slice.
+fn split_ranges(h: usize, n: usize, overlap: usize) -> Vec<(usize, usize)> {
+    let total = h + overlap * (n - 1);
+    let (base, extra) = (total / n, total % n);
+    let mut ranges = Vec::with_capacity(n);
+    let mut start = 0;
+    for i in 0..n {
+        let len = base + usize::from(i < extra);
+        ranges.push((start, start + len));
+        start = start + len - overlap;
+    }
+    ranges
 }
 
 /// Show a saved `<algorithm>_config` JSON as one "name: value" row per
@@ -548,16 +590,197 @@ fn recon_ui(
                 .size(11.0),
             );
             if matches!(algo.key, "svmbir" | "mbirjax") {
-                ui.add_space(4.0);
+                ui.add_space(6.0);
+                // The volume is reconstructed in slice-range jobs (with an
+                // overlap so the stitching has context on both sides), then
+                // stitched back together.
+                const OVERLAP: usize = 10;
+                let cap: usize = if algo.key == "svmbir" { 50 } else { 100 };
+                let h = view.stack.sample.first().map(|p| p.height).unwrap_or(0);
                 ui.label(
-                    RichText::new(
-                        "ℹ the full volume is too large for a single pass with this \
-                         algorithm: it will be split into several sub-reconstructions \
-                         and stitched back together at the end",
-                    )
-                    .weak()
-                    .size(11.0),
+                    RichText::new(format!(
+                        "Splitting the reconstruction — {} handles at most {cap} slices \
+                         per job; consecutive jobs overlap by {OVERLAP} slices and are \
+                         stitched back together at the end",
+                        algo.label
+                    ))
+                    .strong()
+                    .size(12.0),
                 );
+                if h > OVERLAP {
+                    let (n_min, n_max) = split_job_bounds(h, cap, OVERLAP);
+                    view.split_jobs = view.split_jobs.clamp(n_min, n_max);
+                    let stack = std::sync::Arc::clone(&view.stack);
+                    ui.columns(2, |cols| {
+                        let ui = &mut cols[0];
+                        if n_max > n_min {
+                            ui.add(
+                                egui::Slider::new(&mut view.split_jobs, n_min..=n_max)
+                                    .text("number of reconstruction jobs"),
+                            )
+                            .on_hover_text(format!(
+                                "at least {n_min} jobs are needed so no job exceeds \
+                                 {cap} slices"
+                            ));
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{n_min} job{} (the {h} slices fit without a choice)",
+                                    if n_min == 1 { "" } else { "s" }
+                                ))
+                                .size(12.0),
+                            );
+                        }
+                        let n = view.split_jobs;
+                        let ranges = split_ranges(h, n, OVERLAP);
+                        let total = h + OVERLAP * (n - 1);
+                        let (base, extra) = (total / n, total % n);
+                        ui.label(
+                            RichText::new(format!(
+                                "{n} job{}: {} slices each",
+                                if n == 1 { "" } else { "s" },
+                                if extra == 0 {
+                                    format!("{base}")
+                                } else {
+                                    format!("{} or {base}", base + 1)
+                                }
+                            ))
+                            .color(Color32::from_rgb(120, 200, 120))
+                            .size(12.0),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("split_jobs_list")
+                            .max_height(240.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (i, (start, end)) in ranges.iter().enumerate() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "job {}: slices {start} to {} ({} slices)",
+                                            i + 1,
+                                            end - 1,
+                                            end - start
+                                        ))
+                                        .weak()
+                                        .size(11.0),
+                                    );
+                                }
+                            });
+
+                        // Right column: the ranges drawn over a projection,
+                        // with a slider to browse the stack.
+                        let ui = &mut cols[1];
+                        let n_proj = stack.sample.len();
+                        view.preview_frame = view.preview_frame.min(n_proj - 1);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Slider::new(&mut view.preview_frame, 0..=n_proj - 1)
+                                    .text("projection"),
+                            );
+                            let p = &stack.sample[view.preview_frame];
+                            ui.label(
+                                RichText::new(match p.angle_deg {
+                                    Some(a) => format!("{a:.2}°"),
+                                    None => String::new(),
+                                })
+                                .weak()
+                                .size(11.0),
+                            );
+                        });
+                        let key =
+                            (std::sync::Arc::as_ptr(&stack) as usize, view.preview_frame);
+                        if view.preview_tex.as_ref().map(|(k, _)| *k) != Some(key) {
+                            let p = &stack.sample[view.preview_frame];
+                            let stride = (p.width.max(p.height) / 512).max(1);
+                            let (sw, sh) =
+                                (p.width.div_ceil(stride), p.height.div_ceil(stride));
+                            let mut small = Vec::with_capacity(sw * sh);
+                            for y in (0..p.height).step_by(stride) {
+                                for x in (0..p.width).step_by(stride) {
+                                    small.push(p.mean[y * p.width + x]);
+                                }
+                            }
+                            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                            for v in &small {
+                                lo = lo.min(*v);
+                                hi = hi.max(*v);
+                            }
+                            let span = (hi - lo).max(1e-6);
+                            let pixels: Vec<Color32> = small
+                                .iter()
+                                .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
+                                .collect();
+                            let image = egui::ColorImage {
+                                size: [sw, sh],
+                                source_size: egui::vec2(sw as f32, sh as f32),
+                                pixels,
+                            };
+                            let tex = ui.ctx().load_texture(
+                                "split_preview",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            view.preview_tex = Some((key, tex));
+                        }
+                        if let Some((_, tex)) = &view.preview_tex {
+                            let size = tex.size_vec2();
+                            let scale = (380.0 / size.x.max(size.y)).min(2.0);
+                            let response = ui.add(
+                                egui::Image::from_texture(tex)
+                                    .fit_to_exact_size(size * scale),
+                            );
+                            let rect = response.rect;
+                            let painter = ui.painter_at(rect);
+                            let y_of = |row: usize| {
+                                rect.top() + (row as f32 / h as f32) * rect.height()
+                            };
+                            const BAND_COLORS: [Color32; 3] = [
+                                Color32::from_rgb(255, 90, 80),
+                                Color32::from_rgb(110, 230, 230),
+                                Color32::from_rgb(240, 200, 90),
+                            ];
+                            for (i, (start, end)) in ranges.iter().enumerate() {
+                                let color = BAND_COLORS[i % BAND_COLORS.len()];
+                                let fill = Color32::from_rgba_unmultiplied(
+                                    color.r(),
+                                    color.g(),
+                                    color.b(),
+                                    32,
+                                );
+                                let band = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left(), y_of(*start)),
+                                    egui::pos2(rect.right(), y_of(*end)),
+                                );
+                                painter.rect_filled(band, 0.0, fill);
+                                for row in [*start, *end] {
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(rect.left(), y_of(row)),
+                                            egui::pos2(rect.right(), y_of(row)),
+                                        ],
+                                        egui::Stroke::new(1.0, color),
+                                    );
+                                }
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "each color band is one job; the denser stripes \
+                                     between neighbors are the 10-slice overlaps",
+                                )
+                                .weak()
+                                .size(11.0),
+                            );
+                        }
+                    });
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "only {h} slices — a single job will be used"
+                        ))
+                        .weak()
+                        .size(12.0),
+                    );
+                }
             }
             ui.add_space(6.0);
             ui.add_enabled(false, egui::Button::new("▶ Run the full reconstruction"))
@@ -6751,6 +6974,9 @@ impl eframe::App for CtApp {
                         opt_error: None,
                         open_section: Some(ReconSection::Evaluate),
                         selected_algo: 0,
+                        split_jobs: 0,
+                        preview_frame: 0,
+                        preview_tex: None,
                     })
                 }
                 _ => None,
@@ -6765,5 +6991,41 @@ impl eframe::App for CtApp {
                 self.screen = Screen::Setup;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::{split_job_bounds, split_ranges};
+
+    #[test]
+    fn ranges_cover_exactly_with_fixed_overlap() {
+        for (h, cap) in [(512, 100), (512, 50), (2048, 100), (60, 50), (11, 100)] {
+            let (n_min, n_max) = split_job_bounds(h, cap, 10);
+            assert!(n_min <= n_max);
+            for n in n_min..=n_max.min(n_min + 20) {
+                let ranges = split_ranges(h, n, 10);
+                assert_eq!(ranges.len(), n);
+                assert_eq!(ranges[0].0, 0);
+                assert_eq!(ranges[n - 1].1, h, "last job must end at {h}");
+                for w in ranges.windows(2) {
+                    assert_eq!(w[0].1 - w[1].0, 10, "overlap must be exactly 10");
+                }
+                for (a, b) in &ranges {
+                    assert!(b - a <= cap, "job of {} slices exceeds the {cap} cap", b - a);
+                    assert!(b > a);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_job_counts() {
+        // 512 slices: ceil((512+10(n-1))/n) first fits 100 at n=6 and 50 at
+        // n=13; a stack that fits the cap needs a single job.
+        assert_eq!(split_job_bounds(512, 100, 10).0, 6);
+        assert_eq!(split_job_bounds(512, 50, 10).0, 13);
+        assert_eq!(split_job_bounds(90, 100, 10).0, 1);
+        assert_eq!(split_ranges(90, 1, 10), vec![(0, 90)]);
     }
 }
