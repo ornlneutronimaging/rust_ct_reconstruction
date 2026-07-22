@@ -103,7 +103,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         key: "mbirjax",
         label: "MBIRJAX",
         description: "JAX-based model-based iterative — GPU accelerated",
-        binary: None,
+        binary: Some(
+            "/SNS/VENUS/shared/software/git/rust_mbirjax_optimizer/target/release/mbirjax_optimizer",
+        ),
     },
     ReconAlgorithm {
         key: "astra_fbp",
