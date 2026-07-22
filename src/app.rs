@@ -119,7 +119,9 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         key: "tomopy_fbp",
         label: "TomoPy FBP",
         description: "filtered back projection — versatile, well tested",
-        binary: None,
+        binary: Some(
+            "/SNS/VENUS/shared/software/git/rust_tomopy_optimizer/target/release/tomopy_optimizer",
+        ),
     },
     ReconAlgorithm {
         key: "algotom_fbp",
