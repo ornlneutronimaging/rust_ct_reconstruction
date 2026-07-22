@@ -198,6 +198,33 @@ else:
 report("done")
 "#;
 
+/// Write (or replace) the `recon_settings` JSON in the checkpoint's
+/// `/metadata` group, so loading the file later restores the
+/// reconstruction setup (algorithm, slice range, split, output folder).
+pub fn save_recon_settings(path: &Path, json: &str) -> Result<(), String> {
+    use hdf5_metno::types::VarLenUnicode;
+    let file = hdf5_metno::File::open_rw(path)
+        .map_err(|e| format!("cannot open {} for writing: {e}", path.display()))?;
+    let metadata = match file.group("metadata") {
+        Ok(group) => group,
+        Err(_) => file
+            .create_group("metadata")
+            .map_err(|e| format!("create metadata group: {e}"))?,
+    };
+    if metadata.dataset("recon_settings").is_ok() {
+        metadata
+            .unlink("recon_settings")
+            .map_err(|e| format!("replace recon_settings: {e}"))?;
+    }
+    let value: VarLenUnicode = json.parse().unwrap_or_default();
+    metadata
+        .new_dataset::<VarLenUnicode>()
+        .create("recon_settings")
+        .and_then(|ds| ds.write_scalar(&value))
+        .map_err(|e| format!("write recon_settings: {e}"))?;
+    Ok(())
+}
+
 /// The full reconstruction on a background thread; `progress` mirrors the
 /// Python side's progress lines and `poll` resolves to the output folder.
 pub struct RunJob {
@@ -339,4 +366,30 @@ fn run(
     })();
     cleanup();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_recon_settings;
+
+    #[test]
+    fn recon_settings_write_and_replace() {
+        let dir = std::env::temp_dir().join(format!("recon_settings_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checkpoint.h5");
+        hdf5_metno::File::create(&path).unwrap();
+        save_recon_settings(&path, "{\"algorithm\":\"svmbir\"}").unwrap();
+        // Saving again must replace, not fail.
+        save_recon_settings(&path, "{\"algorithm\":\"mbirjax\",\"slice_from\":5}").unwrap();
+        let file = hdf5_metno::File::open(&path).unwrap();
+        let value: hdf5_metno::types::VarLenUnicode = file
+            .dataset("metadata/recon_settings")
+            .unwrap()
+            .read_scalar()
+            .unwrap();
+        assert!(value.as_str().contains("mbirjax"));
+        assert!(value.as_str().contains("\"slice_from\":5"));
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -226,12 +226,21 @@ struct ReconView {
     /// A rust_tiff_viewer session showing the reconstructed slices.
     viewer_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     viewer_error: Option<String>,
+    /// Outcome of saving the reconstruction setup into the checkpoint.
+    settings_save_status: Option<Result<String, String>>,
 }
 
 impl ReconView {
     fn new(stack: LoadedStack, cor: Option<f64>) -> Self {
-        Self {
-            stack: std::sync::Arc::new(stack),
+        Self::from_arc(std::sync::Arc::new(stack), cor)
+    }
+
+    /// Build the view, restoring the reconstruction setup (algorithm,
+    /// slice range, split, output folder) saved in the checkpoint's
+    /// `recon_settings` metadata when there is one.
+    fn from_arc(stack: std::sync::Arc<LoadedStack>, cor: Option<f64>) -> Self {
+        let mut view = Self {
+            stack,
             cor,
             optimizer_job: None,
             reload_job: None,
@@ -248,7 +257,37 @@ impl ReconView {
             run_result: None,
             viewer_job: None,
             viewer_error: None,
+            settings_save_status: None,
+        };
+        if let Some((_, json)) = view
+            .stack
+            .metadata
+            .iter()
+            .find(|(name, _)| name == "recon_settings")
+            && let Ok(doc) = serde_json::from_str::<serde_json::Value>(json)
+        {
+            if let Some(i) = doc
+                .get("algorithm")
+                .and_then(|v| v.as_str())
+                .and_then(|key| RECON_ALGORITHMS.iter().position(|a| a.key == key))
+            {
+                view.selected_algo = i;
+                view.open_section = Some(ReconSection::Run);
+            }
+            if let Some(v) = doc.get("slice_from").and_then(|v| v.as_u64()) {
+                view.slice_from = v as usize;
+            }
+            if let Some(v) = doc.get("slice_to").and_then(|v| v.as_u64()) {
+                view.slice_to = v as usize;
+            }
+            if let Some(v) = doc.get("split_jobs").and_then(|v| v.as_u64()) {
+                view.split_jobs = v as usize;
+            }
+            if let Some(dir) = doc.get("output_folder").and_then(|v| v.as_str()) {
+                view.output_base = Some(PathBuf::from(dir));
+            }
         }
+        view
     }
 }
 
@@ -980,6 +1019,46 @@ fn recon_ui(
             }
             let running = view.run_job.is_some();
             ui.add_space(4.0);
+            if ui
+                .add_enabled(
+                    view.stack.path.is_file(),
+                    egui::Button::new("💾 Update the HDF5 with this setup"),
+                )
+                .on_hover_text(
+                    "saves the chosen algorithm, slice range, split and output folder \
+                     into the checkpoint, so loading it later comes back to this point",
+                )
+                .on_disabled_hover_text("the stack is not saved to a file yet")
+                .clicked()
+            {
+                let doc = serde_json::json!({
+                    "algorithm": algo.key,
+                    "slice_from": view.slice_from.min(h.saturating_sub(1)),
+                    "slice_to": view.slice_to.min(h.saturating_sub(1)),
+                    "split_jobs": view.split_jobs,
+                    "output_folder": view
+                        .output_base
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                });
+                let path = view.stack.path.clone();
+                let result = crate::recon_run::save_recon_settings(&path, &doc.to_string())
+                    .map(|()| format!("reconstruction setup saved into {}", path.display()));
+                match &result {
+                    Ok(msg) => logger::log(msg.clone()),
+                    Err(e) => logger::error(format!("saving the setup failed: {e}")),
+                }
+                view.settings_save_status = Some(result);
+            }
+            match &view.settings_save_status {
+                Some(Ok(msg)) => {
+                    ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                None => {}
+            }
             if ui
                 .add_enabled(
                     view.output_base.is_some() && !running && h > 0,
@@ -7304,25 +7383,10 @@ impl eframe::App for CtApp {
                 Screen::Stack(view) if view.goto_recon => {
                     view.goto_recon = false;
                     let cor = view.cor_result.or(view.stack.center_of_rotation);
-                    Some(ReconView {
-                        stack: std::sync::Arc::clone(&view.stack),
+                    Some(ReconView::from_arc(
+                        std::sync::Arc::clone(&view.stack),
                         cor,
-                        optimizer_job: None,
-                        reload_job: None,
-                        opt_error: None,
-                        open_section: Some(ReconSection::Evaluate),
-                        selected_algo: 0,
-                        split_jobs: 0,
-                        slice_from: 0,
-                        slice_to: usize::MAX,
-                        preview_frame: 0,
-                        preview_tex: None,
-                        output_base: None,
-                        run_job: None,
-                        run_result: None,
-                        viewer_job: None,
-                        viewer_error: None,
-                    })
+                    ))
                 }
                 _ => None,
             };
