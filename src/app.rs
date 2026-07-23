@@ -157,6 +157,17 @@ fn step_file_name(stem: &str, stage: &str) -> String {
     format!("{stem}_step_{stage}.h5")
 }
 
+/// Drag speed of a value widget: holding SHIFT while dragging goes much
+/// faster. egui itself divides the drag speed by 10 while SHIFT is held
+/// (its precision mode), so the ×100 here nets a ×10 faster drag.
+fn drag_speed(ui: &egui::Ui, base: f64) -> f64 {
+    if ui.input(|i| i.modifiers.shift) {
+        base * 100.0
+    } else {
+        base
+    }
+}
+
 /// Navigation requested by a screen's header buttons.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nav {
@@ -855,11 +866,27 @@ fn recon_ui(
         RichText::new("Run the reconstruction").strong(),
         &mut |ui, view| {
             for (i, algo) in RECON_ALGORITHMS.iter().enumerate() {
-                ui.radio_value(
-                    &mut view.selected_algo,
-                    i,
-                    format!("{} — {}", algo.label, algo.description),
-                );
+                // Algorithms already evaluated (tuned parameters saved in the
+                // checkpoint) are highlighted, so it is easy to come back to
+                // them after an evaluation round.
+                let config_key = format!("{}_config", algo.key);
+                let evaluated = view
+                    .stack
+                    .metadata
+                    .iter()
+                    .any(|(name, _)| *name == config_key);
+                let text = format!("{} — {}", algo.label, algo.description);
+                let label = if evaluated {
+                    RichText::new(format!("✔ {text}")).color(Color32::from_rgb(120, 200, 120))
+                } else {
+                    RichText::new(text)
+                };
+                ui.radio_value(&mut view.selected_algo, i, label)
+                    .on_hover_text(if evaluated {
+                        "evaluated — the parameters saved from the evaluation will be used"
+                    } else {
+                        "not evaluated — the default parameters will be used"
+                    });
             }
             ui.add_space(6.0);
             let algo = &RECON_ALGORITHMS[view.selected_algo.min(RECON_ALGORITHMS.len() - 1)];
@@ -919,13 +946,16 @@ fn recon_ui(
                     ui.label(RichText::new("Slices to reconstruct").strong().size(12.0));
                     ui.horizontal(|ui| {
                         ui.label("from:");
+                        let speed = drag_speed(ui, 1.0);
                         ui.add(
                             egui::DragValue::new(&mut view.slice_from)
+                                .speed(speed)
                                 .range(0..=view.slice_to),
                         );
                         ui.label("to:");
                         ui.add(
                             egui::DragValue::new(&mut view.slice_to)
+                                .speed(speed)
                                 .range(view.slice_from..=h - 1),
                         );
                         let count = view.slice_to - view.slice_from + 1;
@@ -3682,9 +3712,18 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     egui::Slider::new(&mut settings.nbr_bins, 10..=1000).text("bins"),
                 );
                 ui.label("exclude bins:");
-                ui.add(egui::DragValue::new(&mut settings.exclude_left).range(0..=50));
+                let speed = drag_speed(ui, 1.0);
+                ui.add(
+                    egui::DragValue::new(&mut settings.exclude_left)
+                        .speed(speed)
+                        .range(0..=50),
+                );
                 ui.label("left,");
-                ui.add(egui::DragValue::new(&mut settings.exclude_right).range(0..=50));
+                ui.add(
+                    egui::DragValue::new(&mut settings.exclude_right)
+                        .speed(speed)
+                        .range(0..=50),
+                );
                 ui.label("right");
                 ui.label("radius:");
                 ui.add(egui::DragValue::new(&mut settings.correct_radius).range(1..=5))
@@ -4513,9 +4552,14 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         .unwrap_or((h / 10, h.saturating_sub(1 + h / 10)));
     ui.horizontal(|ui| {
         ui.label("slice range:");
-        ui.add(egui::DragValue::new(&mut y_top).range(0..=h.saturating_sub(2)));
+        let speed = drag_speed(ui, 1.0);
+        ui.add(
+            egui::DragValue::new(&mut y_top)
+                .speed(speed)
+                .range(0..=h.saturating_sub(2)),
+        );
         ui.label("to");
-        ui.add(egui::DragValue::new(&mut y_bottom).range(1..=h - 1));
+        ui.add(egui::DragValue::new(&mut y_bottom).speed(speed).range(1..=h - 1));
         ui.label(
             RichText::new("(rows where the sample is visible)")
                 .weak()
@@ -4913,14 +4957,20 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                         ui.label(format!("{}:", param.name));
                         match &mut param.value {
                             stripes::ParamValue::Int(v) => {
-                                let widget = egui::DragValue::new(v).range(0..=999);
+                                let widget = egui::DragValue::new(v)
+                                    .speed(drag_speed(ui, 1.0))
+                                    .range(0..=999);
                                 let response = ui.add(widget);
                                 if param.zero_means_auto {
                                     response.on_hover_text("0 = auto");
                                 }
                             }
                             stripes::ParamValue::Float(v) => {
-                                ui.add(egui::DragValue::new(v).speed(0.1).range(0.0..=999.0));
+                                ui.add(
+                                    egui::DragValue::new(v)
+                                        .speed(drag_speed(ui, 0.1))
+                                        .range(0.0..=999.0),
+                                );
                             }
                             stripes::ParamValue::Bool(v) => {
                                 ui.checkbox(v, "");
@@ -4942,9 +4992,14 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         .unwrap_or((h / 3, (2 * h / 3).min(h - 1)));
     ui.horizontal(|ui| {
         ui.label("test on rows:");
-        ui.add(egui::DragValue::new(&mut y0).range(0..=h.saturating_sub(2)));
+        let speed = drag_speed(ui, 1.0);
+        ui.add(
+            egui::DragValue::new(&mut y0)
+                .speed(speed)
+                .range(0..=h.saturating_sub(2)),
+        );
         ui.label("to");
-        ui.add(egui::DragValue::new(&mut y1).range(1..=h - 1));
+        ui.add(egui::DragValue::new(&mut y1).speed(speed).range(1..=h - 1));
         let busy = view.stripe_test_job.is_some() || view.stripe_apply_job.is_some();
         if ui
             .add_enabled(any_enabled && !busy, egui::Button::new("🧪 Test on this band"))
