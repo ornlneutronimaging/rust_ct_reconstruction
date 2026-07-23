@@ -182,12 +182,17 @@ import numpy as np
 from NeuNorm.normalization import Normalization
 from NeuNorm.roi import ROI
 
-sample_file, ob_file, out_file = sys.argv[1:4]
+sample_file, ob_file, out_file, df_file = sys.argv[1:5]
 o_norm = Normalization()
 o_norm.load(data=np.load(sample_file))
 o_norm.load(data=np.load(ob_file), data_type='ob')
-if len(sys.argv) > 4:
-    x0, y0, x1, y1 = (int(v) for v in sys.argv[4:8])
+if df_file != '-':
+    # Dark current: NeuNorm subtracts the (mean) dark field from the sample
+    # and the OB before dividing.
+    o_norm.load(data=np.load(df_file), data_type='df')
+    o_norm.df_correction()
+if len(sys.argv) > 5:
+    x0, y0, x1, y1 = (int(v) for v in sys.argv[5:9])
     o_norm.normalization(roi=ROI(x0=x0, y0=y0, x1=x1, y1=y1), force_mean_ob=True)
 else:
     o_norm.normalization(force_mean_ob=True)
@@ -247,10 +252,11 @@ fn run_normalization(
     let dir = scratch_dir(stack, "norm")?;
     let sample_npy = dir.join("sample.npy");
     let ob_npy = dir.join("ob.npy");
+    let dc_npy = dir.join("dc.npy");
     let out_npy = dir.join("normalized.npy");
     let script = dir.join("neunorm_run.py");
     let cleanup = || {
-        for f in [&sample_npy, &ob_npy, &out_npy, &script] {
+        for f in [&sample_npy, &ob_npy, &dc_npy, &out_npy, &script] {
             let _ = std::fs::remove_file(f);
         }
         let _ = std::fs::remove_dir(&dir);
@@ -260,6 +266,14 @@ fn run_normalization(
         write_npy_stack(&sample_npy, &sample_refs)?;
         let ob_refs: Vec<&Projection> = stack.ob.iter().collect();
         write_npy_stack(&ob_npy, &ob_refs)?;
+        // `-` = no dark current: the script skips the dark-field correction.
+        let dc_arg = if stack.dc.is_empty() {
+            "-".to_owned()
+        } else {
+            let dc_refs: Vec<&Projection> = stack.dc.iter().collect();
+            write_npy_stack(&dc_npy, &dc_refs)?;
+            dc_npy.display().to_string()
+        };
         std::fs::write(&script, NEUNORM_SCRIPT)
             .map_err(|e| format!("write {}: {e}", script.display()))?;
         let mut args: Vec<String> = vec![
@@ -267,6 +281,7 @@ fn run_normalization(
             sample_npy.display().to_string(),
             ob_npy.display().to_string(),
             out_npy.display().to_string(),
+            dc_arg,
         ];
         if settings.beam_fluctuation
             && let Some(roi) = &settings.roi
@@ -348,20 +363,24 @@ fn run_normalization(
             total_counts: sum * p.n_images_used.max(1) as f64,
         });
     }
+    let mut describe = settings.describe();
+    if !stack.dc.is_empty() {
+        describe.push_str(&format!(
+            ", dark current subtracted ({} images)",
+            stack.dc.len()
+        ));
+    }
     let mut metadata = stack.metadata.clone();
     metadata.retain(|(name, _)| name != "normalization");
-    metadata.push(("normalization".to_owned(), settings.describe()));
+    metadata.push(("normalization".to_owned(), describe.clone()));
     metadata.sort();
-    let summary = format!(
-        "{} projections normalized — {}",
-        sample.len(),
-        settings.describe()
-    );
+    let summary = format!("{} projections normalized — {describe}", sample.len());
     Ok((
         LoadedStack {
             path: stack.path.clone(),
             sample,
             ob: stack.ob.clone(),
+            dc: stack.dc.clone(),
             metadata,
             center_of_rotation: stack.center_of_rotation,
         },
@@ -409,29 +428,117 @@ impl VisualizeJob {
     }
 }
 
+/// Write projections as float32 TIFFs into `dir` (created if needed), one
+/// file per projection, ordered by index.
+fn write_projection_tiffs(dir: &Path, projections: &[Projection]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    for (i, p) in projections.iter().enumerate() {
+        let safe: String = p
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+            .collect();
+        let file = dir.join(format!("{i:04}_{safe}.tif"));
+        write_tiff_f32(&file, p.width, p.height, &p.mean)?;
+    }
+    Ok(())
+}
+
+fn remove_dir_files(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let _ = std::fs::remove_file(entry.path());
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn run_viewer(stack: &LoadedStack) -> Result<(), String> {
     let base = scratch_dir(stack, "view")?;
     let dir = base.join("normalized");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let cleanup = || {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-        let _ = std::fs::remove_dir(&dir);
+        remove_dir_files(&dir);
         let _ = std::fs::remove_dir(&base);
     };
     let run = || -> Result<(), String> {
-        for (i, p) in stack.sample.iter().enumerate() {
-            let safe: String = p
-                .name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
-                .collect();
-            let file = dir.join(format!("{i:04}_{safe}.tif"));
-            write_tiff_f32(&file, p.width, p.height, &p.mean)?;
-        }
+        write_projection_tiffs(&dir, &stack.sample)?;
         let output = std::process::Command::new(TIFF_VIEWER_BIN)
             .arg(&dir)
+            .arg("--single-image")
+            .output()
+            .map_err(|e| format!("cannot launch {TIFF_VIEWER_BIN}: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(format!("rust_tiff_viewer failed ({}): {stderr}", output.status));
+        }
+        Ok(())
+    };
+    let result = run();
+    cleanup();
+    result
+}
+
+/// Compare two versions of a stack side by side in the sibling TIFF viewer
+/// (e.g. before / after outlier removal): the sample (or OB, with `use_ob`)
+/// stacks are written as float32 TIFFs and the viewer opens with the second
+/// one as the `--compare` stack, on the single-image view. Everything is
+/// cleaned up when the viewer closes.
+pub struct CompareJob {
+    rx: Receiver<Result<(), String>>,
+}
+
+impl CompareJob {
+    pub fn start(
+        before: Arc<LoadedStack>,
+        after: Arc<LoadedStack>,
+        use_ob: bool,
+        before_name: &'static str,
+        after_name: &'static str,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_compare_viewer(
+                &before,
+                &after,
+                use_ob,
+                before_name,
+                after_name,
+            ));
+        });
+        Self { rx }
+    }
+
+    pub fn poll(&mut self) -> Option<Result<(), String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+fn run_compare_viewer(
+    before: &LoadedStack,
+    after: &LoadedStack,
+    use_ob: bool,
+    before_name: &str,
+    after_name: &str,
+) -> Result<(), String> {
+    let base = scratch_dir(after, "compare")?;
+    // The folder names are what the viewer displays above each stack.
+    let before_dir = base.join(before_name);
+    let after_dir = base.join(after_name);
+    let cleanup = || {
+        remove_dir_files(&before_dir);
+        remove_dir_files(&after_dir);
+        let _ = std::fs::remove_dir(&base);
+    };
+    let (before_p, after_p) = if use_ob {
+        (&before.ob, &after.ob)
+    } else {
+        (&before.sample, &after.sample)
+    };
+    let run = || -> Result<(), String> {
+        write_projection_tiffs(&before_dir, before_p)?;
+        write_projection_tiffs(&after_dir, after_p)?;
+        let output = std::process::Command::new(TIFF_VIEWER_BIN)
+            .arg(&before_dir)
+            .arg("--compare")
+            .arg(&after_dir)
             .arg("--single-image")
             .output()
             .map_err(|e| format!("cannot launch {TIFF_VIEWER_BIN}: {e}"))?;

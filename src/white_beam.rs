@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
+use crate::instrument::Instrument;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WbDetector {
     IkonXl,
@@ -38,16 +40,33 @@ impl WbDetector {
         }
     }
 
-    /// Where the CT sample folders live, e.g.
-    /// `/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct`.
-    pub fn ct_root(self, ipts: &Path) -> PathBuf {
-        ipts.join("images").join(self.images_subdir()).join("raw/ct")
+    /// Where the CT sample folders live. VENUS splits by detector
+    /// (`/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct`); MARS has a single
+    /// camera layout (`/HFIR/CG1D/IPTS-xxxx/raw/ct_scans`).
+    pub fn ct_root(self, instrument: Instrument, ipts: &Path) -> PathBuf {
+        match instrument {
+            Instrument::Venus => ipts.join("images").join(self.images_subdir()).join("raw/ct"),
+            Instrument::Mars => ipts.join("raw/ct_scans"),
+        }
     }
 
     /// Where the open-beam folders live, e.g.
-    /// `/SNS/VENUS/IPTS-36573/images/ikonxl/ob`.
-    pub fn ob_root(self, ipts: &Path) -> PathBuf {
-        ipts.join("images").join(self.images_subdir()).join("ob")
+    /// `/SNS/VENUS/IPTS-36573/images/ikonxl/ob` or
+    /// `/HFIR/CG1D/IPTS-xxxx/raw/ob`.
+    pub fn ob_root(self, instrument: Instrument, ipts: &Path) -> PathBuf {
+        match instrument {
+            Instrument::Venus => ipts.join("images").join(self.images_subdir()).join("ob"),
+            Instrument::Mars => ipts.join("raw/ob"),
+        }
+    }
+
+    /// Where the dark-current folders live, when the instrument records
+    /// them: `/HFIR/CG1D/IPTS-xxxx/raw/dc` on MARS, nothing on VENUS.
+    pub fn dc_root(self, instrument: Instrument, ipts: &Path) -> Option<PathBuf> {
+        match instrument {
+            Instrument::Venus => None,
+            Instrument::Mars => Some(ipts.join("raw/dc")),
+        }
     }
 }
 
@@ -449,17 +468,37 @@ mod tests {
     fn detector_roots() {
         let ipts = Path::new("/SNS/VENUS/IPTS-36573");
         assert_eq!(
-            WbDetector::IkonXl.ct_root(ipts),
+            WbDetector::IkonXl.ct_root(Instrument::Venus, ipts),
             Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct")
         );
         assert_eq!(
-            WbDetector::IkonXl.ob_root(ipts),
+            WbDetector::IkonXl.ob_root(Instrument::Venus, ipts),
             Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/ob")
         );
         assert_eq!(
-            WbDetector::Qhy.ct_root(ipts),
+            WbDetector::Qhy.ct_root(Instrument::Venus, ipts),
             Path::new("/SNS/VENUS/IPTS-36573/images/qhy/raw/ct")
         );
+        assert_eq!(WbDetector::IkonXl.dc_root(Instrument::Venus, ipts), None);
+    }
+
+    #[test]
+    fn mars_roots_ignore_the_detector() {
+        let ipts = Path::new("/HFIR/CG1D/IPTS-12345");
+        for d in WbDetector::ALL {
+            assert_eq!(
+                d.ct_root(Instrument::Mars, ipts),
+                Path::new("/HFIR/CG1D/IPTS-12345/raw/ct_scans")
+            );
+            assert_eq!(
+                d.ob_root(Instrument::Mars, ipts),
+                Path::new("/HFIR/CG1D/IPTS-12345/raw/ob")
+            );
+            assert_eq!(
+                d.dc_root(Instrument::Mars, ipts).as_deref(),
+                Some(Path::new("/HFIR/CG1D/IPTS-12345/raw/dc"))
+            );
+        }
     }
 
     #[test]

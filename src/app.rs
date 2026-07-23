@@ -14,7 +14,7 @@ use crate::crop::{CropJob, CropRect};
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
-use crate::normalize::{NormJob, NormSettings, RoiJob, VisualizeJob};
+use crate::normalize::{CompareJob, NormJob, NormSettings, RoiJob, VisualizeJob};
 use crate::rotate::{self, RotateJob};
 use crate::stripes::{self, StripeAlgo, StripeApplyJob, StripeTestJob};
 use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
@@ -1586,6 +1586,9 @@ struct StackView {
     /// The stack before cleaning (i.e. the crop output), kept so the
     /// cleaning can be re-run with different settings.
     uncleaned: Option<std::sync::Arc<LoadedStack>>,
+    /// Side-by-side before/after cleaning session in the TIFF viewer.
+    clean_compare_job: Option<CompareJob>,
+    clean_compare_error: Option<String>,
     /// Show the OB histogram instead of the sample one.
     hist_show_ob: bool,
     /// Edge-trimmed summed images for the histogram plots, keyed by
@@ -1705,6 +1708,8 @@ impl StackView {
             clean_job: None,
             clean_stats: None,
             uncleaned: None,
+            clean_compare_job: None,
+            clean_compare_error: None,
             hist_show_ob: false,
             sum_cache: Vec::new(),
             sum_jobs: Vec::new(),
@@ -1899,6 +1904,9 @@ struct WhiteBeamView {
     detector: WbDetector,
     sample: MultiFolderPick,
     ob: MultiFolderPick,
+    /// Dark-current picker, on the instruments that record one (MARS).
+    /// Selecting folders is optional even there.
+    dc: Option<MultiFolderPick>,
 
     // Projection angle retrieval.
     angle_source: AngleSource,
@@ -1979,26 +1987,39 @@ impl WhiteBeamView {
     }
 
     fn with_detector(detector: WbDetector, session: &Session) -> Self {
-        let sample = MultiFolderPick::new("sample", detector.ct_root(&session.ipts.path));
-        let ob = MultiFolderPick::new("open beam", detector.ob_root(&session.ipts.path));
+        let instrument = session.instrument;
+        let sample =
+            MultiFolderPick::new("sample", detector.ct_root(instrument, &session.ipts.path));
+        let ob =
+            MultiFolderPick::new("open beam", detector.ob_root(instrument, &session.ipts.path));
+        let dc = detector
+            .dc_root(instrument, &session.ipts.path)
+            .map(|root| MultiFolderPick::new("dark current", root));
+        let describe = |pick: &MultiFolderPick| {
+            format!(
+                "{} ({})",
+                pick.root.display(),
+                match &pick.candidates {
+                    Ok(dirs) => format!("{} folders", dirs.len()),
+                    Err(_) => "unreadable".to_owned(),
+                }
+            )
+        };
         logger::log(format!(
-            "white beam detector: {} — sample root {} ({}), OB root {} ({})",
+            "white beam detector: {} — sample root {}, OB root {}{}",
             detector.label(),
-            sample.root.display(),
-            match &sample.candidates {
-                Ok(dirs) => format!("{} folders", dirs.len()),
-                Err(_) => "unreadable".to_owned(),
-            },
-            ob.root.display(),
-            match &ob.candidates {
-                Ok(dirs) => format!("{} folders", dirs.len()),
-                Err(_) => "unreadable".to_owned(),
+            describe(&sample),
+            describe(&ob),
+            match &dc {
+                Some(dc) => format!(", DC root {}", describe(dc)),
+                None => String::new(),
             },
         ));
         Self {
             detector,
             sample,
             ob,
+            dc,
             angle_source: AngleSource::NamingConvention,
             nc_example: None,
             nc_fields: Vec::new(),
@@ -3300,6 +3321,8 @@ fn stack_ui(
             view.crop_error = None;
             view.uncleaned = None;
             view.clean_stats = None;
+            view.clean_compare_job = None;
+            view.clean_compare_error = None;
             view.sum_cache.clear();
             view.sum_jobs.clear();
             view.hist_cache.clear();
@@ -3837,6 +3860,69 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 .weak()
                 .size(11.0),
         );
+
+        // Compare the data before / after the cleaning in the TIFF viewer.
+        if let Some(job) = &mut view.clean_compare_job {
+            match job.poll() {
+                Some(Ok(())) => {
+                    logger::log("before/after cleaning viewer closed");
+                    view.clean_compare_job = None;
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("comparing before/after cleaning failed: {e}"));
+                    view.clean_compare_error = Some(e);
+                    view.clean_compare_job = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("TIFF viewer is open on the before/after comparison");
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+            }
+        }
+        if view.clean_compare_job.is_none()
+            && let Some(before) = &view.uncleaned
+        {
+            let hover = "opens rust_tiff_viewer with the pre-cleaning and cleaned stacks \
+                         side by side (same colorscale, single-image view)";
+            let mut launch: Option<(bool, &'static str, &'static str)> = None;
+            ui.horizontal(|ui| {
+                if ui
+                    .button("👁 Compare sample before / after cleaning")
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    launch = Some((false, "sample_before_cleaning", "sample_after_cleaning"));
+                }
+                if !before.ob.is_empty()
+                    && ui
+                        .button("👁 Compare OB before / after cleaning")
+                        .on_hover_text(hover)
+                        .clicked()
+                {
+                    launch = Some((true, "ob_before_cleaning", "ob_after_cleaning"));
+                }
+            });
+            if let Some((use_ob, before_name, after_name)) = launch {
+                logger::log(format!(
+                    "opening the TIFF viewer on the before/after cleaning comparison ({})",
+                    if use_ob { "OB" } else { "sample" }
+                ));
+                view.clean_compare_error = None;
+                view.clean_compare_job = Some(CompareJob::start(
+                    std::sync::Arc::clone(before),
+                    std::sync::Arc::clone(&view.stack),
+                    use_ob,
+                    before_name,
+                    after_name,
+                ));
+            }
+        }
+        if let Some(e) = &view.clean_compare_error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
     }
 }
 
@@ -5522,20 +5608,23 @@ fn workflow_ui(
 
 fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     // Detector — it decides where the sample and OB folders are looked for,
-    // so changing it rebuilds both pickers.
+    // so changing it rebuilds the pickers. MARS has a single camera layout,
+    // so the selector only appears on VENUS.
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Detector:").strong());
-        let mut detector = view.detector;
-        egui::ComboBox::from_id_salt("wb_detector")
-            .selected_text(detector.label())
-            .show_ui(ui, |ui| {
-                for d in WbDetector::ALL {
-                    ui.selectable_value(&mut detector, d, d.label());
-                }
-            });
-        if detector != view.detector {
-            logger::log(format!("white beam detector changed: {}", detector.label()));
-            *view = WhiteBeamView::with_detector(detector, session);
+        if session.instrument == Instrument::Venus {
+            ui.label(RichText::new("Detector:").strong());
+            let mut detector = view.detector;
+            egui::ComboBox::from_id_salt("wb_detector")
+                .selected_text(detector.label())
+                .show_ui(ui, |ui| {
+                    for d in WbDetector::ALL {
+                        ui.selectable_value(&mut detector, d, d.label());
+                    }
+                });
+            if detector != view.detector {
+                logger::log(format!("white beam detector changed: {}", detector.label()));
+                *view = WhiteBeamView::with_detector(detector, session);
+            }
         }
         ui.label(
             RichText::new("one image per projection")
@@ -5547,9 +5636,18 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
     ui.separator();
     ui.add_space(10.0);
 
-    ui.columns(2, |cols| {
+    let n_cols = if view.dc.is_some() { 3 } else { 2 };
+    ui.columns(n_cols, |cols| {
         view.sample.ui(&mut cols[0]);
         view.ob.ui(&mut cols[1]);
+        if let Some(dc) = &mut view.dc {
+            dc.ui(&mut cols[2]);
+            cols[2].label(
+                RichText::new("optional — skips the dark-current correction when empty")
+                    .weak()
+                    .size(11.0),
+            );
+        }
     });
 
     ui.add_space(10.0);
@@ -5653,8 +5751,14 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
         Ok(runs) => {
             let total: usize = view.sample.total_files();
+            let dc_note = match &view.dc {
+                Some(dc) if dc.total_files() > 0 => {
+                    format!(" and {} dark current images", dc.total_files())
+                }
+                _ => String::new(),
+            };
             ui.label(format!(
-                "{} of {total} projections will be saved (exclusions and coverage applied), plus {} ob images",
+                "{} of {total} projections will be saved (exclusions and coverage applied), plus {} ob images{dc_note}",
                 runs.len(),
                 view.ob.total_files()
             ));
@@ -5665,38 +5769,46 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     if ui
         .add_enabled(
             selection.is_ok() && !busy,
-            egui::Button::new("▶ Read & stack the projections"),
+            // MARS has one image per projection: nothing gets combined.
+            egui::Button::new(match session.instrument {
+                Instrument::Venus => "▶ Read & stack the projections",
+                Instrument::Mars => "▶ Read the projections",
+            }),
         )
         .clicked()
         && let Ok(sample_runs) = selection
     {
-        let ob_runs: Vec<RunToCombine> = view
-            .ob
-            .selected
-            .iter()
-            .flat_map(|(_, files, _)| files.iter())
-            .map(|file| RunToCombine {
-                name: file
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                run_number: tof::run_number(
-                    &file.file_name().unwrap_or_default().to_string_lossy(),
-                ),
-                images: vec![file.clone()],
-                angle_deg: None,
-            })
-            .collect();
+        let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
+            pick.selected
+                .iter()
+                .flat_map(|(_, files, _)| files.iter())
+                .map(|file| RunToCombine {
+                    name: file
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    run_number: tof::run_number(
+                        &file.file_name().unwrap_or_default().to_string_lossy(),
+                    ),
+                    images: vec![file.clone()],
+                    angle_deg: None,
+                })
+                .collect()
+        };
+        let ob_runs = one_run_per_file(&view.ob);
+        let dc_runs = view.dc.as_ref().map(one_run_per_file).unwrap_or_default();
         logger::log(format!(
-            "reading white beam stack: {} projections, {} ob images",
+            "reading white beam stack: {} projections, {} ob images, {} dc images",
             sample_runs.len(),
-            ob_runs.len()
+            ob_runs.len(),
+            dc_runs.len()
         ));
         view.processed = None;
         view.save_status = None;
         view.process = Some(CombineScan::start(
             sample_runs,
             ob_runs,
+            dc_runs,
             ImageSelection::All,
             false,
         ));
@@ -5711,13 +5823,18 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             .unwrap_or_else(|| "?".to_owned());
         ui.label(
             RichText::new(format!(
-                "stacked: {} projections ({dims}), angles {} — {} ob images",
+                "stacked: {} projections ({dims}), angles {} — {} ob images{}",
                 output.sample.len(),
                 match (angles.first(), angles.last()) {
                     (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
                     _ => "unknown".to_owned(),
                 },
-                output.ob.len()
+                output.ob.len(),
+                if output.dc.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} dc images", output.dc.len())
+                }
             ))
             .strong(),
         );
@@ -5749,9 +5866,18 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         let meta = SaveMeta {
             instrument: session.instrument.name().to_owned(),
             ipts: session.ipts.name.clone(),
-            detector: view.detector.label().to_owned(),
+            // MARS has a single camera — no detector was picked there.
+            detector: match session.instrument {
+                Instrument::Venus => view.detector.label().to_owned(),
+                Instrument::Mars => "CCD".to_owned(),
+            },
             sample_folder: folder_list(&view.sample),
             ob_folder: folder_list(&view.ob),
+            dc_folder: view
+                .dc
+                .as_ref()
+                .filter(|dc| !dc.selected.is_empty())
+                .map(folder_list),
             combine_mode: mode,
             selections_json: None,
             detector_offset_us: None,
@@ -7106,6 +7232,7 @@ fn process_section_ui(
         view.process = Some(CombineScan::start(
             sample_runs,
             ob_runs,
+            Vec::new(),
             sel,
             view.merge_same_angle,
         ));
@@ -7161,6 +7288,7 @@ fn process_section_ui(
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            dc_folder: None,
             combine_mode: if view.combine_all {
                 "all images".to_owned()
             } else {

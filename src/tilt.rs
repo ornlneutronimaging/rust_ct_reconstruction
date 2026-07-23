@@ -394,6 +394,7 @@ impl TiltApplyJob {
                 path: stack.path.clone(),
                 sample,
                 ob: stack.ob.clone(),
+                dc: stack.dc.clone(),
                 metadata,
                 // The roll moves the rotation axis: a stored center is void.
                 center_of_rotation: None,

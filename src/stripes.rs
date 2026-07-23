@@ -360,6 +360,7 @@ impl StripeApplyJob {
                     path: stack.path.clone(),
                     sample,
                     ob: stack.ob.clone(),
+                    dc: stack.dc.clone(),
                     metadata,
                     center_of_rotation: stack.center_of_rotation,
                 })

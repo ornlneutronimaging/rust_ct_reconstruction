@@ -87,6 +87,8 @@ pub struct CombineOutput {
     /// by name).
     pub sample: Vec<Projection>,
     pub ob: Vec<Projection>,
+    /// Dark-current images (MARS only so far); empty when none were loaded.
+    pub dc: Vec<Projection>,
     /// Folders that could not be combined, with the reason.
     pub skipped: Vec<String>,
     /// How duplicate angles were resolved (merges or best-statistics picks).
@@ -272,6 +274,7 @@ impl CombineScan {
     pub fn start(
         sample: Vec<RunToCombine>,
         ob: Vec<RunToCombine>,
+        dc: Vec<RunToCombine>,
         selection: ImageSelection,
         combine_same_angle: bool,
     ) -> Self {
@@ -279,6 +282,7 @@ impl CombineScan {
         let total_images = sample
             .iter()
             .chain(&ob)
+            .chain(&dc)
             .map(|r| selection.pick(&r.images).len())
             .sum();
         let (tx, rx) = channel();
@@ -301,6 +305,7 @@ impl CombineScan {
             };
             let sample = run_all(sample);
             let ob = run_all(ob);
+            let dc = run_all(dc);
             let (mut sample, notes) = resolve_duplicate_angles(sample, combine_same_angle);
             // Increasing angle; folders without an angle go last, by name.
             sample.sort_by(|a, b| match (a.angle_deg, b.angle_deg) {
@@ -312,6 +317,7 @@ impl CombineScan {
             let _ = tx.send(CombineOutput {
                 sample,
                 ob,
+                dc,
                 skipped,
                 notes,
             });
@@ -340,6 +346,8 @@ pub struct SaveMeta {
     pub detector: String,
     pub sample_folder: String,
     pub ob_folder: String,
+    /// Dark-current folder(s), when the instrument provides them.
+    pub dc_folder: Option<String>,
     pub combine_mode: String,
     pub selections_json: Option<String>,
     pub detector_offset_us: Option<f64>,
@@ -441,6 +449,9 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
     if !output.ob.is_empty() {
         write_stack(&file, Some("ob"), &output.ob)?;
     }
+    if !output.dc.is_empty() {
+        write_stack(&file, Some("dc"), &output.dc)?;
+    }
     let metadata = file
         .create_group("metadata")
         .map_err(|e| format!("create metadata group: {e}"))?;
@@ -461,6 +472,9 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
     put("detector", &meta.detector)?;
     put("sample_folder", &meta.sample_folder)?;
     put("ob_folder", &meta.ob_folder)?;
+    if let Some(dc_folder) = &meta.dc_folder {
+        put("dc_folder", dc_folder)?;
+    }
     put("combine_mode", &meta.combine_mode)?;
     if let Some(json) = &meta.selections_json {
         put("tof_selections_json", json)?;
@@ -473,12 +487,17 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
             .map_err(|e| format!("write metadata/detector_offset_us: {e}"))?;
     }
     Ok(format!(
-        "{} — {} projections ({}x{}), {} ob",
+        "{} — {} projections ({}x{}), {} ob{}",
         path.display(),
         output.sample.len(),
         output.sample[0].height,
         output.sample[0].width,
-        output.ob.len()
+        output.ob.len(),
+        if output.dc.is_empty() {
+            String::new()
+        } else {
+            format!(", {} dc", output.dc.len())
+        }
     ))
 }
 
@@ -500,6 +519,9 @@ pub fn stack_from_output(
         ("ob_folder".to_owned(), meta.ob_folder.clone()),
         ("combine_mode".to_owned(), meta.combine_mode.clone()),
     ];
+    if let Some(dc_folder) = &meta.dc_folder {
+        metadata.push(("dc_folder".to_owned(), dc_folder.clone()));
+    }
     if let Some(json) = &meta.selections_json {
         metadata.push(("tof_selections_json".to_owned(), json.clone()));
     }
@@ -511,6 +533,7 @@ pub fn stack_from_output(
         path: pseudo_path,
         sample: output.sample.clone(),
         ob: output.ob.clone(),
+        dc: output.dc.clone(),
         metadata,
         center_of_rotation: None,
     }
@@ -522,6 +545,8 @@ pub struct LoadedStack {
     /// Projections in file order (increasing angle when saved by this app).
     pub sample: Vec<Projection>,
     pub ob: Vec<Projection>,
+    /// Dark-current images (empty when the file has none).
+    pub dc: Vec<Projection>,
     /// `/metadata` entries as (name, value) strings, sorted by name.
     pub metadata: Vec<(String, String)>,
     /// `/center_of_rotation` (px), when the file carries one.
@@ -593,6 +618,10 @@ pub fn load_hdf5(path: &Path) -> Result<LoadedStack, String> {
         Ok(group) => read_stack(&group, "ob")?,
         Err(_) => Vec::new(),
     };
+    let dc = match file.group("dc") {
+        Ok(group) => read_stack(&group, "dc")?,
+        Err(_) => Vec::new(),
+    };
     let mut metadata = Vec::new();
     if let Ok(group) = file.group("metadata") {
         for name in group.member_names().unwrap_or_default() {
@@ -615,6 +644,7 @@ pub fn load_hdf5(path: &Path) -> Result<LoadedStack, String> {
         path: path.to_path_buf(),
         sample,
         ob,
+        dc,
         metadata,
         center_of_rotation,
     })
@@ -638,6 +668,9 @@ pub fn save_stack_hdf5(
     write_stack(&file, None, &stack.sample)?;
     if !stack.ob.is_empty() {
         write_stack(&file, Some("ob"), &stack.ob)?;
+    }
+    if !stack.dc.is_empty() {
+        write_stack(&file, Some("dc"), &stack.dc)?;
     }
     if let Some(cor) = center_of_rotation {
         file.new_dataset::<f64>()
@@ -670,12 +703,17 @@ pub fn save_stack_hdf5(
             .map_err(|e| format!("write metadata/{name}: {e}"))?;
     }
     Ok(format!(
-        "{} — {} projections ({}x{}), {} ob",
+        "{} — {} projections ({}x{}), {} ob{}",
         path.display(),
         stack.sample.len(),
         stack.sample[0].height,
         stack.sample[0].width,
-        stack.ob.len()
+        stack.ob.len(),
+        if stack.dc.is_empty() {
+            String::new()
+        } else {
+            format!(", {} dc", stack.dc.len())
+        }
     ))
 }
 
@@ -825,6 +863,7 @@ mod tests {
                 projection("p2", None, 1, 0.5, 10.0),
             ],
             ob: vec![projection("ob0", None, 2, 4.0, 50.0)],
+            dc: vec![projection("dc0", None, 5, 0.1, 2.0)],
             skipped: Vec::new(),
             notes: Vec::new(),
         };
@@ -834,6 +873,7 @@ mod tests {
             detector: "IkonXL".to_owned(),
             sample_folder: "/a".to_owned(),
             ob_folder: "/b".to_owned(),
+            dc_folder: Some("/c".to_owned()),
             combine_mode: "test".to_owned(),
             selections_json: None,
             detector_offset_us: Some(12.5),
@@ -847,6 +887,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(loaded.sample.len(), 3);
         assert_eq!(loaded.ob.len(), 1);
+        assert_eq!(loaded.dc.len(), 1);
+        assert_eq!(loaded.dc[0].name, "dc0");
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "dc_folder" && v == "/c"));
         assert_eq!(loaded.sample[0].name, "p0");
         assert_eq!(loaded.sample[1].angle_deg, Some(90.5));
         assert_eq!(loaded.sample[2].angle_deg, None);
@@ -869,6 +915,7 @@ mod tests {
             path: PathBuf::from("/x.h5"),
             sample: vec![projection("p0", Some(0.0), 1, 0.5, 10.0)],
             ob: Vec::new(),
+            dc: Vec::new(),
             metadata: vec![("normalization".to_owned(), "NeuNorm".to_owned())],
             center_of_rotation: None,
         };

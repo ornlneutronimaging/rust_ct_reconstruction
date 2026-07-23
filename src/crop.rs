@@ -22,6 +22,18 @@ pub struct CropRect {
     pub height: usize,
 }
 
+/// Indices of the projections handed to the crop tool: everything when the
+/// stack has 100 projections or fewer, an evenly distributed ~10% subset
+/// beyond that — enough to check the region against the whole scan without
+/// writing (and having the tool load) many GB.
+pub fn crop_subset_indices(n: usize, seed: u64) -> Vec<usize> {
+    if n > 100 {
+        subsample_indices(n, 0.10, seed)
+    } else {
+        (0..n).collect()
+    }
+}
+
 /// Evenly distributed random subset of about `fraction` of `n` projections:
 /// one random pick per stratum, so the subset covers the whole scan. At
 /// least 20 (or all when fewer exist) so the crop tool's projections stay
@@ -236,6 +248,8 @@ pub fn apply_crop(stack: &LoadedStack, rect: &CropRect) -> Result<LoadedStack, S
         stack.sample.iter().map(|p| crop_projection(p, rect)).collect();
     let ob: Result<Vec<Projection>, String> =
         stack.ob.iter().map(|p| crop_projection(p, rect)).collect();
+    let dc: Result<Vec<Projection>, String> =
+        stack.dc.iter().map(|p| crop_projection(p, rect)).collect();
     let mut metadata = stack.metadata.clone();
     metadata.retain(|(name, _)| name != "crop");
     metadata.push((
@@ -247,6 +261,7 @@ pub fn apply_crop(stack: &LoadedStack, rect: &CropRect) -> Result<LoadedStack, S
         path: stack.path.clone(),
         sample: sample?,
         ob: ob?,
+        dc: dc?,
         metadata,
         // The crop moves the x coordinates: a stored center of rotation is void.
         center_of_rotation: None,
@@ -278,14 +293,11 @@ fn run_crop_tool(
     stack: &LoadedStack,
     initial: Option<CropRect>,
 ) -> Result<Option<(CropRect, LoadedStack)>, String> {
-    // Only an evenly distributed random subset (~10%) of the projections is
-    // handed to the crop tool — enough to check the region against the whole
-    // scan without writing (and having the tool load) many GB.
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    let indices = subsample_indices(stack.sample.len(), 0.10, seed);
+    let indices = crop_subset_indices(stack.sample.len(), seed);
     let subset: Vec<&Projection> = indices.iter().map(|&i| &stack.sample[i]).collect();
 
     // Scratch space next to the loaded HDF5 (a filesystem known to be big
@@ -344,9 +356,16 @@ fn run_crop_tool_in(
         .arg("--instructions")
         .arg(format!(
             "Draw the crop region for the CT reconstruction; it will also be applied to the \
-             open beams. Showing {} of {} projections (evenly sub-sampled).",
-            subset.len(),
-            stack.sample.len()
+             open beams. {}",
+            if subset.len() == stack.sample.len() {
+                format!("Showing all {} projections.", subset.len())
+            } else {
+                format!(
+                    "Showing {} of {} projections (evenly sub-sampled).",
+                    subset.len(),
+                    stack.sample.len()
+                )
+            }
         ));
     if let Some(rect) = initial {
         cmd.arg("-c")
@@ -423,6 +442,7 @@ mod tests {
             path: std::path::PathBuf::from("/x.h5"),
             sample: vec![projection("s", 4, 3)],
             ob: vec![projection("ob", 4, 3)],
+            dc: vec![projection("dc", 4, 3)],
             metadata: vec![("method".to_owned(), "mean".to_owned())],
             center_of_rotation: None,
         };
@@ -430,6 +450,7 @@ mod tests {
         let cropped = apply_crop(&stack, &rect).unwrap();
         assert_eq!(cropped.sample[0].width, 2);
         assert_eq!(cropped.ob[0].width, 2);
+        assert_eq!(cropped.dc[0].width, 2);
         assert!(cropped
             .metadata
             .iter()
@@ -450,6 +471,17 @@ mod tests {
         // Small stacks are passed whole.
         assert_eq!(subsample_indices(15, 0.10, 7), (0..15).collect::<Vec<_>>());
         assert!(subsample_indices(0, 0.10, 7).is_empty());
+    }
+
+    #[test]
+    fn crop_tool_gets_everything_up_to_100_projections() {
+        assert_eq!(crop_subset_indices(100, 42), (0..100).collect::<Vec<_>>());
+        assert_eq!(crop_subset_indices(1, 42), vec![0]);
+        assert!(crop_subset_indices(0, 42).is_empty());
+        // Above the threshold only the ~10% subset goes to the tool.
+        let picked = crop_subset_indices(400, 42);
+        assert!(picked.len() >= 40, "{}", picked.len());
+        assert!(picked.len() <= 50, "{}", picked.len());
     }
 
     #[test]

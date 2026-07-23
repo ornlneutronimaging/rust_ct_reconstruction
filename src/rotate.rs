@@ -81,6 +81,7 @@ impl RotateJob {
                 path: baseline.path.clone(),
                 sample: rotate_all(&baseline.sample),
                 ob: rotate_all(&baseline.ob),
+                dc: rotate_all(&baseline.dc),
                 metadata,
                 // A quarter turn changes the geometry: any stored center of
                 // rotation is void.

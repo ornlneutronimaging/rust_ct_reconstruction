@@ -229,7 +229,7 @@ impl CleanJob {
         let (tx, rx) = channel();
         let progress = Arc::new(AtomicUsize::new(0));
         let thread_progress = Arc::clone(&progress);
-        let total = stack.sample.len() + stack.ob.len();
+        let total = stack.sample.len() + stack.ob.len() + stack.dc.len();
         std::thread::spawn(move || {
             let run = |projections: &[Projection]| -> (Vec<Projection>, CleanStats) {
                 let results: Vec<(Projection, CleanStats)> = projections
@@ -254,11 +254,20 @@ impl CleanJob {
             };
             let (sample, sample_stats) = run(&stack.sample);
             let (ob, ob_stats) = run(&stack.ob);
+            let (dc, dc_stats) = run(&stack.dc);
             let stats = CleanStats {
-                in_house_replaced: sample_stats.in_house_replaced + ob_stats.in_house_replaced,
-                tomopy_replaced: sample_stats.tomopy_replaced + ob_stats.tomopy_replaced,
-                scipy_applied: sample_stats.scipy_applied || ob_stats.scipy_applied,
-                morph_replaced: sample_stats.morph_replaced + ob_stats.morph_replaced,
+                in_house_replaced: sample_stats.in_house_replaced
+                    + ob_stats.in_house_replaced
+                    + dc_stats.in_house_replaced,
+                tomopy_replaced: sample_stats.tomopy_replaced
+                    + ob_stats.tomopy_replaced
+                    + dc_stats.tomopy_replaced,
+                scipy_applied: sample_stats.scipy_applied
+                    || ob_stats.scipy_applied
+                    || dc_stats.scipy_applied,
+                morph_replaced: sample_stats.morph_replaced
+                    + ob_stats.morph_replaced
+                    + dc_stats.morph_replaced,
             };
             let mut metadata = stack.metadata.clone();
             metadata.retain(|(name, _)| name != "outlier_removal");
@@ -268,6 +277,7 @@ impl CleanJob {
                 path: stack.path.clone(),
                 sample,
                 ob,
+                dc,
                 metadata,
                 center_of_rotation: stack.center_of_rotation,
             };
@@ -365,6 +375,7 @@ impl LogConvertJob {
                     path: stack.path.clone(),
                     sample,
                     ob: stack.ob.clone(),
+                    dc: stack.dc.clone(),
                     metadata,
                     center_of_rotation: stack.center_of_rotation,
                 },
