@@ -75,6 +75,73 @@ enum Screen {
     Recon(ReconView),
 }
 
+/// The steps of the pipeline shown in the progress strip at the top of
+/// every screen.
+const PIPELINE_STEPS: [&str; 4] = ["Setup", "Load", "Pre-processing", "Reconstruction"];
+
+/// A slim progress strip: the four pipeline steps with the completed ones
+/// checked in green, the current one highlighted, and the upcoming ones
+/// dimmed.
+fn pipeline_bar(ui: &mut egui::Ui, current: usize) {
+    let done_color = Color32::from_rgb(120, 200, 120);
+    let current_color = Color32::from_rgb(100, 170, 255);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (i, name) in PIPELINE_STEPS.iter().enumerate() {
+            if i > 0 {
+                let (rect, _) = ui
+                    .allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::hover());
+                let color = if i <= current {
+                    done_color
+                } else {
+                    Color32::from_gray(80)
+                };
+                let y = rect.center().y;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left() + 2.0, y),
+                        egui::pos2(rect.right() - 2.0, y),
+                    ],
+                    egui::Stroke::new(2.0, color),
+                );
+            }
+            let (fill, mark_color) = if i < current {
+                (done_color, Color32::BLACK)
+            } else if i == current {
+                (current_color, Color32::BLACK)
+            } else {
+                (Color32::from_gray(70), Color32::from_gray(170))
+            };
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            let center = rect.center();
+            ui.painter().circle_filled(center, 9.0, fill);
+            ui.painter().text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                if i < current {
+                    "✔".to_owned()
+                } else {
+                    (i + 1).to_string()
+                },
+                egui::FontId::proportional(11.0),
+                mark_color,
+            );
+            let label = if i < current {
+                RichText::new(*name).color(done_color).size(12.0)
+            } else if i == current {
+                RichText::new(*name).strong().color(current_color).size(13.0)
+            } else {
+                RichText::new(*name).weak().size(12.0)
+            };
+            ui.label(label);
+        }
+    });
+    ui.add_space(2.0);
+    ui.separator();
+    ui.add_space(4.0);
+}
+
 /// Navigation requested by a screen's header buttons.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nav {
@@ -522,6 +589,7 @@ fn recon_ui(
     log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
+    pipeline_bar(ui, 3);
     ui.horizontal(|ui| {
         nav = nav_buttons(ui);
         ui.label(
@@ -2667,6 +2735,7 @@ impl CtApp {
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        pipeline_bar(ui, 0);
         top_right_bar(ui, self.logo.as_ref(), &mut self.log_view_open, LOGO_MAX_HEIGHT);
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
@@ -3152,6 +3221,7 @@ fn stack_ui(
     log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
+    pipeline_bar(ui, 2);
     let title_name = view
         .stack
         .path
@@ -5315,6 +5385,7 @@ fn workflow_ui(
     log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
+    pipeline_bar(ui, 1);
     // One compact header row: navigation, session recap, log toggle and a
     // small logo — the vertical space belongs to the workflow itself.
     ui.horizontal(|ui| {
