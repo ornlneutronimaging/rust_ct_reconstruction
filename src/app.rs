@@ -363,6 +363,67 @@ fn sample_base_name(stack: &LoadedStack) -> String {
         .unwrap_or_else(|| "reconstruction".to_owned())
 }
 
+/// Launch an external viewer binary on `dir` in a background thread; the
+/// receiver yields the outcome once the viewer exits.
+fn spawn_external_viewer(
+    bin: &'static str,
+    extra_args: &'static [&'static str],
+    dir: PathBuf,
+) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new(bin)
+            .arg(&dir)
+            .args(extra_args)
+            .output();
+        let name = Path::new(bin)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| bin.to_owned());
+        let _ = tx.send(match result {
+            Err(e) => Err(format!("cannot launch {bin}: {e}")),
+            Ok(out) if !out.status.success() => Err(format!(
+                "{name} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Ok(_) => Ok(()),
+        });
+    });
+    rx
+}
+
+/// The `shared` folder of the IPTS experiment a stack came from, derived
+/// from the sample folder recorded in the checkpoint (or, failing that, the
+/// checkpoint file's own location); `None` when neither path sits under an
+/// existing `IPTS-*/shared`.
+fn ipts_shared_folder(stack: &LoadedStack) -> Option<PathBuf> {
+    let sample = stack
+        .metadata
+        .iter()
+        .find(|(name, _)| name == "sample_folder")
+        .and_then(|(_, value)| value.split(';').next())
+        .map(|p| PathBuf::from(p.trim()));
+    [sample, Some(stack.path.clone())]
+        .into_iter()
+        .flatten()
+        .find_map(|path| shared_under_ipts(&path))
+}
+
+/// `<...>/IPTS-xxxxx/shared` when `path` is inside an IPTS experiment folder
+/// and that shared folder exists.
+fn shared_under_ipts(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for comp in path.components() {
+        root.push(comp);
+        if comp.as_os_str().to_string_lossy().starts_with("IPTS-") {
+            let shared = root.join("shared");
+            return shared.is_dir().then_some(shared);
+        }
+    }
+    None
+}
+
 /// The valid job-count range for splitting `h` slices into jobs of at most
 /// `cap` slices with a fixed `overlap`: the smallest count whose longest job
 /// fits the cap, and the largest that keeps every job at least twice the
@@ -1043,7 +1104,12 @@ fn recon_ui(
                 if ui.button("📂 Select the output folder…").clicked() {
                     let mut dialog =
                         rfd::FileDialog::new().set_title("Select the output folder");
-                    if let Some(dir) = view.output_base.as_deref().filter(|p| p.is_dir()) {
+                    let start = view
+                        .output_base
+                        .clone()
+                        .filter(|p| p.is_dir())
+                        .or_else(|| ipts_shared_folder(&view.stack));
+                    if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(dir) = dialog.pick_folder() {
@@ -1254,34 +1320,31 @@ fn recon_ui(
                                 dir.display()
                             ));
                             view.viewer_error = None;
-                            let dir = dir.clone();
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            std::thread::spawn(move || {
-                                let result = std::process::Command::new(
-                                    crate::normalize::TIFF_VIEWER_BIN,
-                                )
-                                .arg(&dir)
-                                .arg("--single-image")
-                                .output();
-                                let _ = tx.send(match result {
-                                    Err(e) => Err(format!(
-                                        "cannot launch {}: {e}",
-                                        crate::normalize::TIFF_VIEWER_BIN
-                                    )),
-                                    Ok(out) if !out.status.success() => Err(format!(
-                                        "rust_tiff_viewer failed ({}): {}",
-                                        out.status,
-                                        String::from_utf8_lossy(&out.stderr).trim()
-                                    )),
-                                    Ok(_) => Ok(()),
-                                });
-                            });
-                            view.viewer_job = Some(rx);
+                            view.viewer_job = Some(spawn_external_viewer(
+                                crate::normalize::TIFF_VIEWER_BIN,
+                                &["--single-image"],
+                                dir.clone(),
+                            ));
                         }
-                        ui.add_enabled(false, egui::Button::new("📦 3D view"))
-                            .on_disabled_hover_text(
-                                "volume rendering of the reconstruction — coming soon",
-                            );
+                        if ui
+                            .add_enabled(!viewing, egui::Button::new("📦 3D view"))
+                            .on_hover_text(
+                                "volume rendering of the reconstruction in \
+                                 volume_3d_viewer",
+                            )
+                            .clicked()
+                        {
+                            logger::log(format!(
+                                "opening volume_3d_viewer on {}",
+                                dir.display()
+                            ));
+                            view.viewer_error = None;
+                            view.viewer_job = Some(spawn_external_viewer(
+                                crate::normalize::VOLUME_VIEWER_BIN,
+                                &[],
+                                dir.clone(),
+                            ));
+                        }
                         if viewing {
                             ui.spinner();
                             ui.label(RichText::new("viewer open").weak().size(11.0));

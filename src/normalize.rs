@@ -373,6 +373,10 @@ fn run_normalization(
 pub const TIFF_VIEWER_BIN: &str =
     "/SNS/VENUS/shared/software/git/rust_tiff_viewer/target/release/rust_tiff_viewer";
 
+/// The 3-D volume viewer of the sibling repo.
+pub const VOLUME_VIEWER_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_3d_visualization/target/release/volume_3d_viewer";
+
 fn write_tiff_f32(path: &Path, width: usize, height: usize, data: &[f32]) -> Result<(), String> {
     let file =
         std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
