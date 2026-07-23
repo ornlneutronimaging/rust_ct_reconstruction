@@ -25,6 +25,9 @@ pub struct TiltResult {
     pub slope: f64,
     pub intercept: f64,
     pub rows_used: usize,
+    /// Coefficient of determination of the (trimmed) fit; 1.0 = the
+    /// per-row shifts lie perfectly on the line.
+    pub r2: f64,
 }
 
 impl TiltResult {
@@ -87,22 +90,24 @@ pub fn find_cor(
         })
         .collect();
 
-    // Linear least-squares fit: shift = m * row + q.
-    let n = rows.len() as f64;
-    let mean_x = rows.iter().map(|&r| r as f64).sum::<f64>() / n;
-    let mean_y = shifts.iter().sum::<f64>() / n;
-    let mut cov = 0.0;
-    let mut var = 0.0;
-    for (&row, &shift) in rows.iter().zip(&shifts) {
-        let dx = row as f64 - mean_x;
-        cov += dx * (shift - mean_y);
-        var += dx * dx;
-    }
-    if var == 0.0 {
-        return Err("degenerate slice range for the tilt fit".to_owned());
-    }
-    let m = cov / var;
-    let q = mean_y - m * mean_x;
+    // Robust linear fit of shift = m * row + q, MuhRec-style: fit every
+    // sampled row, drop the worst 10% by residual, refit on the rest.
+    let points: Vec<(f64, f64)> = rows
+        .iter()
+        .zip(&shifts)
+        .map(|(&row, &shift)| (row as f64, shift))
+        .collect();
+    let (m, q, _) = linear_fit(&points).ok_or("degenerate slice range for the tilt fit")?;
+    let mut by_residual = points.clone();
+    by_residual.sort_by(|a, b| {
+        let ra = (a.1 - (m * a.0 + q)).abs();
+        let rb = (b.1 - (m * b.0 + q)).abs();
+        ra.total_cmp(&rb)
+    });
+    let keep = ((by_residual.len() as f64 * TRIM_FRACTION) as usize).max(2);
+    by_residual.truncate(keep);
+    let (m, q, r2) =
+        linear_fit(&by_residual).ok_or("degenerate slice range for the tilt fit")?;
     let tilt_deg = (0.5 * m).atan().to_degrees();
     let middle = (m * height as f64 * 0.5 + q).round() as i64;
     let shift_px = middle.div_euclid(2);
@@ -111,8 +116,47 @@ pub fn find_cor(
         shift_px,
         slope: m,
         intercept: q,
-        rows_used: rows.len(),
+        rows_used: keep,
+        r2,
     })
+}
+
+/// Fraction of the sampled rows kept for the trimmed refit (MuhRec keeps
+/// the best 90% by residual).
+const TRIM_FRACTION: f64 = 0.9;
+
+/// Ordinary least squares `y = m*x + q` over `(x, y)` points; returns
+/// `(m, q, r2)`, or `None` when the x values are degenerate.
+fn linear_fit(points: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    let n = points.len() as f64;
+    if points.len() < 2 {
+        return None;
+    }
+    let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / n;
+    let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut var = 0.0;
+    for (x, y) in points {
+        let dx = x - mean_x;
+        cov += dx * (y - mean_y);
+        var += dx * dx;
+    }
+    if var == 0.0 {
+        return None;
+    }
+    let m = cov / var;
+    let q = mean_y - m * mean_x;
+    let (mut ss_res, mut ss_tot) = (0.0, 0.0);
+    for (x, y) in points {
+        ss_res += (y - (m * x + q)).powi(2);
+        ss_tot += (y - mean_y).powi(2);
+    }
+    let r2 = if ss_tot == 0.0 {
+        1.0
+    } else {
+        1.0 - ss_res / ss_tot
+    };
+    Some((m, q, r2))
 }
 
 /// Center of rotation from the 0° / 180° projections: on each row of a band

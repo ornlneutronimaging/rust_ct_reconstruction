@@ -12,6 +12,7 @@ pub mod crop;
 pub mod instrument;
 pub mod ipts;
 pub mod logger;
+pub mod morph;
 pub mod normalize;
 pub mod recon_run;
 pub mod rotate;

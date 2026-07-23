@@ -142,6 +142,21 @@ fn pipeline_bar(ui: &mut egui::Ui, current: usize) {
     ui.add_space(4.0);
 }
 
+/// Default HDF5 file name carrying the workflow step: any previous
+/// `_step_*` marker of the stem is replaced, so the file name says where
+/// it was saved (and hence where loading it resumes).
+fn step_file_name(stem: &str, stage: &str) -> String {
+    let mut stem = stem;
+    for suffix in [
+        "_step_load",
+        "_step_pre_processing",
+        "_step_reconstruction",
+    ] {
+        stem = stem.trim_end_matches(suffix);
+    }
+    format!("{stem}_step_{stage}.h5")
+}
+
 /// Navigation requested by a screen's header buttons.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nav {
@@ -1267,9 +1282,41 @@ fn recon_ui(
                         .as_ref()
                         .map(|p| p.display().to_string()),
                 });
-                let path = view.path.clone();
-                let result = crate::recon_run::save_recon_settings(&path, &doc.to_string())
-                    .map(|()| format!("reconstruction setup saved into {}", path.display()));
+                // The file name carries the workflow step: rename the
+                // checkpoint to `_step_reconstruction` when saving here.
+                let mut path = view.path.clone();
+                let stem = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let renamed = path.with_file_name(step_file_name(&stem, "reconstruction"));
+                let mut rename_error = None;
+                if renamed != path {
+                    match std::fs::rename(&path, &renamed) {
+                        Ok(()) => {
+                            logger::log(format!(
+                                "checkpoint renamed to {}",
+                                renamed.display()
+                            ));
+                            view.path = renamed.clone();
+                            path = renamed;
+                        }
+                        Err(e) => {
+                            rename_error = Some(format!(
+                                "cannot rename {} to {}: {e}",
+                                path.display(),
+                                renamed.display()
+                            ));
+                        }
+                    }
+                }
+                let result = match rename_error {
+                    Some(e) => Err(e),
+                    None => crate::recon_run::save_recon_settings(&path, &doc.to_string())
+                        .map(|()| {
+                            format!("reconstruction setup saved into {}", path.display())
+                        }),
+                };
                 match &result {
                     Ok(msg) => logger::log(msg.clone()),
                     Err(e) => logger::error(format!("saving the setup failed: {e}")),
@@ -1756,6 +1803,7 @@ impl StackView {
                     slope: 2.0 * tilt_deg.to_radians().tan(),
                     intercept: 0.0,
                     rows_used: 0,
+                    r2: 1.0,
                 });
             }
         }
@@ -3505,12 +3553,12 @@ fn stack_ui(
                     .path
                     .file_stem()
                     .map(|n| {
-                        format!(
-                            "{}_preprocessed.h5",
-                            n.to_string_lossy().trim_end_matches("_preprocessed")
+                        step_file_name(
+                            n.to_string_lossy().trim_end_matches("_preprocessed"),
+                            "pre_processing",
                         )
                     })
-                    .unwrap_or_else(|| "ct_preprocessed.h5".to_owned());
+                    .unwrap_or_else(|| "ct_step_pre_processing.h5".to_owned());
                 let mut dialog = rfd::FileDialog::new()
                     .set_title("Save the pre-processed stack")
                     .add_filter("HDF5", &["h5", "hdf5"])
@@ -3575,10 +3623,12 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if let Some(job) = &mut view.clean_job {
         if let Some((cleaned, stats)) = job.poll() {
             logger::log(format!(
-                "outliers removed ({}): {} in-house, {} tomopy replacements{}",
+                "outliers removed ({}): {} in-house, {} tomopy, {} morphological \
+                 replacements{}",
                 view.clean_settings.describe(),
                 stats.in_house_replaced,
                 stats.tomopy_replaced,
+                stats.morph_replaced,
                 if stats.scipy_applied {
                     ", scipy filter applied"
                 } else {
@@ -3633,6 +3683,48 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
     ui.checkbox(&mut settings.scipy, "Scipy (median_filter)")
         .on_hover_text("every pixel is replaced by the 3x3 median of its image");
+    ui.checkbox(&mut settings.morph, "MuhRec (morphological spot clean)")
+        .on_hover_text(
+            "MuhRec's MorphSpotClean: spots are found by comparing with a morphological \
+             reconstruction that fills only true local extrema — real sample structure \
+             is left alone — and blended away with a smooth transition",
+        );
+    if settings.morph {
+        ui.indent("morph_settings", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("detect:");
+                egui::ComboBox::from_id_salt("morph_detect")
+                    .selected_text(settings.morph_detect.label())
+                    .show_ui(ui, |ui| {
+                        for detect in crate::morph::MorphDetect::ALL {
+                            ui.selectable_value(
+                                &mut settings.morph_detect,
+                                detect,
+                                detect.label(),
+                            );
+                        }
+                    });
+            });
+            ui.add(
+                egui::Slider::new(&mut settings.morph_threshold, 0.5..=0.999)
+                    .step_by(0.001)
+                    .text("threshold fraction"),
+            )
+            .on_hover_text(
+                "the detection threshold is the difference value below which this \
+                 fraction of all pixels lies — 0.95 touches at most 5% of the pixels",
+            );
+            ui.add(
+                egui::Slider::new(&mut settings.morph_sigma, 0.0..=0.2)
+                    .step_by(0.005)
+                    .text("transition width (sigma)"),
+            )
+            .on_hover_text(
+                "width of the smooth blend around the threshold, as a fraction of it; \
+                 0 = hard replacement",
+            );
+        });
+    }
 
     // Histogram of the edge-trimmed summed image, sample or ob, before and
     // (once cleaned) after — the excluded bins of the in-house method in red.
@@ -3730,6 +3822,12 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         }
         if stats.scipy_applied {
             parts.push("every pixel median-filtered by scipy".to_owned());
+        }
+        if view.clean_settings.morph {
+            parts.push(format!(
+                "{} pixels by the MuhRec morphological clean",
+                stats.morph_replaced
+            ));
         }
         ui.label(
             RichText::new(format!("cleaned (sample + ob): {}", parts.join(", "))).strong(),
@@ -4247,8 +4345,9 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         match job.poll() {
             Some(Ok(result)) => {
                 logger::log(format!(
-                    "tilt estimated: {:.4} deg, axis shift {} px ({} rows fitted)",
-                    result.tilt_deg, result.shift_px, result.rows_used
+                    "tilt estimated: {:.4} deg, axis shift {} px ({} rows fitted, \
+                     R²={:.4})",
+                    result.tilt_deg, result.shift_px, result.rows_used, result.r2
                 ));
                 view.tilt_result = Some(result);
                 view.tilt_preview_corrected = true;
@@ -4493,8 +4592,9 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         if let Some(result) = &view.tilt_result {
             ui.label(
                 RichText::new(format!(
-                    "tilt: {:.4}° — axis shift: {} px ({} rows fitted)",
-                    result.tilt_deg, result.shift_px, result.rows_used
+                    "tilt: {:.4}° — axis shift: {} px ({} rows fitted after trimming, \
+                     R² = {:.4})",
+                    result.tilt_deg, result.shift_px, result.rows_used, result.r2
                 ))
                 .strong(),
             );
@@ -5668,8 +5768,8 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                     .selected
                     .first()
                     .and_then(|(dir, ..)| dir.file_name())
-                    .map(|n| format!("{}_white_beam.h5", n.to_string_lossy()))
-                    .unwrap_or_else(|| "ct_white_beam.h5".to_owned());
+                    .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
+                    .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
                 let mut dialog = rfd::FileDialog::new()
                     .set_title("Save the white beam projections")
                     .add_filter("HDF5", &["h5", "hdf5"])
@@ -7085,8 +7185,8 @@ fn process_section_ui(
                     .selected
                     .as_deref()
                     .and_then(|p| p.file_name())
-                    .map(|n| format!("{}_combined.h5", n.to_string_lossy()))
-                    .unwrap_or_else(|| "ct_combined.h5".to_owned());
+                    .map(|n| step_file_name(&format!("{}_combined", n.to_string_lossy()), "load"))
+                    .unwrap_or_else(|| "ct_combined_step_load.h5".to_owned());
                 let mut dialog = rfd::FileDialog::new()
                     .set_title("Save the combined projections")
                     .add_filter("HDF5", &["h5", "hdf5"])

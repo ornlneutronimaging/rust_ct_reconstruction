@@ -31,6 +31,13 @@ pub struct CleanSettings {
     pub tomopy: bool,
     pub tomopy_diff: f32,
     pub scipy: bool,
+    /// MuhRec-style morphological spot cleaning (MorphSpotClean port).
+    pub morph: bool,
+    pub morph_detect: crate::morph::MorphDetect,
+    /// Cumulative-histogram fraction setting the detection threshold.
+    pub morph_threshold: f32,
+    /// Sigmoid transition width, as a fraction of the threshold.
+    pub morph_sigma: f32,
 }
 
 impl Default for CleanSettings {
@@ -44,13 +51,17 @@ impl Default for CleanSettings {
             tomopy: false,
             tomopy_diff: 20.0,
             scipy: false,
+            morph: false,
+            morph_detect: crate::morph::MorphDetect::Both,
+            morph_threshold: 0.95,
+            morph_sigma: 0.025,
         }
     }
 }
 
 impl CleanSettings {
     pub fn any_enabled(&self) -> bool {
-        self.in_house || self.tomopy || self.scipy
+        self.in_house || self.tomopy || self.scipy || self.morph
     }
 
     /// One line for the log and the HDF5 provenance.
@@ -67,6 +78,14 @@ impl CleanSettings {
         }
         if self.scipy {
             parts.push("scipy 3x3 median filter".to_owned());
+        }
+        if self.morph {
+            parts.push(format!(
+                "MuhRec morphological spot clean ({}, threshold fraction {}, sigma {})",
+                self.morph_detect.label(),
+                self.morph_threshold,
+                self.morph_sigma
+            ));
         }
         parts.join(" + ")
     }
@@ -165,6 +184,7 @@ pub struct CleanStats {
     pub in_house_replaced: usize,
     pub tomopy_replaced: usize,
     pub scipy_applied: bool,
+    pub morph_replaced: usize,
 }
 
 fn clean_projection(p: &mut Projection, s: &CleanSettings) -> CleanStats {
@@ -178,6 +198,18 @@ fn clean_projection(p: &mut Projection, s: &CleanSettings) -> CleanStats {
     if s.scipy {
         clean_scipy(p);
         stats.scipy_applied = true;
+    }
+    if s.morph {
+        let (cleaned, replaced) = crate::morph::morph_spot_clean(
+            &p.mean,
+            p.width,
+            p.height,
+            s.morph_detect,
+            s.morph_threshold,
+            s.morph_sigma,
+        );
+        p.mean = cleaned;
+        stats.morph_replaced = replaced;
     }
     let sum: f64 = p.mean.iter().map(|v| f64::from(*v)).sum();
     p.total_counts = sum * p.n_images_used.max(1) as f64;
@@ -215,6 +247,7 @@ impl CleanJob {
                     total.in_house_replaced += stats.in_house_replaced;
                     total.tomopy_replaced += stats.tomopy_replaced;
                     total.scipy_applied |= stats.scipy_applied;
+                    total.morph_replaced += stats.morph_replaced;
                     cleaned.push(p);
                 }
                 (cleaned, total)
@@ -225,6 +258,7 @@ impl CleanJob {
                 in_house_replaced: sample_stats.in_house_replaced + ob_stats.in_house_replaced,
                 tomopy_replaced: sample_stats.tomopy_replaced + ob_stats.tomopy_replaced,
                 scipy_applied: sample_stats.scipy_applied || ob_stats.scipy_applied,
+                morph_replaced: sample_stats.morph_replaced + ob_stats.morph_replaced,
             };
             let mut metadata = stack.metadata.clone();
             metadata.retain(|(name, _)| name != "outlier_removal");
