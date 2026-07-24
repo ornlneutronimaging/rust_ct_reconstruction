@@ -1694,9 +1694,8 @@ struct StackView {
     /// (stack pointer, is_ob). A small FIFO so before/after × sample/ob fit.
     sum_cache: Vec<((usize, bool), Vec<f32>)>,
     sum_jobs: Vec<((usize, bool), std::sync::mpsc::Receiver<Vec<f32>>)>,
-    /// Histograms of the summed images: key (stack, is_ob, bins, range
-    /// fingerprint — 0 for the data's own min/max).
-    hist_cache: Vec<((usize, bool, usize, u64), (f64, f64, Vec<u64>))>,
+    /// Histograms of the summed images, keyed by (stack, is_ob, bins).
+    hist_cache: Vec<((usize, bool, usize), (f64, f64, Vec<u64>))>,
 
     // Normalization (mandatory).
     norm_settings: NormSettings,
@@ -3881,68 +3880,41 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         });
     }
 
-    // Histogram of the edge-trimmed summed image, sample or ob, before and
-    // (once cleaned) after — the excluded bins of the in-house method in red.
-    let ob_available = !view.stack.ob.is_empty();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Histogram:").strong());
-        if ui.selectable_label(!view.hist_show_ob, "sample").clicked() {
-            view.hist_show_ob = false;
-        }
-        if ui
-            .add_enabled(
-                ob_available,
-                egui::Button::selectable(view.hist_show_ob, "ob"),
-            )
-            .clicked()
-        {
-            view.hist_show_ob = true;
-        }
-        if !ob_available {
-            ui.label(RichText::new("(no ob in this stack)").weak().size(11.0));
-        }
-    });
-    let use_ob = view.hist_show_ob && ob_available;
-    let before = view.clean_input();
-    let cleaned = (view.clean_stats.is_some() && view.uncleaned.is_some())
-        .then(|| std::sync::Arc::clone(&view.stack));
-    match cleaned {
-        None => {
-            stack_histogram_ui(ui, &ctx, view, &before, use_ob, "before cleaning", true, None);
-        }
-        Some(after) => {
-            ui.columns(2, |cols| {
-                stack_histogram_ui(
-                    &mut cols[0],
-                    &ctx,
-                    view,
-                    &before,
-                    use_ob,
-                    "before cleaning",
-                    true,
-                    None,
-                );
-                // Same bin edges as the before histogram, so the two compare
-                // bin for bin (only the red-marked tails should empty out).
-                let bins = view.clean_settings.nbr_bins;
-                let before_key = (std::sync::Arc::as_ptr(&before) as usize, use_ob, bins, 0u64);
-                let before_range = view
-                    .hist_cache
-                    .iter()
-                    .find(|(k, _)| *k == before_key)
-                    .map(|(_, (min, max, _))| (*min, *max));
-                stack_histogram_ui(
-                    &mut cols[1],
-                    &ctx,
-                    view,
-                    &after,
-                    use_ob,
-                    "after cleaning",
-                    false,
-                    before_range,
-                );
-            });
-        }
+    // Histogram of the edge-trimmed summed image (sample or ob), shown only
+    // while the in-house method is being set up: it exists to choose the
+    // excluded bins (red), and disappears once the cleaning has run. No
+    // after-cleaning histogram: the outliers define the bin range, so the
+    // before/after plots are never comparable and only confuse.
+    if view.clean_settings.in_house && view.clean_stats.is_none() {
+        let ob_available = !view.stack.ob.is_empty();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Histogram:").strong());
+            if ui.selectable_label(!view.hist_show_ob, "sample").clicked() {
+                view.hist_show_ob = false;
+            }
+            if ui
+                .add_enabled(
+                    ob_available,
+                    egui::Button::selectable(view.hist_show_ob, "ob"),
+                )
+                .clicked()
+            {
+                view.hist_show_ob = true;
+            }
+            if !ob_available {
+                ui.label(RichText::new("(no ob in this stack)").weak().size(11.0));
+            }
+        });
+        let use_ob = view.hist_show_ob && ob_available;
+        let input = view.clean_input();
+        stack_histogram_ui(
+            ui,
+            &ctx,
+            view,
+            &input,
+            use_ob,
+            "summed image — pixels in the red bins get replaced",
+        );
     }
 
     let busy = view.clean_job.is_some();
@@ -4079,7 +4051,6 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// Histogram of the edge-trimmed summed image (sample or ob) of one stack,
 /// computed once per (stack, data type) on a background thread. The excluded
 /// bins of the in-house method are drawn in red.
-#[allow(clippy::too_many_arguments)]
 fn stack_histogram_ui(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -4087,8 +4058,6 @@ fn stack_histogram_ui(
     stack: &std::sync::Arc<LoadedStack>,
     use_ob: bool,
     title: &str,
-    mark_exclusions: bool,
-    range: Option<(f64, f64)>,
 ) {
     const EDGE_TRIM: usize = 10;
     ui.label(RichText::new(title).strong().size(13.0));
@@ -4165,18 +4134,10 @@ fn stack_histogram_ui(
     }
 
     let bins = view.clean_settings.nbr_bins;
-    // A fixed range (the before histogram's edges) is part of the key so a
-    // full-range entry cached earlier cannot shadow it.
-    let range_fingerprint = range
-        .map(|(lo, hi)| lo.to_bits() ^ hi.to_bits().rotate_left(1))
-        .unwrap_or(0);
-    let hist_key = (key.0, key.1, bins, range_fingerprint);
+    let hist_key = (key.0, key.1, bins);
     if !view.hist_cache.iter().any(|(k, _)| *k == hist_key) {
         let values = &view.sum_cache[index].1;
-        let (min, max, counts) = match range {
-            Some((lo, hi)) => clean::histogram_range(values, bins, lo, hi),
-            None => clean::histogram(values, bins),
-        };
+        let (min, max, counts) = clean::histogram(values, bins);
         if view.hist_cache.len() >= 8 {
             view.hist_cache.remove(0);
         }
@@ -4187,7 +4148,7 @@ fn stack_histogram_ui(
         return;
     };
     let bin_width = (max - min) / counts.len() as f64;
-    let mark_exclusions = mark_exclusions && view.clean_settings.in_house;
+    let mark_exclusions = view.clean_settings.in_house;
     let left = view.clean_settings.exclude_left;
     let right = view.clean_settings.exclude_right;
     let bars: Vec<egui_plot::Bar> = counts
