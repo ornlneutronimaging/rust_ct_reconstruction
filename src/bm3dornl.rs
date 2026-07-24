@@ -21,6 +21,9 @@ pub const INPUT_FILE: &str = "projections_for_bm3dornl.h5";
 /// Dataset holding the stack inside the exchange file.
 pub const INPUT_DATASET: &str = "projections";
 
+/// File the GUI's "Return data to main application" button writes.
+pub const RESULT_FILE: &str = "bm3dornl_result.h5";
+
 /// The visible exchange folder next to the checkpoint (file dialogs often
 /// hide dotted names, and the user has to browse into it from the tool).
 fn exchange_dir(stack: &LoadedStack) -> Result<PathBuf, String> {
@@ -263,8 +266,19 @@ fn run_tool(
     input_path: &Path,
 ) -> Result<Option<(LoadedStack, String)>, String> {
     let want = write_input(input_path, stack)?;
+    let return_path = dir.join(RESULT_FILE);
+    let _ = std::fs::remove_file(&return_path);
     let launched = SystemTime::now();
+    // The exchange file is passed on the command line: the tool loads the
+    // dataset immediately (with a progress bar) instead of the user
+    // browsing to it, and its "Return data to main application" button
+    // writes the processed volume to `return_path` and closes the tool.
     let output = std::process::Command::new(BM3DORNL_GUI_BIN)
+        .arg(input_path)
+        .arg("--dataset")
+        .arg(format!("/{INPUT_DATASET}"))
+        .arg("--called-from-app")
+        .arg(&return_path)
         .output()
         .map_err(|e| format!("cannot launch {BM3DORNL_GUI_BIN}: {e}"))?;
     if !output.status.success() {
@@ -274,7 +288,14 @@ fn run_tool(
             output.status
         ));
     }
-    let Some(result) = newest_result(dir, launched) else {
+    // The return button's file wins; a manual export into the exchange
+    // folder still works as a fallback.
+    let result = if return_path.is_file() {
+        Some(return_path)
+    } else {
+        newest_result(dir, launched)
+    };
+    let Some(result) = result else {
         let _ = std::fs::remove_file(input_path);
         let _ = std::fs::remove_dir(dir);
         return Ok(None);

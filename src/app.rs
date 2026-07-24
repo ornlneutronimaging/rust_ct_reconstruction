@@ -5007,8 +5007,8 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             Some(Ok(None)) => {
                 logger::log("bm3dornl tool closed without an exported result");
                 view.bm3d_error = Some(
-                    "the tool closed without an exported result — the data is unchanged \
-                     (export into the exchange folder before closing)"
+                    "the tool closed without returning a result — the data is unchanged \
+                     (use \"Return data to main application\" in the tool)"
                         .to_owned(),
                 );
                 view.bm3d_job = None;
@@ -5024,13 +5024,11 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     ui.label("bm3dornl tool is open");
                 });
                 ui.label(
-                    RichText::new(format!(
-                        "in the tool: open {} (dataset \"{}\"), denoise, then export the \
-                         processed data as HDF5 or TIFF into the same folder and close \
-                         the tool",
-                        job.input_path.display(),
-                        crate::bm3dornl::INPUT_DATASET,
-                    ))
+                    RichText::new(
+                        "the tool opens with the projections already loaded — denoise, \
+                         then press \"⏎ Return data to main application\" there to send \
+                         the result back here",
+                    )
                     .weak()
                     .size(11.0),
                 );
