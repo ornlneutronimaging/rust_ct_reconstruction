@@ -3492,13 +3492,13 @@ fn stack_ui(
          status: SectionStatus,
          body: &mut dyn FnMut(&mut egui::Ui, &mut StackView)| {
             let header = match status {
-                SectionStatus::NoStatus => RichText::new(title).strong(),
+                SectionStatus::NoStatus => {
+                    RichText::new(title).strong().color(Color32::from_gray(150))
+                }
                 SectionStatus::Done => RichText::new(format!("✔ {title}"))
                     .strong()
                     .color(Color32::from_rgb(120, 200, 120)),
-                SectionStatus::NotRun => RichText::new(format!("{title} — not run"))
-                    .strong()
-                    .color(Color32::from_gray(150)),
+                SectionStatus::NotRun => RichText::new(format!("{title} — not run")).strong(),
                 SectionStatus::Required => RichText::new(format!("{title} — required"))
                     .strong()
                     .color(Color32::from_rgb(240, 180, 60)),
