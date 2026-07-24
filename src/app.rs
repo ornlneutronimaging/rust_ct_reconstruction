@@ -3762,6 +3762,23 @@ fn stack_ui(
         }
     }
     ui.add_space(24.0);
+    // The same bottom-right `Next` pill as the earlier screens, enabled once
+    // the pre-processed checkpoint was saved; it continues to the
+    // reconstruction exactly like the `🚀 Reconstruction` button.
+    let ready = matches!(view.stack_save_status, Some(Ok(_)));
+    egui::Area::new(egui::Id::new("stack_next_button"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .show(ui.ctx(), |ui| {
+            let response = next_button_widget(ui, ready);
+            let response = if ready {
+                response.on_hover_text("continue to the reconstruction of the saved checkpoint")
+            } else {
+                response.on_hover_text("save the pre-processed stack to HDF5 first")
+            };
+            if response.clicked() {
+                view.goto_recon = true;
+            }
+        });
     nav
 }
 
@@ -5843,6 +5860,42 @@ fn workflow_ui(
                 .show(ui, |ui| tof_ui(ui, session, tof_view));
         }
     }
+    // The same bottom-right `Next` pill as the setup screen, enabled once
+    // the stack was saved to HDF5; it continues to pre-processing exactly
+    // like the button inside the save section. Clicking also reopens that
+    // section, whose UI drives the actual hand-over.
+    let (ready, pending) = match view {
+        WorkflowView::WhiteBeam(v) => (
+            matches!(v.save_status, Some(Ok(_))),
+            v.preprocess_pending == 0,
+        ),
+        WorkflowView::Tof(v) => (
+            matches!(v.save_status, Some(Ok(_))),
+            v.preprocess_pending == 0,
+        ),
+    };
+    egui::Area::new(egui::Id::new("workflow_next_button"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .show(ui.ctx(), |ui| {
+            let response = next_button_widget(ui, ready && pending);
+            let response = if ready {
+                response.on_hover_text("continue to pre-processing")
+            } else {
+                response.on_hover_text("save to HDF5 first")
+            };
+            if response.clicked() {
+                match view {
+                    WorkflowView::WhiteBeam(v) => {
+                        v.preprocess_pending = 1;
+                        v.open_section = Some(WbSection::Save);
+                    }
+                    WorkflowView::Tof(v) => {
+                        v.preprocess_pending = 1;
+                        v.open_section = Some(TofSection::Process);
+                    }
+                }
+            }
+        });
     nav
 }
 
