@@ -3964,6 +3964,24 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 .size(11.0),
         );
 
+        // The cleaning can remove too much: one click goes back to the
+        // data set as it was before the outlier removal.
+        if ui
+            .button("↺ Undo the cleaning")
+            .on_hover_text(
+                "discard the outlier removal and go back to the uncleaned data set",
+            )
+            .clicked()
+            && let Some(before) = view.uncleaned.take()
+        {
+            logger::log("outlier removal undone: back to the pre-cleaning stack");
+            view.stack = before;
+            view.clean_stats = None;
+            view.clean_compare_job = None;
+            view.clean_compare_error = None;
+            return;
+        }
+
         // Compare the data before / after the cleaning in the TIFF viewer.
         if let Some(job) = &mut view.clean_compare_job {
             match job.poll() {
