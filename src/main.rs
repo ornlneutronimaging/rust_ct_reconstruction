@@ -15,6 +15,19 @@ OPTIONS:
   -h, --help    Show this help
 ";
 
+/// Load the application icon from the embedded PNG (256x256 to keep the
+/// binary small).
+fn load_icon() -> Option<egui::IconData> {
+    let icon_bytes = include_bytes!("../logos/ImagingLogo_256.png");
+    let image = image::load_from_memory(icon_bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -34,13 +47,18 @@ fn main() -> eframe::Result<()> {
         eprintln!("Warning: logging disabled: {e}");
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        // Tall enough for the whole setup screen (instrument, IPTS list,
+        // mode buttons, load-HDF5 row, Next, admin bar) without scrolling.
+        .with_inner_size([1280.0, 1000.0])
+        .with_min_inner_size([900.0, 700.0])
+        .with_title("CT Reconstruction");
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            // Tall enough for the whole setup screen (instrument, IPTS list,
-            // mode buttons, load-HDF5 row, Next, admin bar) without scrolling.
-            .with_inner_size([1280.0, 1000.0])
-            .with_min_inner_size([900.0, 700.0])
-            .with_title("CT Reconstruction"),
+        viewport,
         ..Default::default()
     };
 
