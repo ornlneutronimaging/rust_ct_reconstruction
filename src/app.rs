@@ -1636,6 +1636,7 @@ enum StackSection {
     Crop,
     Clean,
     Normalize,
+    Bm3d,
     Stripes,
     Rotate,
     Tilt,
@@ -1680,6 +1681,13 @@ struct StackView {
     /// Side-by-side before/after cleaning session in the TIFF viewer.
     clean_compare_job: Option<CompareJob>,
     clean_compare_error: Option<String>,
+
+    // Ring artifact removal (bm3dornl tool).
+    bm3d_job: Option<crate::bm3dornl::Bm3dJob>,
+    bm3d_summary: Option<String>,
+    bm3d_error: Option<String>,
+    /// The stack before the bm3dornl denoising, kept so it can be undone.
+    unbm3d: Option<std::sync::Arc<LoadedStack>>,
     /// Show the OB histogram instead of the sample one.
     hist_show_ob: bool,
     /// Edge-trimmed summed images for the histogram plots, keyed by
@@ -1804,6 +1812,10 @@ impl StackView {
             uncleaned: None,
             clean_compare_job: None,
             clean_compare_error: None,
+            bm3d_job: None,
+            bm3d_summary: None,
+            bm3d_error: None,
+            unbm3d: None,
             hist_show_ob: false,
             sum_cache: Vec::new(),
             sum_jobs: Vec::new(),
@@ -1876,6 +1888,9 @@ impl StackView {
             view.unrotated = Some(std::sync::Arc::clone(&view.stack));
             view.norm_summary = Some(format!("restored from the loaded file ({desc})"));
             view.open_section = Some(StackSection::Rotate);
+        }
+        if let Some(desc) = meta("ring_artifact_removal") {
+            view.bm3d_summary = Some(format!("restored from the loaded file ({desc})"));
         }
         if let Some(rotation) = meta("rotation")
             && let Some(deg) = rotation
@@ -3417,6 +3432,10 @@ fn stack_ui(
             view.clean_stats = None;
             view.clean_compare_job = None;
             view.clean_compare_error = None;
+            view.bm3d_job = None;
+            view.bm3d_summary = None;
+            view.bm3d_error = None;
+            view.unbm3d = None;
             view.sum_cache.clear();
             view.sum_jobs.clear();
             view.hist_cache.clear();
@@ -3545,6 +3564,16 @@ fn stack_ui(
         },
     );
     if view.normalized {
+        section(
+            ui,
+            view,
+            StackSection::Bm3d,
+            "Ring artifact removal (bm3dornl)",
+            run_status(view.bm3d_summary.is_some()),
+            &mut |ui, view| {
+                bm3d_section_ui(ui, view);
+            },
+        );
         section(
             ui,
             view,
@@ -4948,6 +4977,115 @@ fn log_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             view.stack.sample.len()
         ));
         view.log_job = Some(LogConvertJob::start(std::sync::Arc::clone(&view.stack)));
+    }
+}
+
+/// "Ring artifact removal (bm3dornl)": the sample stack is handed to the
+/// sibling bm3dornl GUI as an exchange HDF5 file; the user denoises it
+/// there, exports the result into the same folder, and closing the tool
+/// imports it back in place of the sample stack.
+fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    ui.label(
+        RichText::new(
+            "BM3D denoising specialized for streak/ring artifacts — the data is edited \
+             in the standalone bm3dornl tool and imported back here",
+        )
+        .weak()
+        .size(11.0),
+    );
+
+    if let Some(job) = &mut view.bm3d_job {
+        match job.poll() {
+            Some(Ok(Some((denoised, summary)))) => {
+                logger::log(format!("bm3dornl import: {summary}"));
+                view.unbm3d = Some(std::sync::Arc::clone(&view.stack));
+                view.stack = std::sync::Arc::new(denoised);
+                view.bm3d_summary = Some(summary);
+                view.bm3d_job = None;
+            }
+            Some(Ok(None)) => {
+                logger::log("bm3dornl tool closed without an exported result");
+                view.bm3d_error = Some(
+                    "the tool closed without an exported result — the data is unchanged \
+                     (export into the exchange folder before closing)"
+                        .to_owned(),
+                );
+                view.bm3d_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("bm3dornl session failed: {e}"));
+                view.bm3d_error = Some(e);
+                view.bm3d_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("bm3dornl tool is open");
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "in the tool: open {} (dataset \"{}\"), denoise, then export the \
+                         processed data as HDF5 or TIFF into the same folder and close \
+                         the tool",
+                        job.input_path.display(),
+                        crate::bm3dornl::INPUT_DATASET,
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+                ctx.request_repaint_after(Duration::from_millis(500));
+                return;
+            }
+        }
+    }
+
+    let tool_built = Path::new(crate::bm3dornl::BM3DORNL_GUI_BIN).is_file();
+    if !tool_built {
+        ui.colored_label(
+            Color32::from_rgb(240, 180, 60),
+            format!(
+                "the bm3dornl tool is not built yet ({})",
+                crate::bm3dornl::BM3DORNL_GUI_BIN
+            ),
+        );
+    }
+    if ui
+        .add_enabled(tool_built, egui::Button::new("🚀 Launch the bm3dornl tool"))
+        .on_hover_text(
+            "exports the current stack to an exchange HDF5 file and opens the bm3dornl \
+             GUI on it; the result you export there is imported back automatically",
+        )
+        .clicked()
+    {
+        logger::log("launching the bm3dornl ring artifact removal tool");
+        view.bm3d_error = None;
+        match crate::bm3dornl::Bm3dJob::start(std::sync::Arc::clone(&view.stack)) {
+            Ok(job) => view.bm3d_job = Some(job),
+            Err(e) => {
+                logger::error(format!("cannot start the bm3dornl session: {e}"));
+                view.bm3d_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(summary) = &view.bm3d_summary {
+        ui.colored_label(Color32::from_rgb(120, 200, 120), summary);
+    }
+    if view.unbm3d.is_some()
+        && ui
+            .button("↺ Undo the ring artifact removal")
+            .on_hover_text("go back to the data set as it was before the bm3dornl denoising")
+            .clicked()
+        && let Some(before) = view.unbm3d.take()
+    {
+        logger::log("bm3dornl denoising undone: back to the previous stack");
+        view.stack = before;
+        view.bm3d_summary = None;
+        view.bm3d_error = None;
+    }
+    if let Some(e) = &view.bm3d_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
     }
 }
 

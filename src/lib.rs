@@ -5,6 +5,7 @@
 //! validation) can be tested without a display.
 
 pub mod app;
+pub mod bm3dornl;
 pub mod clean;
 pub mod combine;
 pub mod config;
