@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod bm3dornl;
+pub mod btop;
 pub mod clean;
 pub mod combine;
 pub mod config;

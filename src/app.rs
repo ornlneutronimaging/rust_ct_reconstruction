@@ -48,7 +48,6 @@ const ADMIN_PASSWORD_SHA256: &str =
 /// Imaging team logo, embedded in the binary and shown in the top-right
 /// corner (same asset and placement as the jupyter notebooks portal).
 const LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
-const LOGO_MAX_HEIGHT: f32 = 64.0;
 
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let img = image::load_from_memory(LOGO_BYTES).ok()?;
@@ -615,8 +614,6 @@ fn config_json_rows(ui: &mut egui::Ui, json: &str) {
 fn recon_ui(
     ui: &mut egui::Ui,
     view: &mut ReconView,
-    logo: Option<&egui::TextureHandle>,
-    log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
     pipeline_bar(ui, 3);
@@ -652,7 +649,6 @@ fn recon_ui(
             .size(15.0)
             .strong(),
         );
-        top_right_bar(ui, logo, log_open, 28.0);
     });
     ui.add_space(10.0);
 
@@ -2788,6 +2784,7 @@ pub struct CtApp {
     log_text: String,
     log_last_read: Option<Instant>,
     log_error: Option<String>,
+
 }
 
 impl Default for CtApp {
@@ -2906,6 +2903,41 @@ impl CtApp {
             });
     }
 
+    /// The imaging team logo, the log toggle and the btop launcher, floating
+    /// in the top-right corner of the window so they are reachable from
+    /// every screen.
+    fn corner_bar(&mut self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("corner_bar"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 6.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.log_view_open, "📜 Log")
+                        .clicked()
+                    {
+                        self.log_view_open = !self.log_view_open;
+                    }
+                    if ui
+                        .button("🖥 btop")
+                        .on_hover_text(
+                            "open the btop system monitor in its own terminal window",
+                        )
+                        .clicked()
+                    {
+                        match crate::btop::launch() {
+                            Ok(()) => {
+                                logger::log("btop opened in an external terminal window");
+                            }
+                            Err(e) => logger::error(format!("cannot open btop: {e}")),
+                        }
+                    }
+                    if let Some(tex) = &self.logo {
+                        ui.add(egui::Image::from_texture(tex).max_height(32.0));
+                    }
+                });
+            });
+    }
+
     fn refresh_log(&mut self) {
         self.log_last_read = Some(Instant::now());
         match logger::read_tail(LOG_TAIL_BYTES) {
@@ -2919,7 +2951,6 @@ impl CtApp {
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
         pipeline_bar(ui, 0);
-        top_right_bar(ui, self.logo.as_ref(), &mut self.log_view_open, LOGO_MAX_HEIGHT);
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
             ui.label(RichText::new("CT Reconstruction").size(32.0).strong());
@@ -3377,31 +3408,12 @@ fn next_button_widget(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     }
 }
 
-/// Top-right corner of the current row: the imaging team logo (at the given
-/// height) and the toggle that opens/closes the log viewer side panel.
-fn top_right_bar(
-    ui: &mut egui::Ui,
-    logo: Option<&egui::TextureHandle>,
-    log_open: &mut bool,
-    logo_height: f32,
-) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-        if let Some(tex) = logo {
-            ui.add(egui::Image::from_texture(tex).max_height(logo_height));
-        }
-        if ui.selectable_label(*log_open, "📜 Log").clicked() {
-            *log_open = !*log_open;
-        }
-    });
-}
 
 /// Pre-processing of a loaded stack of projections; returns the requested
 /// navigation.
 fn stack_ui(
     ui: &mut egui::Ui,
     view: &mut StackView,
-    logo: Option<&egui::TextureHandle>,
-    log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
     pipeline_bar(ui, 2);
@@ -3457,7 +3469,6 @@ fn stack_ui(
             view.clear_log();
             view.clear_cor();
         }
-        top_right_bar(ui, logo, log_open, 28.0);
     });
     ui.add_space(10.0);
 
@@ -5824,8 +5835,6 @@ fn workflow_ui(
     ui: &mut egui::Ui,
     session: &Session,
     view: &mut WorkflowView,
-    logo: Option<&egui::TextureHandle>,
-    log_open: &mut bool,
 ) -> Nav {
     let mut nav = Nav::Stay;
     pipeline_bar(ui, 1);
@@ -5843,7 +5852,6 @@ fn workflow_ui(
             .size(15.0)
             .strong(),
         );
-        top_right_bar(ui, logo, log_open, 28.0);
     });
     ui.add_space(6.0);
     match view {
@@ -8223,6 +8231,7 @@ impl eframe::App for CtApp {
             self.logo = load_logo(&ctx);
         }
         self.log_panel(ui, &ctx);
+        self.corner_bar(&ctx);
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
             // A finished HDF5 load jumps straight to pre-processing.
@@ -8290,13 +8299,13 @@ impl eframe::App for CtApp {
             let mut nav = Nav::Stay;
             egui::CentralPanel::default().show(ui, |ui| match &mut self.screen {
                 Screen::Workflow { session, view } => {
-                    nav = workflow_ui(ui, session, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = workflow_ui(ui, session, view);
                 }
                 Screen::Stack(view) => {
-                    nav = stack_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = stack_ui(ui, view);
                 }
                 Screen::Recon(view) => {
-                    nav = recon_ui(ui, view, self.logo.as_ref(), &mut self.log_view_open);
+                    nav = recon_ui(ui, view);
                 }
                 Screen::Setup => {}
             });
