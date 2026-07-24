@@ -42,6 +42,7 @@ const RUN_SCRIPT: &str = r#"
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import tifffile
@@ -63,6 +64,11 @@ def report(msg):
     print(f"PROGRESS {msg}", flush=True)
 
 
+def stat(obj):
+    # Per-job timing, parsed by the Rust side into the run statistics.
+    print("STAT " + json.dumps(obj), flush=True)
+
+
 def write_slices(volume, first_rel):
     for i in range(volume.shape[0]):
         idx = offset + first_rel + i
@@ -74,6 +80,7 @@ if algo in ("svmbir", "mbirjax"):
     n_jobs = len(jobs)
     prev_tail = None  # the previous job's overlap slices, kept for blending
     for j, (a, b) in enumerate(jobs):
+        t0 = time.time()
         report(f"job {j + 1}/{n_jobs}: reconstructing slices {offset + a} to {offset + b - 1}")
         s = np.ascontiguousarray(sino[:, a:b, :])
         if algo == "svmbir":
@@ -126,6 +133,7 @@ if algo in ("svmbir", "mbirjax"):
         write_slices(rec[head:keep], a + head)
         prev_tail = np.array(rec[keep:], dtype=np.float32) if j < n_jobs - 1 else None
         del rec
+        stat({"from": offset + a, "to": offset + b - 1, "seconds": round(time.time() - t0, 1)})
 else:
     report(f"reconstructing {sino.shape[1]} slices with {algo}")
     if algo == "astra_fbp":
@@ -225,10 +233,76 @@ pub fn save_recon_settings(path: &Path, json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Statistics of a finished reconstruction run, shown under the result.
+#[derive(Clone, Debug)]
+pub struct RunStats {
+    pub output_folder: PathBuf,
+    /// Number of `image_*.tiff` slices in the output folder.
+    pub n_files: usize,
+    /// Smallest and largest slice file size, in bytes.
+    pub file_bytes: (u64, u64),
+    /// Sum of every slice file size, in bytes.
+    pub total_bytes: u64,
+    /// Wall time of the whole run (sinogram export included).
+    pub total_seconds: f64,
+    /// Per slice-range job (svmbir/mbirjax only): first slice, last slice,
+    /// seconds spent reconstructing + writing that range.
+    pub job_times: Vec<(usize, usize, f64)>,
+}
+
+/// `1234567` → `"1.2 MB"` — the sizes shown in the run statistics.
+pub fn format_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.2} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.1} kB", b / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// `3725.0` → `"1h 2m 5s"` — the durations shown in the run statistics.
+pub fn format_duration(seconds: f64) -> String {
+    let total = seconds.round().max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else if seconds >= 10.0 {
+        format!("{s}s")
+    } else {
+        format!("{seconds:.1}s")
+    }
+}
+
+/// The `image_*.tiff` slices of the output folder: count, (min, max) file
+/// size and total size.
+fn scan_output_folder(dir: &Path) -> (usize, (u64, u64), u64) {
+    let mut n = 0usize;
+    let (mut min, mut max, mut total) = (u64::MAX, 0u64, 0u64);
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("image_") && (name.ends_with(".tiff") || name.ends_with(".tif"))) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        n += 1;
+        min = min.min(meta.len());
+        max = max.max(meta.len());
+        total += meta.len();
+    }
+    if n == 0 { (0, (0, 0), 0) } else { (n, (min, max), total) }
+}
+
 /// The full reconstruction on a background thread; `progress` mirrors the
-/// Python side's progress lines and `poll` resolves to the output folder.
+/// Python side's progress lines and `poll` resolves to the run statistics
+/// (which carry the output folder).
 pub struct RunJob {
-    rx: Receiver<Result<PathBuf, String>>,
+    rx: Receiver<Result<RunStats, String>>,
     pub progress: Arc<Mutex<String>>,
     /// Everything the Python side prints (stdout except the progress
     /// lines, plus stderr), appended live.
@@ -268,7 +342,7 @@ impl RunJob {
         }
     }
 
-    pub fn poll(&mut self) -> Option<Result<PathBuf, String>> {
+    pub fn poll(&mut self) -> Option<Result<RunStats, String>> {
         self.rx.try_recv().ok()
     }
 
@@ -310,8 +384,9 @@ fn run(
     output: &Arc<Mutex<String>>,
     child_pid: &Arc<std::sync::atomic::AtomicU32>,
     cancelled: &Arc<std::sync::atomic::AtomicBool>,
-) -> Result<PathBuf, String> {
+) -> Result<RunStats, String> {
     use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
     let first = stack
         .sample
         .first()
@@ -341,7 +416,8 @@ fn run(
         }
         let _ = std::fs::remove_dir(&scratch);
     };
-    let result = (|| -> Result<PathBuf, String> {
+    let job_times: Arc<Mutex<Vec<(usize, usize, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let result = (|| -> Result<RunStats, String> {
         *progress.lock().unwrap() = format!("writing the {span}-slice sinogram…");
         let mut volume = Vec::with_capacity(n * span * w);
         for p in &stack.sample {
@@ -404,10 +480,25 @@ fn run(
         let stdout = child.stdout.take().expect("piped stdout");
         let progress_lines = Arc::clone(progress);
         let stdout_buffer = Arc::clone(output);
+        let stdout_times = Arc::clone(&job_times);
         let stdout_reader = std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Some(msg) = line.strip_prefix("PROGRESS ") {
                     *progress_lines.lock().unwrap() = msg.to_owned();
+                } else if let Some(json) = line.strip_prefix("STAT ") {
+                    if let Ok(doc) = serde_json::from_str::<serde_json::Value>(json)
+                        && let (Some(from), Some(to), Some(seconds)) = (
+                            doc.get("from").and_then(|v| v.as_u64()),
+                            doc.get("to").and_then(|v| v.as_u64()),
+                            doc.get("seconds").and_then(|v| v.as_f64()),
+                        )
+                    {
+                        stdout_times.lock().unwrap().push((
+                            from as usize,
+                            to as usize,
+                            seconds,
+                        ));
+                    }
                 } else {
                     append_output(&stdout_buffer, &line);
                 }
@@ -445,7 +536,15 @@ fn run(
                 tail.join(" | ")
             ));
         }
-        Ok(spec.output_folder.clone())
+        let (n_files, file_bytes, total_bytes) = scan_output_folder(&spec.output_folder);
+        Ok(RunStats {
+            output_folder: spec.output_folder.clone(),
+            n_files,
+            file_bytes,
+            total_bytes,
+            total_seconds: started.elapsed().as_secs_f64(),
+            job_times: job_times.lock().unwrap().clone(),
+        })
     })();
     cleanup();
     result
@@ -453,7 +552,18 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::save_recon_settings;
+    use super::{format_bytes, format_duration, save_recon_settings};
+
+    #[test]
+    fn stat_formatting() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(8_400_000), "8.4 MB");
+        assert_eq!(format_bytes(9_450_000_000), "9.45 GB");
+        assert_eq!(format_duration(3725.0), "1h 2m 5s");
+        assert_eq!(format_duration(65.0), "1m 5s");
+        assert_eq!(format_duration(12.4), "12s");
+        assert_eq!(format_duration(3.14), "3.1s");
+    }
 
     #[test]
     fn recon_settings_write_and_replace() {

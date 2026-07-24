@@ -176,6 +176,10 @@ enum Nav {
     Home,
     /// Back to the previous view, exactly as it was left.
     Previous,
+    /// Back to the previous pipeline step (reconstruction →
+    /// pre-processing): the saved view when the history has one, otherwise
+    /// a pre-processing view rebuilt from the current stack.
+    PreviousStep,
 }
 
 /// The home and previous-view buttons of every screen header; returns the
@@ -348,8 +352,8 @@ struct ReconView {
     output_base: Option<PathBuf>,
     /// The full reconstruction in flight.
     run_job: Option<crate::recon_run::RunJob>,
-    /// Outcome of the last run (output folder or error).
-    run_result: Option<Result<PathBuf, String>>,
+    /// Outcome of the last run (statistics or error).
+    run_result: Option<Result<crate::recon_run::RunStats, String>>,
     /// A rust_tiff_viewer session showing the reconstructed slices.
     viewer_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     viewer_error: Option<String>,
@@ -617,7 +621,26 @@ fn recon_ui(
     let mut nav = Nav::Stay;
     pipeline_bar(ui, 3);
     ui.horizontal(|ui| {
-        nav = nav_buttons(ui);
+        // Not the generic nav_buttons: on this screen "previous" means the
+        // previous pipeline step (pre-processing), not the previous view.
+        if ui
+            .button("🏠 Home")
+            .on_hover_text("back to the starting view")
+            .clicked()
+        {
+            nav = Nav::Home;
+        }
+        if ui
+            .button("⬅ Pre-processing")
+            .on_hover_text(
+                "back to the pre-processing step — restored as it was left, or \
+                 rebuilt from this stack when the reconstruction was opened directly \
+                 from a file",
+            )
+            .clicked()
+        {
+            nav = Nav::PreviousStep;
+        }
         ui.label(
             RichText::new(format!(
                 "Reconstruction — {}",
@@ -1254,10 +1277,14 @@ fn recon_ui(
                 match job.poll() {
                     Some(result) => {
                         match &result {
-                            Ok(dir) => logger::log(format!(
-                                "full {} reconstruction written into {}",
+                            Ok(stats) => logger::log(format!(
+                                "full {} reconstruction written into {} — {} files, {} \
+                                 total, {}",
                                 algo.label,
-                                dir.display()
+                                stats.output_folder.display(),
+                                stats.n_files,
+                                crate::recon_run::format_bytes(stats.total_bytes),
+                                crate::recon_run::format_duration(stats.total_seconds),
                             )),
                             Err(e) => {
                                 logger::error(format!("full reconstruction failed: {e}"))
@@ -1443,7 +1470,8 @@ fn recon_ui(
                 }
             }
             match &view.run_result {
-                Some(Ok(dir)) => {
+                Some(Ok(stats)) => {
+                    let dir = &stats.output_folder;
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             Color32::from_rgb(120, 200, 120),
@@ -1495,6 +1523,39 @@ fn recon_ui(
                             ui.label(RichText::new("viewer open").weak().size(11.0));
                         }
                     });
+                    // Run statistics: files, sizes and timing.
+                    use crate::recon_run::{format_bytes, format_duration};
+                    let (min, max) = stats.file_bytes;
+                    let each = if min == max {
+                        format!("{} each", format_bytes(max))
+                    } else {
+                        format!("{} to {} each", format_bytes(min), format_bytes(max))
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "⏱ {} — {} slice files created, {}, {} total",
+                            format_duration(stats.total_seconds),
+                            stats.n_files,
+                            each,
+                            format_bytes(stats.total_bytes),
+                        ))
+                        .weak()
+                        .size(12.0),
+                    );
+                    if !stats.job_times.is_empty() {
+                        let ranges: Vec<String> = stats
+                            .job_times
+                            .iter()
+                            .map(|(from, to, seconds)| {
+                                format!("{from}–{to} in {}", format_duration(*seconds))
+                            })
+                            .collect();
+                        ui.label(
+                            RichText::new(format!("slice-range times: {}", ranges.join("; ")))
+                                .weak()
+                                .size(12.0),
+                        );
+                    }
                 }
                 Some(Err(e)) => {
                     ui.colored_label(Color32::LIGHT_RED, e);
@@ -1726,7 +1787,10 @@ struct StackView {
 
 impl StackView {
     fn new(stack: LoadedStack) -> Self {
-        let stack = std::sync::Arc::new(stack);
+        Self::from_arc(std::sync::Arc::new(stack))
+    }
+
+    fn from_arc(stack: std::sync::Arc<LoadedStack>) -> Self {
         let mut view = Self {
             open_section: Some(StackSection::Normalize),
             original: std::sync::Arc::clone(&stack),
@@ -8114,6 +8178,23 @@ impl eframe::App for CtApp {
                             self.screen = Screen::Setup;
                         }
                     },
+                    Nav::PreviousStep => {
+                        if matches!(self.back_stack.last(), Some(Screen::Stack(_))) {
+                            logger::log("returned to the pre-processing view");
+                            self.screen = self.back_stack.pop().expect("checked above");
+                        } else if let Screen::Recon(view) = &self.screen {
+                            // The reconstruction was opened straight from a
+                            // file: build the pre-processing view from its
+                            // stack (the checkpoint state restores there).
+                            logger::log(
+                                "opening the pre-processing view on the reconstruction stack",
+                            );
+                            let mut stack_view =
+                                StackView::from_arc(std::sync::Arc::clone(&view.stack));
+                            stack_view.stack_saved_path = Some(view.path.clone());
+                            self.screen = Screen::Stack(stack_view);
+                        }
+                    }
                     Nav::Stay => {}
                 }
             }
