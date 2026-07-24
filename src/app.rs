@@ -1244,6 +1244,13 @@ fn recon_ui(
                         .output_base
                         .clone()
                         .filter(|p| p.is_dir())
+                        .or_else(|| {
+                            view.stack
+                                .path
+                                .parent()
+                                .filter(|p| p.is_dir())
+                                .map(Path::to_path_buf)
+                        })
                         .or_else(|| ipts_shared_folder(&view.stack));
                     if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
