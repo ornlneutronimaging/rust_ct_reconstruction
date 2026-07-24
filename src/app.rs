@@ -2778,6 +2778,10 @@ pub struct CtApp {
     load_job: Option<LoadJob>,
     load_error: Option<String>,
 
+    // Credits window (tools and libraries used, with versions).
+    credits_open: bool,
+    credits: crate::credits::Credits,
+
     // Log viewer (right side panel).
     log_view_open: bool,
     log_auto_refresh: bool,
@@ -2815,6 +2819,8 @@ impl CtApp {
             load_job: None,
             load_error: None,
             logo: None,
+            credits_open: false,
+            credits: Default::default(),
             log_view_open: false,
             back_stack: Vec::new(),
             log_auto_refresh: true,
@@ -2930,6 +2936,15 @@ impl CtApp {
                             }
                             Err(e) => logger::error(format!("cannot open btop: {e}")),
                         }
+                    }
+                    if ui
+                        .selectable_label(self.credits_open, "ℹ credits")
+                        .on_hover_text(
+                            "the open-source tools and libraries this app is built on",
+                        )
+                        .clicked()
+                    {
+                        self.credits_open = !self.credits_open;
                     }
                     if let Some(tex) = &self.logo {
                         ui.add(egui::Image::from_texture(tex).max_height(32.0));
@@ -8232,6 +8247,7 @@ impl eframe::App for CtApp {
         }
         self.log_panel(ui, &ctx);
         self.corner_bar(&ctx);
+        self.credits.window(&ctx, &mut self.credits_open);
         if matches!(self.screen, Screen::Setup) {
             self.poll_scan(&ctx);
             // A finished HDF5 load jumps straight to pre-processing.

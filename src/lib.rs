@@ -10,6 +10,7 @@ pub mod btop;
 pub mod clean;
 pub mod combine;
 pub mod config;
+pub mod credits;
 pub mod crop;
 pub mod instrument;
 pub mod ipts;
