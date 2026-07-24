@@ -1893,7 +1893,6 @@ impl StackView {
             view.normalized = true;
             view.unrotated = Some(std::sync::Arc::clone(&view.stack));
             view.norm_summary = Some(format!("restored from the loaded file ({desc})"));
-            view.open_section = Some(StackSection::Rotate);
         }
         if let Some(desc) = meta("ring_artifact_removal") {
             view.bm3d_summary = Some(format!("restored from the loaded file ({desc})"));
@@ -4230,8 +4229,9 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.norm_summary = Some(summary);
                 view.norm_error = None;
                 view.norm_job = None;
-                // The rotation step starts from this normalized baseline,
-                // and the accordion moves on to it.
+                // The rotation step starts from this normalized baseline.
+                // The accordion stays where it is so the optional steps in
+                // between (ring artifacts, stripes…) are not skipped over.
                 view.unrotated = Some(std::sync::Arc::clone(&view.stack));
                 view.rotation_quarters = 0;
                 view.rotation_applied = 0;
@@ -4240,7 +4240,6 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.clear_stripes();
                 view.clear_log();
                 view.clear_cor();
-                view.open_section = Some(StackSection::Rotate);
             }
             Some(Err(e)) => {
                 logger::error(format!("normalization failed: {e}"));
