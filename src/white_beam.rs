@@ -60,11 +60,14 @@ impl WbDetector {
         }
     }
 
-    /// Where the dark-current folders live, when the instrument records
-    /// them: `/HFIR/CG1D/IPTS-xxxx/raw/dc` on MARS, nothing on VENUS.
+    /// Where the dark-current folders live (selecting them is optional):
+    /// `/HFIR/CG1D/IPTS-xxxx/raw/dc` on MARS, and per detector on VENUS
+    /// (`/SNS/VENUS/IPTS-xxxx/images/ikonxl/dc`), mirroring the ob layout.
     pub fn dc_root(self, instrument: Instrument, ipts: &Path) -> Option<PathBuf> {
         match instrument {
-            Instrument::Venus => None,
+            Instrument::Venus => {
+                Some(ipts.join("images").join(self.images_subdir()).join("dc"))
+            }
             Instrument::Mars => Some(ipts.join("raw/dc")),
         }
     }
@@ -479,7 +482,14 @@ mod tests {
             WbDetector::Qhy.ct_root(Instrument::Venus, ipts),
             Path::new("/SNS/VENUS/IPTS-36573/images/qhy/raw/ct")
         );
-        assert_eq!(WbDetector::IkonXl.dc_root(Instrument::Venus, ipts), None);
+        assert_eq!(
+            WbDetector::IkonXl.dc_root(Instrument::Venus, ipts).as_deref(),
+            Some(Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/dc"))
+        );
+        assert_eq!(
+            WbDetector::Qhy.dc_root(Instrument::Venus, ipts).as_deref(),
+            Some(Path::new("/SNS/VENUS/IPTS-36573/images/qhy/dc"))
+        );
     }
 
     #[test]
