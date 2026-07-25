@@ -3194,83 +3194,99 @@ impl CtApp {
     /// Collapsed accordion under the IPTS list with the last few HDF5 files
     /// saved or loaded; clicking one reloads it exactly like the Load button.
     fn recent_files_section(&mut self, ui: &mut egui::Ui) {
+        // Centered as a block of the same width as the IPTS box above it.
+        const W: f32 = 460.0;
         let entries = crate::recent::entries();
         let header = RichText::new(format!("🕓 Recent HDF5 files ({})", entries.len())).size(13.0);
-        egui::CollapsingHeader::new(header)
-            .id_salt("recent_files")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.set_width(460.0);
-                if entries.is_empty() {
-                    ui.label(RichText::new("nothing saved or loaded yet").weak());
-                    return;
-                }
-                let busy = self.load_job.is_some();
-                let mut clicked: Option<PathBuf> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("recent_files_scroll")
-                    .max_height(180.0)
-                    .auto_shrink([false, true])
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - W) / 2.0).max(0.0));
+            ui.vertical(|ui| {
+                ui.set_width(W);
+                egui::CollapsingHeader::new(header)
+                    .id_salt("recent_files")
+                    .default_open(false)
                     .show(ui, |ui| {
-                        ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
-                            // One compact row per file: action icon + name on
-                            // the left, the (year-less) date right-aligned the
-                            // way menus render shortcuts.
-                            for entry in &entries {
-                                let name = entry
-                                    .path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| entry.path.display().to_string());
-                                let exists = entry.path.is_file();
-                                let icon = match entry.action {
-                                    crate::recent::Action::Saved => "💾",
-                                    crate::recent::Action::Loaded => "📂",
-                                };
-                                let date = entry
-                                    .when
-                                    .split_once('-')
-                                    .filter(|(year, _)| year.len() == 4)
-                                    .map(|(_, rest)| rest)
-                                    .unwrap_or(&entry.when);
-                                let response = ui
-                                    .add_enabled(
-                                        exists && !busy,
-                                        egui::Button::new(
-                                            RichText::new(format!("{icon} {name}")).size(13.0),
-                                        )
-                                        .shortcut_text(RichText::new(date).weak().size(11.0))
-                                        .wrap_mode(egui::TextWrapMode::Truncate),
-                                    )
-                                    .on_hover_text(format!(
-                                        "{} {}\n{}",
-                                        entry.action.label(),
-                                        entry.when,
-                                        entry.path.display()
-                                    ))
-                                    .on_disabled_hover_text(if exists {
-                                        "a load is already running".to_owned()
-                                    } else {
-                                        format!("{} no longer exists", entry.path.display())
-                                    });
-                                if response.clicked() {
-                                    clicked = Some(entry.path.clone());
-                                }
-                            }
-                        });
+                        if entries.is_empty() {
+                            ui.label(RichText::new("nothing saved or loaded yet").weak());
+                            return;
+                        }
+                        let busy = self.load_job.is_some();
+                        let mut clicked: Option<PathBuf> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("recent_files_scroll")
+                            .max_height(180.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                                    // One compact row per file: action icon +
+                                    // name on the left, the (year-less) date
+                                    // right-aligned the way menus render
+                                    // shortcuts.
+                                    for entry in &entries {
+                                        let name = entry
+                                            .path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| entry.path.display().to_string());
+                                        let exists = entry.path.is_file();
+                                        let icon = match entry.action {
+                                            crate::recent::Action::Saved => "💾",
+                                            crate::recent::Action::Loaded => "📂",
+                                        };
+                                        let date = entry
+                                            .when
+                                            .split_once('-')
+                                            .filter(|(year, _)| year.len() == 4)
+                                            .map(|(_, rest)| rest)
+                                            .unwrap_or(&entry.when);
+                                        let response = ui
+                                            .add_enabled(
+                                                exists && !busy,
+                                                egui::Button::new(
+                                                    RichText::new(format!("{icon} {name}"))
+                                                        .size(13.0),
+                                                )
+                                                .shortcut_text(
+                                                    RichText::new(date).weak().size(11.0),
+                                                )
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                            )
+                                            .on_hover_text(format!(
+                                                "{} {}\n{}",
+                                                entry.action.label(),
+                                                entry.when,
+                                                entry.path.display()
+                                            ))
+                                            .on_disabled_hover_text(if exists {
+                                                "a load is already running".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} no longer exists",
+                                                    entry.path.display()
+                                                )
+                                            });
+                                        if response.clicked() {
+                                            clicked = Some(entry.path.clone());
+                                        }
+                                    }
+                                });
+                            });
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(
+                                "💾 = saved   📂 = loaded   (hover a row for the full path)",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                        if let Some(path) = clicked {
+                            logger::log(format!("loading recent stack: {}", path.display()));
+                            self.load_error = None;
+                            self.load_job = Some(LoadJob::start(path));
+                        }
                     });
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("💾 = saved   📂 = loaded   (hover a row for the full path)")
-                        .weak()
-                        .size(11.0),
-                );
-                if let Some(path) = clicked {
-                    logger::log(format!("loading recent stack: {}", path.display()));
-                    self.load_error = None;
-                    self.load_job = Some(LoadJob::start(path));
-                }
             });
+        });
     }
 
     /// The two large acquisition-mode buttons; clicking selects the mode, it
