@@ -19,6 +19,21 @@ pub fn valid_email(address: &str) -> bool {
     a.contains('@') && !a.starts_with('@') && !a.ends_with('@') && !a.contains(char::is_whitespace)
 }
 
+/// Headers must be plain ASCII (RFC 2047 encoding is the alternative);
+/// anything else risks the message being silently discarded by the mail
+/// filtering, so non-ASCII characters are replaced by spaces.
+fn ascii_header(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
 /// Send one message through the local MTA. Returns once sendmail has
 /// accepted (queued) it.
 pub fn send_mail(to: &str, subject: &str, body: &str) -> Result<(), String> {
@@ -29,9 +44,15 @@ pub fn send_mail(to: &str, subject: &str, body: &str) -> Result<(), String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("cannot launch {SENDMAIL}: {e}"))?;
+    // The MIME headers matter: the body is UTF-8 (the provenance can carry
+    // degree signs and the like) and without a declared charset the mail
+    // filtering may drop the message.
     let message = format!(
-        "To: {to}\nFrom: {from}\nSubject: {subject}\n\n{body}\n",
-        from = default_email()
+        "To: {to}\nFrom: {from}\nSubject: {subject}\nMIME-Version: 1.0\n\
+         Content-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n{body}\n",
+        to = ascii_header(to),
+        from = default_email(),
+        subject = ascii_header(subject),
     );
     child
         .stdin
@@ -63,14 +84,16 @@ pub struct RunContext {
     pub metadata: Vec<(String, String)>,
 }
 
+/// ASCII only: a non-ASCII subject (an em dash, say) must be RFC
+/// 2047-encoded to be legal, and the mail filtering drops it otherwise.
 pub fn email_subject(ctx: &RunContext, result: &Result<RunStats, String>) -> String {
     match result {
         Ok(stats) => format!(
-            "CT reconstruction done — {} in {}",
+            "CT reconstruction done - {} in {}",
             ctx.algo_label,
             format_duration(stats.total_seconds)
         ),
-        Err(_) => format!("CT reconstruction failed — {}", ctx.algo_label),
+        Err(_) => format!("CT reconstruction failed - {}", ctx.algo_label),
     }
 }
 
@@ -272,6 +295,15 @@ mod tests {
         assert_eq!(settings.recipient(), default_email());
         settings.email = "someone@example.com".to_owned();
         assert_eq!(settings.recipient(), "someone@example.com");
+    }
+
+    #[test]
+    fn subjects_are_pure_ascii() {
+        let ctx = context();
+        assert!(email_subject(&ctx, &Ok(stats())).is_ascii());
+        assert!(email_subject(&ctx, &Err("boom".to_owned())).is_ascii());
+        assert_eq!(ascii_header("done — svmbir"), "done   svmbir");
+        assert_eq!(ascii_header("plain ascii"), "plain ascii");
     }
 
     #[test]
