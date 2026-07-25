@@ -2979,7 +2979,9 @@ impl CtApp {
             self.instrument_row(ui);
             ui.add_space(20.0);
             self.ipts_section(ui);
-            ui.add_space(28.0);
+            ui.add_space(10.0);
+            self.recent_files_section(ui);
+            ui.add_space(24.0);
             self.mode_buttons(ui);
             ui.add_space(16.0);
             self.load_stack_row(ui);
@@ -3187,6 +3189,72 @@ impl CtApp {
                 ui.label(RichText::new("No experiment selected yet").weak());
             }
         }
+    }
+
+    /// Collapsed accordion under the IPTS list with the last few HDF5 files
+    /// saved or loaded; clicking one reloads it exactly like the Load button.
+    fn recent_files_section(&mut self, ui: &mut egui::Ui) {
+        let entries = crate::recent::entries();
+        let header = RichText::new(format!("🕓 Recent HDF5 files ({})", entries.len())).size(13.0);
+        egui::CollapsingHeader::new(header)
+            .id_salt("recent_files")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.set_width(460.0);
+                if entries.is_empty() {
+                    ui.label(RichText::new("nothing saved or loaded yet").weak());
+                    return;
+                }
+                let busy = self.load_job.is_some();
+                let mut clicked: Option<PathBuf> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("recent_files_scroll")
+                    .max_height(180.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                            for entry in &entries {
+                                let name = entry
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| entry.path.display().to_string());
+                                let exists = entry.path.is_file();
+                                let response = ui
+                                    .add_enabled(
+                                        exists && !busy,
+                                        egui::Button::new(RichText::new(name).size(13.0))
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                    )
+                                    .on_hover_text(entry.path.display().to_string())
+                                    .on_disabled_hover_text(if exists {
+                                        "a load is already running".to_owned()
+                                    } else {
+                                        format!("{} no longer exists", entry.path.display())
+                                    });
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}{}",
+                                        entry.action.label(),
+                                        entry.when,
+                                        if exists { "" } else { " — file is gone" }
+                                    ))
+                                    .weak()
+                                    .size(11.0),
+                                );
+                                ui.add_space(4.0);
+                                if response.clicked() {
+                                    clicked = Some(entry.path.clone());
+                                }
+                            }
+                        });
+                    });
+                if let Some(path) = clicked {
+                    logger::log(format!("loading recent stack: {}", path.display()));
+                    self.load_error = None;
+                    self.load_job = Some(LoadJob::start(path));
+                }
+            });
     }
 
     /// The two large acquisition-mode buttons; clicking selects the mode, it
@@ -3685,6 +3753,9 @@ fn stack_ui(
             match job.poll() {
                 Some(Ok(msg)) => {
                     logger::log(format!("pre-processing checkpoint saved: {msg}"));
+                    if let Some(path) = &view.stack_saved_path {
+                        crate::recent::record_saved(path);
+                    }
                     view.stack_save_status = Some(Ok(msg));
                     view.stack_save_job = None;
                 }
@@ -6048,6 +6119,9 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         match job.poll() {
             Some(Ok(msg)) => {
                 logger::log(format!("saved white beam data: {msg}"));
+                if let Some(path) = &view.saved_path {
+                    crate::recent::record_saved(path);
+                }
                 view.save_status = Some(Ok(msg));
                 view.save_job = None;
             }
@@ -7436,6 +7510,9 @@ fn process_section_ui(
         match job.poll() {
             Some(Ok(msg)) => {
                 logger::log(format!("saved combined data: {msg}"));
+                if let Some(path) = &view.saved_path {
+                    crate::recent::record_saved(path);
+                }
                 view.save_status = Some(Ok(msg));
                 view.save_job = None;
             }
@@ -8266,6 +8343,7 @@ impl eframe::App for CtApp {
                                 "pre-processing"
                             }
                         ));
+                        crate::recent::record_loaded(&stack.path);
                         self.load_job = None;
                         self.back_stack.clear();
                         self.screen = if preprocessed {

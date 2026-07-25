@@ -17,6 +17,7 @@ pub mod ipts;
 pub mod logger;
 pub mod morph;
 pub mod normalize;
+pub mod recent;
 pub mod recon_run;
 pub mod rotate;
 pub mod session;
