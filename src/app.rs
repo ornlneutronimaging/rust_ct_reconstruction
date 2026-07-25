@@ -3213,6 +3213,9 @@ impl CtApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                            // One compact row per file: action icon + name on
+                            // the left, the (year-less) date right-aligned the
+                            // way menus render shortcuts.
                             for entry in &entries {
                                 let name = entry
                                     .path
@@ -3220,35 +3223,48 @@ impl CtApp {
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| entry.path.display().to_string());
                                 let exists = entry.path.is_file();
+                                let icon = match entry.action {
+                                    crate::recent::Action::Saved => "💾",
+                                    crate::recent::Action::Loaded => "📂",
+                                };
+                                let date = entry
+                                    .when
+                                    .split_once('-')
+                                    .filter(|(year, _)| year.len() == 4)
+                                    .map(|(_, rest)| rest)
+                                    .unwrap_or(&entry.when);
                                 let response = ui
                                     .add_enabled(
                                         exists && !busy,
-                                        egui::Button::new(RichText::new(name).size(13.0))
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        egui::Button::new(
+                                            RichText::new(format!("{icon} {name}")).size(13.0),
+                                        )
+                                        .shortcut_text(RichText::new(date).weak().size(11.0))
+                                        .wrap_mode(egui::TextWrapMode::Truncate),
                                     )
-                                    .on_hover_text(entry.path.display().to_string())
+                                    .on_hover_text(format!(
+                                        "{} {}\n{}",
+                                        entry.action.label(),
+                                        entry.when,
+                                        entry.path.display()
+                                    ))
                                     .on_disabled_hover_text(if exists {
                                         "a load is already running".to_owned()
                                     } else {
                                         format!("{} no longer exists", entry.path.display())
                                     });
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} {}{}",
-                                        entry.action.label(),
-                                        entry.when,
-                                        if exists { "" } else { " — file is gone" }
-                                    ))
-                                    .weak()
-                                    .size(11.0),
-                                );
-                                ui.add_space(4.0);
                                 if response.clicked() {
                                     clicked = Some(entry.path.clone());
                                 }
                             }
                         });
                     });
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("💾 = saved   📂 = loaded   (hover a row for the full path)")
+                        .weak()
+                        .size(11.0),
+                );
                 if let Some(path) = clicked {
                     logger::log(format!("loading recent stack: {}", path.display()));
                     self.load_error = None;
