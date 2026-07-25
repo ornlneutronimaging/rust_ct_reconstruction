@@ -618,20 +618,14 @@ fn config_json_rows(ui: &mut egui::Ui, json: &str) {
 }
 
 /// The "notify me when done" block of the Run section: an email with the
-/// full report and/or a short text message through the carrier's
-/// email-to-SMS gateway.
+/// full report, going to the user's ORNL address unless another one is
+/// typed in.
 fn notify_settings_ui(ui: &mut egui::Ui, settings: &mut crate::notify::Settings) {
     use crate::notify;
-    ui.label(
-        RichText::new("Notify me when the reconstruction is done")
-            .strong()
-            .size(13.0),
-    );
     ui.horizontal(|ui| {
-        ui.checkbox(&mut settings.email_enabled, "📧 email");
-        ui.add_enabled(
-            settings.email_enabled,
-            egui::TextEdit::singleline(&mut settings.email).desired_width(220.0),
+        ui.checkbox(
+            &mut settings.email_enabled,
+            RichText::new("📧 Email me when the reconstruction is done").size(13.0),
         );
         ui.label(
             RichText::new("full report: duration, output folder, every parameter used")
@@ -639,41 +633,27 @@ fn notify_settings_ui(ui: &mut egui::Ui, settings: &mut crate::notify::Settings)
                 .size(11.0),
         );
     });
-    if settings.email_enabled && !notify::valid_email(&settings.email) {
-        ui.colored_label(Color32::LIGHT_RED, "enter a valid email address");
-    }
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut settings.sms_enabled, "📱 text");
-        ui.add_enabled(
-            settings.sms_enabled,
-            egui::TextEdit::singleline(&mut settings.phone)
-                .hint_text("10-digit US number")
-                .desired_width(140.0),
-        );
-        ui.add_enabled_ui(settings.sms_enabled, |ui| {
-            settings.carrier = settings.carrier.min(notify::CARRIERS.len() - 1);
-            egui::ComboBox::from_id_salt("sms_carrier")
-                .selected_text(notify::CARRIERS[settings.carrier].0)
-                .show_ui(ui, |ui| {
-                    for (i, (name, _)) in notify::CARRIERS.iter().enumerate() {
-                        ui.selectable_value(&mut settings.carrier, i, *name);
-                    }
-                });
+    ui.add_enabled_ui(settings.email_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            ui.label(
+                RichText::new(format!("sent to {}", notify::default_email()))
+                    .size(12.0),
+            );
+            ui.label(RichText::new("— or use this address instead:").weak().size(12.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.email)
+                    .hint_text("leave empty for the default")
+                    .desired_width(220.0),
+            );
         });
-        ui.label(
-            RichText::new("short \"done\" message, sent through the carrier's email-to-SMS gateway")
-                .weak()
-                .size(11.0),
-        );
     });
-    if settings.sms_enabled
-        && let Err(e) = notify::sms_address(&settings.phone, notify::CARRIERS[settings.carrier].1)
-    {
-        ui.colored_label(Color32::LIGHT_RED, e);
+    if settings.email_enabled && !notify::valid_email(&settings.recipient()) {
+        ui.colored_label(Color32::LIGHT_RED, "enter a valid email address");
     }
 }
 
-/// Send the notifications requested for a finished (or failed) run; one
+/// Send the notification requested for a finished (or failed) run; one
 /// result line per channel, shown under the run result.
 fn send_run_notifications(
     settings: &crate::notify::Settings,
@@ -683,7 +663,7 @@ fn send_run_notifications(
     use crate::notify;
     let mut status = Vec::new();
     if settings.email_enabled {
-        let to = settings.email.trim().to_owned();
+        let to = settings.recipient();
         let sent = if notify::valid_email(&to) {
             notify::send_mail(
                 &to,
@@ -697,20 +677,6 @@ fn send_run_notifications(
         match &sent {
             Ok(msg) => logger::log(msg.clone()),
             Err(e) => logger::error(format!("email notification failed: {e}")),
-        }
-        status.push(sent);
-    }
-    if settings.sms_enabled {
-        let (carrier, gateway) = notify::CARRIERS[settings.carrier.min(notify::CARRIERS.len() - 1)];
-        let sent = notify::sms_address(&settings.phone, gateway)
-            .and_then(|address| {
-                notify::send_mail(&address, "", &notify::sms_text(ctx, result))
-                    .map(|()| address)
-            })
-            .map(|address| format!("text sent to {address} ({carrier})"));
-        match &sent {
-            Ok(msg) => logger::log(msg.clone()),
-            Err(e) => logger::error(format!("text notification failed: {e}")),
         }
         status.push(sent);
     }

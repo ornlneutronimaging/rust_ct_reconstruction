@@ -1,9 +1,6 @@
-//! End-of-reconstruction notifications: a detailed email (duration, output
-//! folder, every parameter used) and/or a short text message.
-//!
-//! Both go through the analysis machine's local `sendmail`; texts are
-//! delivered by the carriers' email-to-SMS gateways (`<number>@vtext.com`
-//! and friends), so no external service or credentials are needed.
+//! End-of-reconstruction email notification: duration, output folder and
+//! every parameter used, sent through the analysis machine's local
+//! `sendmail` — no external service or credentials needed.
 
 use crate::recon_run::{RunStats, format_bytes, format_duration};
 use std::io::Write;
@@ -14,33 +11,6 @@ const SENDMAIL: &str = "/usr/sbin/sendmail";
 /// The user's ORNL address, prefilled in the notification settings.
 pub fn default_email() -> String {
     format!("{}@ornl.gov", crate::logger::user_id())
-}
-
-/// US carriers and their email-to-SMS gateway domains.
-pub const CARRIERS: &[(&str, &str)] = &[
-    ("AT&T", "txt.att.net"),
-    ("Verizon", "vtext.com"),
-    ("T-Mobile", "tmomail.net"),
-    ("US Cellular", "email.uscc.net"),
-    ("Google Fi", "msg.fi.google.com"),
-    ("Cricket", "sms.cricketwireless.net"),
-];
-
-/// `(555) 123-4567` + `vtext.com` → `5551234567@vtext.com`. A leading 1 on
-/// an 11-digit number is dropped; anything else is rejected.
-pub fn sms_address(phone: &str, gateway: &str) -> Result<String, String> {
-    let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-    let digits = match digits.len() {
-        10 => digits,
-        11 if digits.starts_with('1') => digits[1..].to_owned(),
-        _ => {
-            return Err(format!(
-                "'{}' is not a 10-digit US phone number",
-                phone.trim()
-            ));
-        }
-    };
-    Ok(format!("{digits}@{gateway}"))
 }
 
 /// Minimal sanity check before handing an address to sendmail.
@@ -179,22 +149,6 @@ pub fn email_body(ctx: &RunContext, result: &Result<RunStats, String>) -> String
     b
 }
 
-/// The short text-message version; SMS gateways truncate around 160
-/// characters, so it only says which algorithm finished and how long it took.
-pub fn sms_text(ctx: &RunContext, result: &Result<RunStats, String>) -> String {
-    match result {
-        Ok(stats) => format!(
-            "CT reconstruction: your {} run is done ({})",
-            ctx.algo_label,
-            format_duration(stats.total_seconds)
-        ),
-        Err(_) => format!(
-            "CT reconstruction: your {} run FAILED — see the app for details",
-            ctx.algo_label
-        ),
-    }
-}
-
 fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_owned())
@@ -205,24 +159,22 @@ fn hostname() -> String {
 // Saved notification settings (~/.config/rust_ct_reconstruction/notify.json)
 // so the address and phone number survive restarts.
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Settings {
     pub email_enabled: bool,
+    /// Optional replacement address; empty = the default `<user>@ornl.gov`.
     pub email: String,
-    pub sms_enabled: bool,
-    pub phone: String,
-    /// Index into [`CARRIERS`].
-    pub carrier: usize,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            email_enabled: false,
-            email: default_email(),
-            sms_enabled: false,
-            phone: String::new(),
-            carrier: 0,
+impl Settings {
+    /// Where the notification actually goes: the custom address when one
+    /// was typed, the user's ORNL address otherwise.
+    pub fn recipient(&self) -> String {
+        let custom = self.email.trim();
+        if custom.is_empty() {
+            default_email()
+        } else {
+            custom.to_owned()
         }
     }
 }
@@ -262,17 +214,12 @@ fn read_settings(path: &Path) -> Settings {
     if let Some(v) = json.get("email_enabled").and_then(|v| v.as_bool()) {
         settings.email_enabled = v;
     }
-    if let Some(v) = json.get("email").and_then(|v| v.as_str()) {
+    if let Some(v) = json.get("email").and_then(|v| v.as_str())
+        // Settings written before the address became an override stored the
+        // default explicitly; treat it as "use the default".
+        && v != default_email()
+    {
         settings.email = v.to_owned();
-    }
-    if let Some(v) = json.get("sms_enabled").and_then(|v| v.as_bool()) {
-        settings.sms_enabled = v;
-    }
-    if let Some(v) = json.get("phone").and_then(|v| v.as_str()) {
-        settings.phone = v.to_owned();
-    }
-    if let Some(v) = json.get("carrier").and_then(|v| v.as_u64()) {
-        settings.carrier = (v as usize).min(CARRIERS.len() - 1);
     }
     settings
 }
@@ -285,9 +232,6 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
     let json = serde_json::json!({
         "email_enabled": settings.email_enabled,
         "email": settings.email,
-        "sms_enabled": settings.sms_enabled,
-        "phone": settings.phone,
-        "carrier": settings.carrier,
     });
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -321,17 +265,13 @@ mod tests {
     }
 
     #[test]
-    fn sms_address_normalizes_us_numbers() {
-        assert_eq!(
-            sms_address("(555) 123-4567", "vtext.com").as_deref(),
-            Ok("5551234567@vtext.com")
-        );
-        assert_eq!(
-            sms_address("1-555-123-4567", "txt.att.net").as_deref(),
-            Ok("5551234567@txt.att.net")
-        );
-        assert!(sms_address("12345", "vtext.com").is_err());
-        assert!(sms_address("+44 20 7946 0958", "vtext.com").is_err());
+    fn recipient_falls_back_to_the_default_address() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.recipient(), default_email());
+        settings.email = "  ".to_owned();
+        assert_eq!(settings.recipient(), default_email());
+        settings.email = "someone@example.com".to_owned();
+        assert_eq!(settings.recipient(), "someone@example.com");
     }
 
     #[test]
@@ -362,25 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn sms_text_stays_short() {
-        let ctx = context();
-        assert!(sms_text(&ctx, &Ok(stats())).len() <= 160);
-        assert!(sms_text(&ctx, &Err("boom".to_owned())).len() <= 160);
-    }
-
-    #[test]
     fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!("notify_test_{}", std::process::id()));
         let file = dir.join("notify.json");
         let settings = Settings {
             email_enabled: true,
-            email: "j35@ornl.gov".to_owned(),
-            sms_enabled: true,
-            phone: "555-123-4567".to_owned(),
-            carrier: 2,
+            email: "someone@example.com".to_owned(),
         };
         write_settings(&file, &settings).unwrap();
         assert_eq!(read_settings(&file), settings);
+        // A stored default address (written by the previous version, which
+        // prefilled it) reads back as "use the default".
+        let old = Settings {
+            email_enabled: true,
+            email: default_email(),
+        };
+        write_settings(&file, &old).unwrap();
+        assert_eq!(read_settings(&file).email, "");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
