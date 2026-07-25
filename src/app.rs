@@ -2205,13 +2205,19 @@ impl WhiteBeamView {
 
     fn with_detector(detector: WbDetector, session: &Session) -> Self {
         let instrument = session.instrument;
-        let sample =
-            MultiFolderPick::new("sample", detector.ct_root(instrument, &session.ipts.path));
-        let ob =
-            MultiFolderPick::new("open beam", detector.ob_root(instrument, &session.ipts.path));
+        let sample = MultiFolderPick::new(
+            "sample",
+            detector.ct_root(instrument, &session.ipts.path),
+            &session.ipts.path,
+        );
+        let ob = MultiFolderPick::new(
+            "open beam",
+            detector.ob_root(instrument, &session.ipts.path),
+            &session.ipts.path,
+        );
         let dc = detector
             .dc_root(instrument, &session.ipts.path)
-            .map(|root| MultiFolderPick::new("dark current", root));
+            .map(|root| MultiFolderPick::new("dark current", root, &session.ipts.path));
         let describe = |pick: &MultiFolderPick| {
             format!(
                 "{} ({})",
@@ -2402,6 +2408,8 @@ struct MultiFolderPick {
     /// "sample" or "open beam" — used in headings and log lines.
     kind: &'static str,
     root: PathBuf,
+    /// Where the Browse dialog opens: the experiment's `shared` folder.
+    browse_start: PathBuf,
     candidates: Result<Vec<PathBuf>, String>,
     /// Selected folders (sorted by name): `(folder, used TIFFs, superseded
     /// TIFFs)` — superseded are older revisions of retaken projections,
@@ -2411,11 +2419,12 @@ struct MultiFolderPick {
 }
 
 impl MultiFolderPick {
-    fn new(kind: &'static str, root: PathBuf) -> Self {
+    fn new(kind: &'static str, root: PathBuf, ipts: &Path) -> Self {
         let candidates = tof::list_subdirs(&root);
         Self {
             kind,
             root,
+            browse_start: ipts.join("shared"),
             candidates,
             selected: Vec::new(),
             error: None,
@@ -2507,7 +2516,11 @@ impl MultiFolderPick {
         if ui.button("📂 Browse…").clicked() {
             let mut dialog = rfd::FileDialog::new()
                 .set_title(format!("Select {} folder(s)", self.kind));
-            let start = if self.root.is_dir() {
+            // Start in the experiment's shared folder; fall back to the
+            // detector data root when the experiment has none.
+            let start = if self.browse_start.is_dir() {
+                Some(self.browse_start.clone())
+            } else if self.root.is_dir() {
                 Some(self.root.clone())
             } else {
                 self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
@@ -2628,8 +2641,10 @@ impl TofView {
     }
 
     fn with_detector(detector: Detector, session: &Session) -> Self {
-        let sample = FolderPick::new("sample", detector.ct_root(&session.ipts.path));
-        let ob = FolderPick::new("open beam", detector.ob_root(&session.ipts.path));
+        let sample =
+            FolderPick::new("sample", detector.ct_root(&session.ipts.path), &session.ipts.path);
+        let ob =
+            FolderPick::new("open beam", detector.ob_root(&session.ipts.path), &session.ipts.path);
         logger::log(format!(
             "TOF detector: {} — sample root {} ({}), OB root {} ({})",
             detector.label(),
@@ -2692,6 +2707,8 @@ struct FolderPick {
     /// "sample" or "open beam" — used in headings and log lines.
     kind: &'static str,
     root: PathBuf,
+    /// Where the Browse dialog opens: the experiment's `shared` folder.
+    browse_start: PathBuf,
     candidates: Result<Vec<PathBuf>, String>,
     selected: Option<PathBuf>,
     scan: Option<FolderScan>,
@@ -2700,11 +2717,12 @@ struct FolderPick {
 }
 
 impl FolderPick {
-    fn new(kind: &'static str, root: PathBuf) -> Self {
+    fn new(kind: &'static str, root: PathBuf, ipts: &Path) -> Self {
         let candidates = tof::list_subdirs(&root);
         Self {
             kind,
             root,
+            browse_start: ipts.join("shared"),
             candidates,
             selected: None,
             scan: None,
@@ -2789,7 +2807,11 @@ impl FolderPick {
 
         if ui.button("📂 Browse…").clicked() {
             let mut dialog = rfd::FileDialog::new().set_title(format!("Select the {} folder", self.kind));
-            let start = if self.root.is_dir() {
+            // Start in the experiment's shared folder; fall back to the
+            // detector data root when the experiment has none.
+            let start = if self.browse_start.is_dir() {
+                Some(self.browse_start.clone())
+            } else if self.root.is_dir() {
                 Some(self.root.clone())
             } else {
                 self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
