@@ -362,6 +362,12 @@ struct ReconView {
     /// job finishes.
     run_output: Option<std::sync::Arc<std::sync::Mutex<String>>>,
     show_run_output: bool,
+    /// End-of-run notification settings (email / text), persisted per user.
+    notify: crate::notify::Settings,
+    /// What the notifications are built from, captured when the run starts.
+    run_context: Option<crate::notify::RunContext>,
+    /// Outcome of each notification sent for the last run.
+    notify_status: Vec<Result<String, String>>,
 }
 
 impl ReconView {
@@ -396,6 +402,9 @@ impl ReconView {
             settings_save_status: None,
             run_output: None,
             show_run_output: false,
+            notify: crate::notify::load_settings(),
+            run_context: None,
+            notify_status: Vec::new(),
         };
         if let Some((_, json)) = view
             .stack
@@ -606,6 +615,106 @@ fn config_json_rows(ui: &mut egui::Ui, json: &str) {
             ui.label(RichText::new(json).size(12.0));
         }
     }
+}
+
+/// The "notify me when done" block of the Run section: an email with the
+/// full report and/or a short text message through the carrier's
+/// email-to-SMS gateway.
+fn notify_settings_ui(ui: &mut egui::Ui, settings: &mut crate::notify::Settings) {
+    use crate::notify;
+    ui.label(
+        RichText::new("Notify me when the reconstruction is done")
+            .strong()
+            .size(13.0),
+    );
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut settings.email_enabled, "📧 email");
+        ui.add_enabled(
+            settings.email_enabled,
+            egui::TextEdit::singleline(&mut settings.email).desired_width(220.0),
+        );
+        ui.label(
+            RichText::new("full report: duration, output folder, every parameter used")
+                .weak()
+                .size(11.0),
+        );
+    });
+    if settings.email_enabled && !notify::valid_email(&settings.email) {
+        ui.colored_label(Color32::LIGHT_RED, "enter a valid email address");
+    }
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut settings.sms_enabled, "📱 text");
+        ui.add_enabled(
+            settings.sms_enabled,
+            egui::TextEdit::singleline(&mut settings.phone)
+                .hint_text("10-digit US number")
+                .desired_width(140.0),
+        );
+        ui.add_enabled_ui(settings.sms_enabled, |ui| {
+            settings.carrier = settings.carrier.min(notify::CARRIERS.len() - 1);
+            egui::ComboBox::from_id_salt("sms_carrier")
+                .selected_text(notify::CARRIERS[settings.carrier].0)
+                .show_ui(ui, |ui| {
+                    for (i, (name, _)) in notify::CARRIERS.iter().enumerate() {
+                        ui.selectable_value(&mut settings.carrier, i, *name);
+                    }
+                });
+        });
+        ui.label(
+            RichText::new("short \"done\" message, sent through the carrier's email-to-SMS gateway")
+                .weak()
+                .size(11.0),
+        );
+    });
+    if settings.sms_enabled
+        && let Err(e) = notify::sms_address(&settings.phone, notify::CARRIERS[settings.carrier].1)
+    {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
+/// Send the notifications requested for a finished (or failed) run; one
+/// result line per channel, shown under the run result.
+fn send_run_notifications(
+    settings: &crate::notify::Settings,
+    ctx: &crate::notify::RunContext,
+    result: &Result<crate::recon_run::RunStats, String>,
+) -> Vec<Result<String, String>> {
+    use crate::notify;
+    let mut status = Vec::new();
+    if settings.email_enabled {
+        let to = settings.email.trim().to_owned();
+        let sent = if notify::valid_email(&to) {
+            notify::send_mail(
+                &to,
+                &notify::email_subject(ctx, result),
+                &notify::email_body(ctx, result),
+            )
+            .map(|()| format!("email sent to {to}"))
+        } else {
+            Err(format!("'{to}' is not a valid email address"))
+        };
+        match &sent {
+            Ok(msg) => logger::log(msg.clone()),
+            Err(e) => logger::error(format!("email notification failed: {e}")),
+        }
+        status.push(sent);
+    }
+    if settings.sms_enabled {
+        let (carrier, gateway) = notify::CARRIERS[settings.carrier.min(notify::CARRIERS.len() - 1)];
+        let sent = notify::sms_address(&settings.phone, gateway)
+            .and_then(|address| {
+                notify::send_mail(&address, "", &notify::sms_text(ctx, result))
+                    .map(|()| address)
+            })
+            .map(|address| format!("text sent to {address} ({carrier})"));
+        match &sent {
+            Ok(msg) => logger::log(msg.clone()),
+            Err(e) => logger::error(format!("text notification failed: {e}")),
+        }
+        status.push(sent);
+    }
+    status
 }
 
 /// The reconstruction screen: evaluate the algorithms (optional), then pick
@@ -1293,6 +1402,9 @@ fn recon_ui(
                                 logger::error(format!("full reconstruction failed: {e}"))
                             }
                         }
+                        if let Some(ctx) = &view.run_context {
+                            view.notify_status = send_run_notifications(&view.notify, ctx, &result);
+                        }
                         view.run_result = Some(result);
                         view.run_job = None;
                     }
@@ -1392,6 +1504,9 @@ fn recon_ui(
                 }
                 None => {}
             }
+            ui.add_space(6.0);
+            notify_settings_ui(ui, &mut view.notify);
+            ui.add_space(4.0);
             if ui
                 .add_enabled(
                     view.output_base.is_some() && !running && h > 0,
@@ -1446,6 +1561,19 @@ fn recon_ui(
                     output_folder.display()
                 ));
                 view.run_result = None;
+                view.notify_status.clear();
+                // The settings are "in use" now — persist them, and keep a
+                // copy of everything the end-of-run notifications report.
+                crate::notify::save_settings(&view.notify);
+                view.run_context = Some(crate::notify::RunContext {
+                    algo_label: algo.label.to_owned(),
+                    params_json: params_json.clone(),
+                    slice_from: from,
+                    slice_to: to,
+                    n_jobs: jobs.len(),
+                    checkpoint: view.path.clone(),
+                    metadata: view.stack.metadata.clone(),
+                });
                 let job = crate::recon_run::RunJob::start(
                     std::sync::Arc::clone(&view.stack),
                     crate::recon_run::RunSpec {
@@ -1564,6 +1692,19 @@ fn recon_ui(
                     ui.colored_label(Color32::LIGHT_RED, e);
                 }
                 None => {}
+            }
+            for sent in &view.notify_status {
+                match sent {
+                    Ok(msg) => {
+                        ui.colored_label(
+                            Color32::from_rgb(120, 200, 120),
+                            format!("🔔 {msg}"),
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::LIGHT_RED, format!("🔔 {e}"));
+                    }
+                }
             }
             if let Some(e) = &view.viewer_error {
                 ui.colored_label(Color32::LIGHT_RED, e);
