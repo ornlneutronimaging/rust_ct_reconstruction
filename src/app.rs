@@ -757,32 +757,6 @@ fn recon_ui(
         ))
         .strong(),
     );
-    let mut tilt_tool = false;
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                view.path.is_file()
-                    && view.optimizer_job.is_none()
-                    && view.reload_job.is_none(),
-                egui::Button::new("🎯 Tilt & center-of-rotation tool"),
-            )
-            .on_hover_text(
-                "open the standalone estimator: 0/180 opposite-pair algorithms \
-                 measure the rotation-axis tilt and center, the correction is \
-                 applied and saved into this checkpoint, and it is reloaded here",
-            )
-            .on_disabled_hover_text("the stack is not saved to a file yet")
-            .clicked()
-        {
-            tilt_tool = true;
-        }
-        ui.label(
-            RichText::new("for the challenging cases where the pre-processing values are off")
-                .weak()
-                .size(11.0),
-        );
-    });
     ui.add_space(6.0);
     egui::CollapsingHeader::new(RichText::new("Provenance").strong())
         .default_open(false)
@@ -859,9 +833,6 @@ fn recon_ui(
         .filter(|(name, _)| name.ends_with("_config"))
         .count();
     let mut launch: Option<(&'static str, String)> = None;
-    if tilt_tool {
-        launch = Some((TILT_COR_BIN, "the tilt & center-of-rotation tool".to_owned()));
-    }
     let mut clicked: Option<ReconSection> = None;
     let mut section = |ui: &mut egui::Ui,
                        view: &mut ReconView,
@@ -1782,8 +1753,100 @@ enum StackSection {
     Rotate,
     Tilt,
     Cor,
+    TiltCorTool,
     Sinogram,
     Log,
+}
+
+/// The standalone tilt & center-of-rotation tool, run on the CURRENT
+/// in-memory stack: write it to a work HDF5 next to the loaded file, open
+/// the tool on it, then read the (possibly corrected) stack back. The
+/// second value is a summary of the newly applied correction, `None` when
+/// the tool was closed without applying one.
+struct TiltToolJob {
+    rx: std::sync::mpsc::Receiver<Result<(LoadedStack, Option<String>), String>>,
+    progress: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl TiltToolJob {
+    fn start(
+        stack: std::sync::Arc<LoadedStack>,
+        cor: Option<f64>,
+        dir: PathBuf,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(
+            "writing the stack to a work file…".to_owned(),
+        ));
+        let progress_thread = std::sync::Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let _ = tx.send(run_tilt_tool(&stack, cor, &dir, &progress_thread));
+        });
+        Self { rx, progress }
+    }
+
+    fn poll(&mut self) -> Option<Result<(LoadedStack, Option<String>), String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// The tool's correction records in a stack's metadata (one JSON line per
+/// applied correction).
+fn tilt_tool_records(metadata: &[(String, String)]) -> Vec<&str> {
+    metadata
+        .iter()
+        .find(|(name, _)| name == "tilt_center_of_rotation")
+        .map(|(_, value)| value.lines().filter(|l| !l.trim().is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn run_tilt_tool(
+    stack: &LoadedStack,
+    cor: Option<f64>,
+    dir: &Path,
+    progress: &std::sync::Arc<std::sync::Mutex<String>>,
+) -> Result<(LoadedStack, Option<String>), String> {
+    let work = dir.join(format!(".tilt_cor_work_{}.h5", std::process::id()));
+    let before = tilt_tool_records(&stack.metadata).len();
+    combine::save_stack_hdf5(&work, stack, cor, &[])?;
+    *progress.lock().unwrap() =
+        "the tilt & center-of-rotation tool is open — estimate, apply & save \
+         there, then close it to come back"
+            .to_owned();
+    let output = std::process::Command::new(TILT_COR_BIN)
+        .arg(&work)
+        .arg("--called-from-app")
+        .output();
+    let result = (|| {
+        let output = output.map_err(|e| format!("cannot launch {TILT_COR_BIN}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "the tilt & center-of-rotation tool failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        *progress.lock().unwrap() = "reading the corrected stack back…".to_owned();
+        let mut loaded = combine::load_hdf5(&work)?;
+        // The work file is deleted right after this; keep pointing at the
+        // file the session came from.
+        loaded.path = stack.path.clone();
+        let records = tilt_tool_records(&loaded.metadata);
+        let summary = (records.len() > before)
+            .then(|| records.last().copied())
+            .flatten()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .map(|doc| {
+                format!(
+                    "tilt of {:.3}° corrected, center of rotation {:.2} px",
+                    doc.get("corrected_tilt_deg").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    doc.get("center_of_rotation").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                )
+            });
+        Ok((loaded, summary))
+    })();
+    let _ = std::fs::remove_file(&work);
+    result
 }
 
 /// Shown on a section's header: whether the step was run.
@@ -1898,6 +1961,12 @@ struct StackView {
     /// Preview texture, keyed by (stack, frame or MAX for overlay, cor bits).
     cor_tex: Option<((usize, usize, u64), egui::TextureHandle)>,
 
+    // Standalone tilt & center-of-rotation tool, run on a work copy of the
+    // current stack for the challenging cases.
+    tilt_tool_job: Option<TiltToolJob>,
+    tilt_tool_summary: Option<String>,
+    tilt_tool_error: Option<String>,
+
     // Remove stripes (after normalization; tomopy via the pixi python).
     stripe_algos: Vec<StripeAlgo>,
     /// Row band (y0, y1) the test run works on.
@@ -1993,6 +2062,9 @@ impl StackView {
             cor_frame: None,
             cor_overlay: false,
             cor_tex: None,
+            tilt_tool_job: None,
+            tilt_tool_summary: None,
+            tilt_tool_error: None,
             stripe_algos: stripes::default_algorithms(),
             stripe_range: None,
             stripe_test_job: None,
@@ -3903,6 +3975,16 @@ fn stack_ui(
             run_status(view.cor_result.is_some()),
             &mut |ui, view| {
                 cor_section_ui(ui, view);
+            },
+        );
+        section(
+            ui,
+            view,
+            StackSection::TiltCorTool,
+            "Tilt & center of rotation — standalone tool",
+            run_status(view.tilt_tool_summary.is_some()),
+            &mut |ui, view| {
+                tilt_tool_section_ui(ui, view);
             },
         );
         section(
@@ -5920,6 +6002,103 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// The sinogram of one detector row of the current (normalized, possibly
 /// rotated) stack: one line per projection, in stack order (increasing
 /// angle), against the detector column.
+/// The standalone tilt & center-of-rotation tool, for the challenging
+/// cases the sections above cannot crack: the current stack is written to a
+/// work HDF5, the sibling app estimates (0/180 opposite-pair algorithms,
+/// sub-pixel, all-pairs consensus) and applies the correction there, and
+/// the corrected stack is read back in.
+fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.tilt_tool_job {
+        match job.poll() {
+            Some(Ok((stack, summary))) => {
+                match summary {
+                    Some(summary) => {
+                        logger::log(format!("tilt & center-of-rotation tool: {summary}"));
+                        view.cor_result = stack.center_of_rotation.or(view.cor_result);
+                        view.stack = std::sync::Arc::new(stack);
+                        view.tilt_tool_summary = Some(summary);
+                        // The projections changed: a done log conversion no
+                        // longer describes them.
+                        view.clear_log();
+                    }
+                    None => {
+                        logger::log(
+                            "tilt & center-of-rotation tool closed without applying \
+                             a correction",
+                        );
+                    }
+                }
+                view.tilt_tool_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("tilt & center-of-rotation tool: {e}"));
+                view.tilt_tool_error = Some(e);
+                view.tilt_tool_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(job.progress.lock().unwrap().clone());
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+        }
+    }
+    ui.label(
+        "For the challenging volumes: a standalone application with more robust \
+         algorithms — sub-pixel 0°/180° registration of a chosen pair, or a \
+         consensus over every opposite pair in the scan — with a difference view \
+         to verify the axis visually.",
+    );
+    ui.label(
+        RichText::new(
+            "the current stack (with every step above applied) is handed to the \
+             tool through a work file next to the loaded HDF5; applying & saving \
+             there brings the corrected projections and the center of rotation \
+             back here",
+        )
+        .weak()
+        .size(11.0),
+    );
+    ui.add_space(4.0);
+    if ui
+        .add_enabled(
+            view.tilt_tool_job.is_none() && !view.stack.sample.is_empty(),
+            egui::Button::new("🎯 Open the tilt & center-of-rotation tool"),
+        )
+        .clicked()
+    {
+        let dir = view
+            .stack
+            .path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        logger::log(format!(
+            "opening the tilt & center-of-rotation tool (work file in {})",
+            dir.display()
+        ));
+        view.tilt_tool_error = None;
+        view.tilt_tool_job = Some(TiltToolJob::start(
+            std::sync::Arc::clone(&view.stack),
+            view.cor_result,
+            dir,
+        ));
+    }
+    if let Some(summary) = &view.tilt_tool_summary {
+        ui.colored_label(
+            Color32::from_rgb(120, 200, 120),
+            format!("applied: {summary}"),
+        );
+    }
+    if let Some(e) = &view.tilt_tool_error {
+        ui.colored_label(Color32::LIGHT_RED, e);
+    }
+}
+
 fn sinogram_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let stack = std::sync::Arc::clone(&view.stack);
     let Some(first) = stack.sample.first() else {
