@@ -206,6 +206,9 @@ fn nav_buttons(ui: &mut egui::Ui) -> Nav {
 const SVMBIR_OPTIMIZER_BIN: &str =
     "/SNS/VENUS/shared/software/git/rust_svmbir_optimizer/target/release/svmbir_optimizer";
 
+/// The standalone tilt & center-of-rotation tool of the sibling repo.
+const TILT_COR_BIN: &str = "/SNS/VENUS/shared/software/git/rust_tilt_center_of_rotation/target/release/tilt_center_of_rotation";
+
 /// The reconstruction algorithms of the pipeline (the Python
 /// `ReconstructionAlgorithm` list); each gets its own standalone evaluation
 /// application, launched from the reconstruction screen.
@@ -754,6 +757,32 @@ fn recon_ui(
         ))
         .strong(),
     );
+    let mut tilt_tool = false;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                view.path.is_file()
+                    && view.optimizer_job.is_none()
+                    && view.reload_job.is_none(),
+                egui::Button::new("🎯 Tilt & center-of-rotation tool"),
+            )
+            .on_hover_text(
+                "open the standalone estimator: 0/180 opposite-pair algorithms \
+                 measure the rotation-axis tilt and center, the correction is \
+                 applied and saved into this checkpoint, and it is reloaded here",
+            )
+            .on_disabled_hover_text("the stack is not saved to a file yet")
+            .clicked()
+        {
+            tilt_tool = true;
+        }
+        ui.label(
+            RichText::new("for the challenging cases where the pre-processing values are off")
+                .weak()
+                .size(11.0),
+        );
+    });
     ui.add_space(6.0);
     egui::CollapsingHeader::new(RichText::new("Provenance").strong())
         .default_open(false)
@@ -773,14 +802,14 @@ fn recon_ui(
         let label = label.clone();
         match rx.try_recv() {
             Ok(Ok(())) => {
-                logger::log(format!("{label} evaluator closed — reloading the checkpoint"));
+                logger::log(format!("{label} closed — reloading the checkpoint"));
                 view.optimizer_job = None;
                 if view.path.is_file() {
                     view.reload_job = Some(LoadJob::start(view.path.clone()));
                 }
             }
             Ok(Err(e)) => {
-                logger::error(format!("{label} evaluator failed: {e}"));
+                logger::error(format!("{label} failed: {e}"));
                 view.opt_error = Some(e);
                 view.optimizer_job = None;
             }
@@ -788,8 +817,7 @@ fn recon_ui(
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(format!(
-                        "{label} evaluator is open — tune, evaluate, then save the \
-                         parameters there"
+                        "{label} is open — work there, then close it to come back"
                     ));
                 });
                 ctx.request_repaint_after(Duration::from_millis(300));
@@ -831,6 +859,9 @@ fn recon_ui(
         .filter(|(name, _)| name.ends_with("_config"))
         .count();
     let mut launch: Option<(&'static str, String)> = None;
+    if tilt_tool {
+        launch = Some((TILT_COR_BIN, "the tilt & center-of-rotation tool".to_owned()));
+    }
     let mut clicked: Option<ReconSection> = None;
     let mut section = |ui: &mut egui::Ui,
                        view: &mut ReconView,
@@ -892,7 +923,7 @@ fn recon_ui(
                 if response.clicked()
                     && let Some(binary) = algo.binary
                 {
-                    launch = Some((binary, algo.label.to_owned()));
+                    launch = Some((binary, format!("the {} evaluator", algo.label)));
                 }
                 let config_key = format!("{}_config", algo.key);
                 let config = view
@@ -1695,7 +1726,7 @@ fn recon_ui(
     }
     if let Some((binary, label)) = launch {
         logger::log(format!(
-            "opening the {label} evaluator on {}",
+            "opening {label} on {}",
             view.path.display()
         ));
         view.opt_error = None;
