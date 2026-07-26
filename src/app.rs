@@ -1751,9 +1751,7 @@ enum StackSection {
     Bm3d,
     Stripes,
     Rotate,
-    Tilt,
-    Cor,
-    TiltCorTool,
+    TiltCor,
     Sinogram,
     Log,
 }
@@ -3960,31 +3958,15 @@ fn stack_ui(
         section(
             ui,
             view,
-            StackSection::Tilt,
-            "Tilt correction",
-            run_status(view.tilt_applied.is_some()),
+            StackSection::TiltCor,
+            "Tilt & center of rotation",
+            run_status(
+                view.tilt_applied.is_some()
+                    || view.cor_result.is_some()
+                    || view.tilt_tool_summary.is_some(),
+            ),
             &mut |ui, view| {
-                tilt_section_ui(ui, view);
-            },
-        );
-        section(
-            ui,
-            view,
-            StackSection::Cor,
-            "Center of rotation",
-            run_status(view.cor_result.is_some()),
-            &mut |ui, view| {
-                cor_section_ui(ui, view);
-            },
-        );
-        section(
-            ui,
-            view,
-            StackSection::TiltCorTool,
-            "Tilt & center of rotation — standalone tool",
-            run_status(view.tilt_tool_summary.is_some()),
-            &mut |ui, view| {
-                tilt_tool_section_ui(ui, view);
+                tilt_cor_section_ui(ui, view);
             },
         );
         section(
@@ -4929,6 +4911,65 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// Tilt correction (neutompy find_COR port): estimate the rotation-axis
 /// tilt and offset from the 0° and 180° projections, then rotate + roll
 /// every projection to straighten it.
+/// The tilt & center-of-rotation section: the two in-tool calculations as
+/// sub-sections, and the standalone application for going deeper when the
+/// volume is challenging.
+fn tilt_cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    ui.label(
+        RichText::new(
+            "Correct the rotation-axis tilt and find the center of rotation here; \
+             when the volume is challenging and these are not enough, go deeper \
+             with the standalone application below.",
+        )
+        .weak()
+        .size(12.0),
+    );
+    ui.add_space(4.0);
+    let sub = |ui: &mut egui::Ui,
+               view: &mut StackView,
+               id: &str,
+               title: &str,
+               done: bool,
+               body: &mut dyn FnMut(&mut egui::Ui, &mut StackView)| {
+        let header = if done {
+            RichText::new(format!("✔ {title}"))
+                .strong()
+                .color(Color32::from_rgb(120, 200, 120))
+        } else {
+            RichText::new(title).strong()
+        };
+        egui::CollapsingHeader::new(header)
+            .id_salt(id)
+            .default_open(false)
+            .show(ui, |ui| body(ui, view));
+        ui.add_space(2.0);
+    };
+    sub(
+        ui,
+        view,
+        "tilt_sub",
+        "Tilt correction",
+        view.tilt_applied.is_some(),
+        &mut |ui, view| tilt_section_ui(ui, view),
+    );
+    sub(
+        ui,
+        view,
+        "cor_sub",
+        "Center of rotation",
+        view.cor_result.is_some(),
+        &mut |ui, view| cor_section_ui(ui, view),
+    );
+    sub(
+        ui,
+        view,
+        "tilt_tool_sub",
+        "Go deeper — standalone application",
+        view.tilt_tool_summary.is_some(),
+        &mut |ui, view| tilt_tool_section_ui(ui, view),
+    );
+}
+
 fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let ctx = ui.ctx().clone();
     // Fold finished background work into the view.
