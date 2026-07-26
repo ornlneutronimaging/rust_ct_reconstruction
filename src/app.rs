@@ -6091,7 +6091,9 @@ fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         "For the challenging volumes: a standalone application with more robust \
          algorithms — sub-pixel 0°/180° registration of a chosen pair, or a \
          consensus over every opposite pair in the scan — with a difference view \
-         to verify the axis visually.",
+         to verify the axis visually, and a gridrec (FBP) test-slice \
+         reconstruction to judge the tilt and center on an actual \
+         reconstruction (sweeping several centers to find the sharpest).",
     );
     ui.label(
         RichText::new(
