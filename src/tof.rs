@@ -382,7 +382,7 @@ impl PreprocessScan {
 /// TOF images are combined. Its `--called-from-marimo` mode prints the
 /// selections as JSON on stdout and closes.
 pub const TOF_PROFILE_VIEWER_BIN: &str =
-    "/SNS/VENUS/shared/software/git/rust_tof_profile_viewer/target/release/tof_profile_viewer";
+    "/SNS/VENUS/shared/software/git/rust_tof_profile_rebin_viewer/target/release/tof_profile_rebin_viewer";
 
 /// One selection exported by the TOF Profile Viewer: the same range on every
 /// axis it could express it in (an axis is `None` when no TOF spectra were
