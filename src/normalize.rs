@@ -18,8 +18,10 @@ use std::sync::mpsc::{Receiver, channel};
 pub const ROI_SELECTOR_BIN: &str =
     "/SNS/VENUS/shared/software/git/rust_roi_selector/target/release/roi_selector";
 
-/// The interpreter used to run NeuNorm.
-pub const PYTHON: &str = "python3";
+/// The interpreter used to run NeuNorm: the same pinned pixi environment as
+/// the reconstruction, so it works for every user (a bare `python3` resolves
+/// to whatever is on the user's PATH, which usually has no NeuNorm).
+pub const PYTHON: &str = crate::recon_run::RECON_PYTHON;
 
 #[derive(Clone, Debug, Default)]
 pub struct NormSettings {
