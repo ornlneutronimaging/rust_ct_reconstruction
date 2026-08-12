@@ -78,12 +78,38 @@ enum Screen {
 /// every screen.
 const PIPELINE_STEPS: [&str; 4] = ["Setup", "Load", "Pre-processing", "Reconstruction"];
 
+/// Green for "done/success" text: the pale shade tuned for the dark theme
+/// washes out on the light panel background.
+fn ok_text(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(120, 200, 120)
+    } else {
+        Color32::from_rgb(0, 120, 0)
+    }
+}
+
+/// Amber for warning text, same reasoning as [`ok_text`].
+fn warn_text(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(240, 180, 60)
+    } else {
+        Color32::from_rgb(170, 100, 0)
+    }
+}
+
 /// A slim progress strip: the four pipeline steps with the completed ones
 /// checked in green, the current one highlighted, and the upcoming ones
 /// dimmed.
 fn pipeline_bar(ui: &mut egui::Ui, current: usize) {
     let done_color = Color32::from_rgb(120, 200, 120);
     let current_color = Color32::from_rgb(100, 170, 255);
+    // The circle fills stay bright on both themes; only the step names need
+    // darker text on the light background.
+    let (done_text, current_text) = if ui.visuals().dark_mode {
+        (done_color, current_color)
+    } else {
+        (Color32::from_rgb(0, 120, 0), Color32::from_rgb(0, 86, 160))
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         for (i, name) in PIPELINE_STEPS.iter().enumerate() {
@@ -127,9 +153,9 @@ fn pipeline_bar(ui: &mut egui::Ui, current: usize) {
                 mark_color,
             );
             let label = if i < current {
-                RichText::new(*name).color(done_color).size(12.0)
+                RichText::new(*name).color(done_text).size(12.0)
             } else if i == current {
-                RichText::new(*name).strong().color(current_color).size(13.0)
+                RichText::new(*name).strong().color(current_text).size(13.0)
             } else {
                 RichText::new(*name).weak().size(12.0)
             };
@@ -652,7 +678,7 @@ fn notify_settings_ui(ui: &mut egui::Ui, settings: &mut crate::notify::Settings)
         });
     });
     if settings.email_enabled && !notify::valid_email(&settings.recipient()) {
-        ui.colored_label(Color32::LIGHT_RED, "enter a valid email address");
+        ui.colored_label(ui.visuals().error_fg_color, "enter a valid email address");
     }
 }
 
@@ -854,7 +880,7 @@ fn recon_ui(
     let evaluate_header = if evaluated > 0 {
         RichText::new(format!("✔ Evaluate the algorithms (optional) — {evaluated} evaluated"))
             .strong()
-            .color(Color32::from_rgb(120, 200, 120))
+            .color(ok_text(ui))
     } else {
         RichText::new("Evaluate the algorithms (optional)").strong()
     };
@@ -869,7 +895,7 @@ fn recon_ui(
         );
         if !on_disk {
             ui.colored_label(
-                Color32::from_rgb(240, 180, 60),
+                warn_text(ui),
                 "the stack is not saved to a file yet — save the checkpoint first to \
                  evaluate the algorithms",
             );
@@ -905,7 +931,7 @@ fn recon_ui(
                     .map(|(_, json)| json.clone());
                 if available {
                     let icon = if config.is_some() {
-                        RichText::new("👁").color(Color32::from_rgb(120, 200, 120))
+                        RichText::new("👁").color(ok_text(ui))
                     } else {
                         RichText::new("👁").weak()
                     };
@@ -940,7 +966,7 @@ fn recon_ui(
                     if config.is_some() {
                         ui.label(
                             RichText::new("parameters saved")
-                                .color(Color32::from_rgb(120, 200, 120))
+                                .color(ok_text(ui))
                                 .size(11.0),
                         );
                     } else {
@@ -973,7 +999,7 @@ fn recon_ui(
                     .any(|(name, _)| *name == config_key);
                 let text = format!("{} — {}", algo.label, algo.description);
                 let label = if evaluated {
-                    RichText::new(format!("✔ {text}")).color(Color32::from_rgb(120, 200, 120))
+                    RichText::new(format!("✔ {text}")).color(ok_text(ui))
                 } else {
                     RichText::new(text)
                 };
@@ -1126,7 +1152,7 @@ fn recon_ui(
                                         format!("{} or {base}", base + 1)
                                     }
                                 ))
-                                .color(Color32::from_rgb(120, 200, 120))
+                                .color(ok_text(ui))
                                 .size(12.0),
                             );
                             egui::ScrollArea::vertical()
@@ -1465,10 +1491,10 @@ fn recon_ui(
             }
             match &view.settings_save_status {
                 Some(Ok(msg)) => {
-                    ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+                    ui.colored_label(ok_text(ui), msg);
                 }
                 Some(Err(e)) => {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 None => {}
             }
@@ -1573,7 +1599,7 @@ fn recon_ui(
                     let dir = &stats.output_folder;
                     ui.horizontal(|ui| {
                         ui.colored_label(
-                            Color32::from_rgb(120, 200, 120),
+                            ok_text(ui),
                             format!("reconstruction written into {}", dir.display()),
                         );
                         let viewing = view.viewer_job.is_some();
@@ -1657,7 +1683,7 @@ fn recon_ui(
                     }
                 }
                 Some(Err(e)) => {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 None => {}
             }
@@ -1665,17 +1691,17 @@ fn recon_ui(
                 match sent {
                     Ok(msg) => {
                         ui.colored_label(
-                            Color32::from_rgb(120, 200, 120),
+                            ok_text(ui),
                             format!("🔔 {msg}"),
                         );
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::LIGHT_RED, format!("🔔 {e}"));
+                        ui.colored_label(ui.visuals().error_fg_color, format!("🔔 {e}"));
                     }
                 }
             }
             if let Some(e) = &view.viewer_error {
-                ui.colored_label(Color32::LIGHT_RED, e);
+                ui.colored_label(ui.visuals().error_fg_color, e);
             }
             if let Some(output) = view.run_output.clone() {
                 terminal_output_ui(
@@ -1721,7 +1747,7 @@ fn recon_ui(
         view.optimizer_job = Some((label, rx));
     }
     if let Some(e) = &view.opt_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
     nav
 }
@@ -2586,7 +2612,7 @@ impl MultiFolderPick {
         let mut toggled: Option<PathBuf> = None;
         match &self.candidates {
             Err(e) => {
-                ui.colored_label(Color32::LIGHT_RED, e);
+                ui.colored_label(ui.visuals().error_fg_color, e);
             }
             Ok(dirs) if dirs.is_empty() => {
                 ui.label(RichText::new("no folders found").weak());
@@ -2637,7 +2663,7 @@ impl MultiFolderPick {
         }
 
         if let Some(e) = &self.error {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
         ui.add_space(6.0);
         if self.selected.is_empty() {
@@ -2664,7 +2690,7 @@ impl MultiFolderPick {
                 let text =
                     RichText::new(format!("{name} — {} tiff{revisions}", files.len())).size(12.0);
                 if files.is_empty() {
-                    ui.colored_label(Color32::from_rgb(240, 180, 60), text.text());
+                    ui.colored_label(warn_text(ui), text.text());
                 } else {
                     ui.label(text.weak());
                 }
@@ -2876,7 +2902,7 @@ impl FolderPick {
         let mut clicked = None;
         match &self.candidates {
             Err(e) => {
-                ui.colored_label(Color32::LIGHT_RED, e);
+                ui.colored_label(ui.visuals().error_fg_color, e);
             }
             Ok(dirs) if dirs.is_empty() => {
                 ui.label(RichText::new("no folders found").weak());
@@ -2933,7 +2959,7 @@ impl FolderPick {
             });
         }
         if let Some(e) = &self.error {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
         if let Some(folders) = &self.folders {
             let images: usize = folders.iter().map(|f| f.images.len()).sum();
@@ -3128,7 +3154,7 @@ impl CtApp {
                 );
                 ui.separator();
                 if let Some(e) = &self.log_error {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 egui::ScrollArea::both()
                     .stick_to_bottom(true)
@@ -3176,6 +3202,8 @@ impl CtApp {
                     {
                         self.credits_open = !self.credits_open;
                     }
+                    ui.separator();
+                    crate::theme::toggle_button(ui);
                     if let Some(tex) = &self.logo {
                         ui.add(egui::Image::from_texture(tex).max_height(32.0));
                     }
@@ -3252,7 +3280,7 @@ impl CtApp {
             }
         }
         if let Some(e) = &self.load_error {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
     }
 
@@ -3310,7 +3338,7 @@ impl CtApp {
                     });
                 }
                 Some(Scan::Failed(e)) => {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 Some(Scan::Done(entries)) => {
                     ui.horizontal(|ui| {
@@ -3404,7 +3432,7 @@ impl CtApp {
 
         if let Some(e) = &self.manual_error {
             ui.add_space(6.0);
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
         ui.add_space(8.0);
         match &self.selected {
@@ -3647,7 +3675,7 @@ impl CtApp {
                     }
                 });
                 if let Some(e) = &self.admin_error {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
             } else {
                 ui.horizontal(|ui| {
@@ -3701,7 +3729,7 @@ impl CtApp {
                     ui.label(RichText::new(info).weak().size(12.0));
                 }
                 if let Some(e) = &self.debug_error {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
             }
         });
@@ -3853,11 +3881,11 @@ fn stack_ui(
                 }
                 SectionStatus::Done => RichText::new(format!("✔ {title}"))
                     .strong()
-                    .color(Color32::from_rgb(120, 200, 120)),
+                    .color(ok_text(ui)),
                 SectionStatus::NotRun => RichText::new(format!("{title} — not run")).strong(),
                 SectionStatus::Required => RichText::new(format!("{title} — required"))
                     .strong()
-                    .color(Color32::from_rgb(240, 180, 60)),
+                    .color(warn_text(ui)),
             };
             let open = view.open_section == Some(which);
             let response = egui::CollapsingHeader::new(header)
@@ -4036,7 +4064,7 @@ fn stack_ui(
                     "the log conversion (last section) is mandatory before saving or \
                      evaluating the reconstruction",
                 )
-                .color(Color32::from_rgb(240, 180, 60)),
+                .color(warn_text(ui)),
             );
         }
         ui.horizontal(|ui| {
@@ -4106,10 +4134,10 @@ fn stack_ui(
         });
         match &view.stack_save_status {
             Some(Ok(msg)) => {
-                ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+                ui.colored_label(ok_text(ui), format!("saved: {msg}"));
             }
             Some(Err(e)) => {
-                ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+                ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
             }
             None => {}
         }
@@ -4419,7 +4447,7 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             }
         }
         if let Some(e) = &view.clean_compare_error {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
     }
 }
@@ -4637,7 +4665,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 
     if view.stack.ob.is_empty() && !view.normalized {
         ui.colored_label(
-            Color32::LIGHT_RED,
+            ui.visuals().error_fg_color,
             "this stack has no open beam — normalization cannot run",
         );
         return;
@@ -4646,7 +4674,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         if let Some(summary) = &view.norm_summary {
             ui.label(
                 RichText::new(format!("normalized ✔ — {summary}"))
-                    .color(Color32::from_rgb(120, 200, 120)),
+                    .color(ok_text(ui)),
             );
         }
         // Visualize the normalized data in the sibling TIFF viewer.
@@ -4688,7 +4716,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 .size(11.0),
         );
         if let Some(e) = &view.norm_error {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
         return;
     }
@@ -4758,7 +4786,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         ui.label(RichText::new("the checked corrections need a ROI first").weak());
     }
     if let Some(e) = &view.norm_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
     if let Some(output) = view.norm_output.clone() {
         terminal_output_ui(
@@ -4934,7 +4962,7 @@ fn tilt_cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         let header = if done {
             RichText::new(format!("✔ {title}"))
                 .strong()
-                .color(Color32::from_rgb(120, 200, 120))
+                .color(ok_text(ui))
         } else {
             RichText::new(title).strong()
         };
@@ -5040,7 +5068,7 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     };
     let (Some(i0), Some(i180)) = (nearest(0.0), nearest(180.0)) else {
         ui.colored_label(
-            Color32::LIGHT_RED,
+            ui.visuals().error_fg_color,
             "the projections carry no angles — the tilt needs the 0° and 180° images",
         );
         return;
@@ -5260,11 +5288,11 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                  find ≈ 0°",
                 applied.tilt_deg, applied.shift_px
             ))
-            .color(Color32::from_rgb(120, 200, 120)),
+            .color(ok_text(ui)),
         );
     }
     if let Some(e) = &view.tilt_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -5307,7 +5335,7 @@ fn log_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     ))
                     .unwrap_or_default()
             ))
-            .color(Color32::from_rgb(120, 200, 120)),
+            .color(ok_text(ui)),
         );
         // Visualize the attenuation data in the sibling TIFF viewer.
         if let Some(job) = &mut view.log_visualize_job {
@@ -5437,7 +5465,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let tool_built = Path::new(crate::bm3dornl::BM3DORNL_GUI_BIN).is_file();
     if !tool_built {
         ui.colored_label(
-            Color32::from_rgb(240, 180, 60),
+            warn_text(ui),
             format!(
                 "the bm3dornl tool is not built yet ({})",
                 crate::bm3dornl::BM3DORNL_GUI_BIN
@@ -5464,7 +5492,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
 
     if let Some(summary) = &view.bm3d_summary {
-        ui.colored_label(Color32::from_rgb(120, 200, 120), summary);
+        ui.colored_label(ok_text(ui), summary);
     }
     if view.unbm3d.is_some()
         && ui
@@ -5479,7 +5507,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         view.bm3d_error = None;
     }
     if let Some(e) = &view.bm3d_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -5740,7 +5768,7 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if let Some(desc) = &view.stripes_applied {
         ui.label(
             RichText::new(format!("stripes removed ✔ — {desc}"))
-                .color(Color32::from_rgb(120, 200, 120)),
+                .color(ok_text(ui)),
         );
         ui.label(
             RichText::new("re-applying runs the current selection on the pre-removal stack")
@@ -5749,7 +5777,7 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         );
     }
     if let Some(e) = &view.stripe_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -5796,7 +5824,7 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             value - default_center
         ))
         .strong()
-        .color(Color32::from_rgb(120, 200, 120)),
+        .color(ok_text(ui)),
         None => RichText::new(format!(
             "center of rotation: {default_center:.1} px (horizontal center — default until calculated)"
         ))
@@ -5830,7 +5858,7 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         view.cor_slice = Some(slice_row.min(h - 1));
     } else {
         ui.colored_label(
-            Color32::LIGHT_RED,
+            ui.visuals().error_fg_color,
             "the projections carry no angles — only the horizontal center can be used",
         );
     }
@@ -6036,7 +6064,7 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         });
     }
     if let Some(e) = &view.cor_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -6133,12 +6161,12 @@ fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
     if let Some(summary) = &view.tilt_tool_summary {
         ui.colored_label(
-            Color32::from_rgb(120, 200, 120),
+            ok_text(ui),
             format!("applied: {summary}"),
         );
     }
     if let Some(e) = &view.tilt_tool_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -6149,7 +6177,7 @@ fn sinogram_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     };
     let (w, h, n) = (first.width, first.height, stack.sample.len());
     if stack.sample.iter().any(|p| (p.width, p.height) != (w, h)) {
-        ui.colored_label(Color32::LIGHT_RED, "projections have inconsistent sizes");
+        ui.colored_label(ui.visuals().error_fg_color, "projections have inconsistent sizes");
         return;
     }
 
@@ -6325,7 +6353,7 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         .size(11.0),
     );
     if let Some(e) = &view.crop_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
 }
 
@@ -6643,7 +6671,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             .strong(),
         );
         for e in &output.skipped {
-            ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
+            ui.colored_label(warn_text(ui), format!("skipped: {e}"));
         }
         let folder_list = |pick: &MultiFolderPick| {
             pick.selected
@@ -6764,10 +6792,10 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     }
     match &view.save_status {
         Some(Ok(msg)) => {
-            ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+            ui.colored_label(ok_text(ui), format!("saved: {msg}"));
         }
         Some(Err(e)) => {
-            ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+            ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
         }
         None => {}
     }
@@ -6813,7 +6841,7 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
         }
     });
     if let Some(e) = &view.exclude_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
     ui.add_space(6.0);
 
@@ -6924,7 +6952,7 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
     };
     if cache.failed > 0 {
         ui.colored_label(
-            Color32::from_rgb(240, 180, 60),
+            warn_text(ui),
             format!("{} image(s) could not be read", cache.failed),
         );
     }
@@ -7181,7 +7209,7 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
         ));
     }
     if n_kept == 0 {
-        ui.colored_label(Color32::from_rgb(240, 180, 60), format!("{line} — nothing left!"));
+        ui.colored_label(warn_text(ui), format!("{line} — nothing left!"));
     } else {
         ui.label(RichText::new(line).strong());
     }
@@ -7235,7 +7263,13 @@ fn vertical_threshold_slider(
         2.0,
         Color32::from_rgba_unmultiplied(230, 100, 100, 120),
     );
-    painter.circle_filled(Pos2::new(cx, y), HANDLE_R, Color32::from_gray(230));
+    // A light handle disappears on the light panel background.
+    let handle = if ui.visuals().dark_mode {
+        Color32::from_gray(230)
+    } else {
+        Color32::from_gray(60)
+    };
+    painter.circle_filled(Pos2::new(cx, y), HANDLE_R, handle);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
@@ -7389,7 +7423,7 @@ fn data_to_use_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
         AngleData::Ready(angles, failed) => {
             if failed > 0 {
                 ui.colored_label(
-                    Color32::from_rgb(240, 180, 60),
+                    warn_text(ui),
                     format!("{failed} image(s) without an angle value are ignored"),
                 );
             }
@@ -7589,7 +7623,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                     }
                     None => {
                         ui.colored_label(
-                            Color32::LIGHT_RED,
+                            ui.visuals().error_fg_color,
                             format!(
                                 "'{}.{}' is not a number — pick numeric fields",
                                 view.nc_fields[*i], view.nc_fields[*j]
@@ -7598,7 +7632,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                     }
                 },
                 _ => {
-                    ui.colored_label(Color32::LIGHT_RED, "select 2 and only 2 fields!");
+                    ui.colored_label(ui.visuals().error_fg_color, "select 2 and only 2 fields!");
                 }
             }
         }
@@ -7607,7 +7641,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                 RichText::new(
                     "the angle will be read from each image's TIFF metadata (tag 65039)",
                 )
-                .color(Color32::from_rgb(120, 200, 120)),
+                .color(ok_text(ui)),
             );
             let first = view.first_sample_image().cloned();
             match &first {
@@ -7633,7 +7667,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                     ui.label(RichText::new(format!("first image angle: {angle:.3}°")).strong());
                 }
                 Some(Err(e)) => {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 None => {}
             }
@@ -7677,7 +7711,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                 }
             });
             if let Some(e) = &view.ascii_error {
-                ui.colored_label(Color32::LIGHT_RED, e);
+                ui.colored_label(ui.visuals().error_fg_color, e);
             }
             if let Some(angles) = &view.ascii_angles {
                 let n_images = view.total_sample_images();
@@ -7696,11 +7730,11 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         RichText::new(format!(
                             "matches the {n_images} sample images ✔",
                         ))
-                        .color(Color32::from_rgb(120, 200, 120)),
+                        .color(ok_text(ui)),
                     );
                 } else {
                     ui.colored_label(
-                        Color32::LIGHT_RED,
+                        ui.visuals().error_fg_color,
                         format!(
                             "{} angles but {n_images} sample images — they must match",
                             angles.len()
@@ -8077,7 +8111,7 @@ fn process_section_ui(
             ui.label(RichText::new(note).weak().size(12.0));
         }
         for e in &output.skipped {
-            ui.colored_label(Color32::from_rgb(240, 180, 60), format!("skipped: {e}"));
+            ui.colored_label(warn_text(ui), format!("skipped: {e}"));
         }
         let meta = SaveMeta {
             instrument: session.instrument.name().to_owned(),
@@ -8186,10 +8220,10 @@ fn process_section_ui(
     }
     match &view.save_status {
         Some(Ok(msg)) => {
-            ui.colored_label(Color32::from_rgb(120, 200, 120), format!("saved: {msg}"));
+            ui.colored_label(ok_text(ui), format!("saved: {msg}"));
         }
         Some(Err(e)) => {
-            ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}"));
+            ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
         }
         None => {}
     }
@@ -8320,7 +8354,7 @@ fn combine_section_ui(ui: &mut egui::Ui, ctx: &egui::Context, view: &mut TofView
     }
 
     if let Some(e) = &view.combine_error {
-        ui.colored_label(Color32::LIGHT_RED, e);
+        ui.colored_label(ui.visuals().error_fg_color, e);
     }
     if let Some(spec) = &view.combine_spec {
         ui.add_space(4.0);
@@ -8413,7 +8447,7 @@ fn run_list_column(
         .count();
     let heading = format!("{label} — {kept} run(s)");
     if kept == 0 {
-        ui.colored_label(Color32::from_rgb(240, 180, 60), heading);
+        ui.colored_label(warn_text(ui), heading);
     } else {
         ui.label(RichText::new(heading).strong());
     }
@@ -8528,7 +8562,7 @@ fn preprocess_summary_ui(ui: &mut egui::Ui, result: &PreprocessResult) {
             line.push_str(&format!(" — {missing_pc} without proton charge"));
         }
         if empty > 0 || missing_pc > 0 {
-            ui.colored_label(Color32::from_rgb(240, 180, 60), line);
+            ui.colored_label(warn_text(ui), line);
         } else {
             ui.label(line);
         }
@@ -8615,7 +8649,7 @@ fn proton_charge_section(ui: &mut egui::Ui, view: &mut TofView) {
     }
     if s_kept == 0 || o_kept == 0 {
         ui.colored_label(
-            Color32::from_rgb(240, 180, 60),
+            warn_text(ui),
             format!("{line} — the next step needs at least one of each!"),
         );
     } else {
@@ -8677,8 +8711,14 @@ fn vertical_range_slider(
         ],
         Stroke::new(6.0, Color32::from_rgb(120, 200, 120)),
     );
+    // A light handle disappears on the light panel background.
+    let handle = if ui.visuals().dark_mode {
+        Color32::from_gray(230)
+    } else {
+        Color32::from_gray(60)
+    };
     for v in [selection.0, selection.1] {
-        painter.circle_filled(Pos2::new(cx, to_y(v)), HANDLE_R, Color32::from_gray(230));
+        painter.circle_filled(Pos2::new(cx, to_y(v)), HANDLE_R, handle);
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);

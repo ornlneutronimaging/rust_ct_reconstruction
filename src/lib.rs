@@ -23,6 +23,7 @@ pub mod recon_run;
 pub mod rotate;
 pub mod session;
 pub mod stripes;
+pub mod theme;
 pub mod tilt;
 pub mod tof;
 pub mod white_beam;

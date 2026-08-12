@@ -66,8 +66,7 @@ fn main() -> eframe::Result<()> {
         "CT Reconstruction",
         native_options,
         Box::new(|cc| {
-            // Always use the dark theme, regardless of the system/desktop theme.
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            cc.egui_ctx.set_theme(ct_reconstruction::theme::load());
             Ok(Box::new(CtApp::new()))
         }),
     )
