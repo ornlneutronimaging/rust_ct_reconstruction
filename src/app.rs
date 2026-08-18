@@ -2301,6 +2301,9 @@ struct WhiteBeamView {
     /// 1 = show the wait spinner this frame, 2 = build the stack next
     /// frame (so the spinner is on screen during the heavy copy).
     preprocess_pending: u8,
+    /// The Next button was clicked before the projections were read: run
+    /// the read automatically and continue to pre-processing when it lands.
+    auto_continue: bool,
 }
 
 /// Integrated intensities cached per selection: the scan covers the used
@@ -2398,6 +2401,7 @@ impl WhiteBeamView {
             saved_path: None,
             goto_preprocess: None,
             preprocess_pending: 0,
+            auto_continue: false,
             open_section: Some(WbSection::Angles),
         }
     }
@@ -2527,12 +2531,81 @@ impl WhiteBeamView {
     fn total_sample_images(&self) -> usize {
         self.sample.total_files()
     }
+
+    /// Build the naming-convention field checkboxes (with the default angle
+    /// guess) from the first sample image when the current example no longer
+    /// belongs to the selection — or was never set because the "Projection
+    /// angles" section was not opened after picking the folders.
+    fn ensure_nc_defaults(&mut self) {
+        if self.angle_source != AngleSource::NamingConvention {
+            return;
+        }
+        let example_valid = self.nc_example.as_ref().is_some_and(|e| {
+            self.sample
+                .selected
+                .iter()
+                .any(|(_, files, _)| files.contains(e))
+        });
+        if example_valid {
+            return;
+        }
+        let Some(example) = self.first_sample_image().cloned() else {
+            return;
+        };
+        self.nc_fields = white_beam::name_fields(&example);
+        self.nc_checked = vec![false; self.nc_fields.len()];
+        if let Some((i, j)) = white_beam::default_angle_fields(self.nc_fields.len()) {
+            self.nc_checked[i] = true;
+            self.nc_checked[j] = true;
+        }
+        self.nc_example = Some(example);
+    }
+
+    /// Kick off reading + stacking the current selection — what the
+    /// "Read & stack the projections" button does, also run automatically
+    /// when the Next button is clicked before the user did it.
+    fn start_read(&mut self, sample_runs: Vec<RunToCombine>) {
+        let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
+            pick.selected
+                .iter()
+                .flat_map(|(_, files, _)| files.iter())
+                .map(|file| RunToCombine {
+                    name: file
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    run_number: tof::run_number(
+                        &file.file_name().unwrap_or_default().to_string_lossy(),
+                    ),
+                    images: vec![file.clone()],
+                    angle_deg: None,
+                })
+                .collect()
+        };
+        let ob_runs = one_run_per_file(&self.ob);
+        let dc_runs = self.dc.as_ref().map(one_run_per_file).unwrap_or_default();
+        logger::log(format!(
+            "reading white beam stack: {} projections, {} ob images, {} dc images",
+            sample_runs.len(),
+            ob_runs.len(),
+            dc_runs.len()
+        ));
+        self.processed = None;
+        self.save_status = None;
+        self.process = Some(CombineScan::start(
+            sample_runs,
+            ob_runs,
+            dc_runs,
+            ImageSelection::All,
+            false,
+        ));
+    }
 }
 
 /// Selection of any number of folders under a fixed root; what is kept is
 /// the list of TIFF files inside each selected folder.
 struct MultiFolderPick {
-    /// "sample" or "open beam" — used in headings and log lines.
+    /// "sample", "open beam" or "dark current" — used in headings and log lines.
     kind: &'static str,
     root: PathBuf,
     /// Where the Browse dialog opens: the experiment's `shared` folder.
@@ -2603,6 +2676,7 @@ impl MultiFolderPick {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let heading = match self.kind {
             "sample" => "Sample (projections)",
+            "dark current" => "Dark current",
             _ => "Open beam",
         };
         ui.label(RichText::new(heading).size(16.0).strong());
@@ -6396,34 +6470,64 @@ fn workflow_ui(
                 .show(ui, |ui| tof_ui(ui, session, tof_view));
         }
     }
-    // The same bottom-right `Next` pill as the setup screen, enabled once
-    // the stack was saved to HDF5; it continues to pre-processing exactly
-    // like the button inside the save section. Clicking also reopens that
-    // section, whose UI drives the actual hand-over.
-    let (ready, pending) = match view {
-        WorkflowView::WhiteBeam(v) => (
-            matches!(v.save_status, Some(Ok(_))),
-            v.preprocess_pending == 0,
-        ),
-        WorkflowView::Tof(v) => (
-            matches!(v.save_status, Some(Ok(_))),
-            v.preprocess_pending == 0,
-        ),
+    // The same bottom-right `Next` pill as the setup screen; it continues to
+    // pre-processing exactly like the button inside the save section, which
+    // drives the actual hand-over (clicking reopens that section). On the
+    // white beam side it is available as soon as the sample and open beam
+    // folders are picked (dark current stays optional): clicking runs the
+    // skipped intermediate steps — reading + stacking the projections —
+    // automatically before handing over.
+    let (ready, pending, hint) = match view {
+        WorkflowView::WhiteBeam(v) => {
+            // Default the naming-convention angle fields so a user who never
+            // opened the angles section still gets a valid selection.
+            v.ensure_nc_defaults();
+            let selection = v.final_selection();
+            let ready =
+                v.processed.is_some() || (selection.is_ok() && v.ob.total_files() > 0);
+            let hint = if v.process.is_some() || v.auto_continue {
+                "reading the projections…".to_owned()
+            } else if ready {
+                "continue to pre-processing".to_owned()
+            } else if selection.is_ok() {
+                "select the open beam folder(s) first".to_owned()
+            } else {
+                selection.err().unwrap_or_default()
+            };
+            (
+                ready,
+                v.preprocess_pending == 0 && v.process.is_none() && !v.auto_continue,
+                hint,
+            )
+        }
+        WorkflowView::Tof(v) => {
+            let ready = matches!(v.save_status, Some(Ok(_)));
+            (
+                ready,
+                v.preprocess_pending == 0,
+                if ready {
+                    "continue to pre-processing".to_owned()
+                } else {
+                    "save to HDF5 first".to_owned()
+                },
+            )
+        }
     };
     egui::Area::new(egui::Id::new("workflow_next_button"))
         .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
         .show(ui.ctx(), |ui| {
-            let response = next_button_widget(ui, ready && pending);
-            let response = if ready {
-                response.on_hover_text("continue to pre-processing")
-            } else {
-                response.on_hover_text("save to HDF5 first")
-            };
+            let response = next_button_widget(ui, ready && pending).on_hover_text(hint);
             if response.clicked() {
                 match view {
                     WorkflowView::WhiteBeam(v) => {
-                        v.preprocess_pending = 1;
                         v.open_section = Some(WbSection::Save);
+                        if v.processed.is_some() {
+                            v.preprocess_pending = 1;
+                        } else {
+                            // Projections not read yet: the save section
+                            // starts the read and continues once it lands.
+                            v.auto_continue = true;
+                        }
                     }
                     WorkflowView::Tof(v) => {
                         v.preprocess_pending = 1;
@@ -6576,6 +6680,23 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
     }
 
+    // The Next button was clicked before the projections were read: run the
+    // read now, then continue to pre-processing as soon as it lands.
+    if view.auto_continue {
+        if view.processed.is_some() {
+            view.auto_continue = false;
+            view.preprocess_pending = 1;
+        } else if view.process.is_none() {
+            match view.final_selection() {
+                Ok(runs) => view.start_read(runs),
+                Err(e) => {
+                    logger::error(format!("cannot continue to pre-processing: {e}"));
+                    view.auto_continue = false;
+                }
+            }
+        }
+    }
+
     let selection = view.final_selection();
     match &selection {
         Err(msg) => {
@@ -6610,40 +6731,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         .clicked()
         && let Ok(sample_runs) = selection
     {
-        let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
-            pick.selected
-                .iter()
-                .flat_map(|(_, files, _)| files.iter())
-                .map(|file| RunToCombine {
-                    name: file
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    run_number: tof::run_number(
-                        &file.file_name().unwrap_or_default().to_string_lossy(),
-                    ),
-                    images: vec![file.clone()],
-                    angle_deg: None,
-                })
-                .collect()
-        };
-        let ob_runs = one_run_per_file(&view.ob);
-        let dc_runs = view.dc.as_ref().map(one_run_per_file).unwrap_or_default();
-        logger::log(format!(
-            "reading white beam stack: {} projections, {} ob images, {} dc images",
-            sample_runs.len(),
-            ob_runs.len(),
-            dc_runs.len()
-        ));
-        view.processed = None;
-        view.save_status = None;
-        view.process = Some(CombineScan::start(
-            sample_runs,
-            ob_runs,
-            dc_runs,
-            ImageSelection::All,
-            false,
-        ));
+        view.start_read(sample_runs);
     }
 
     if let Some(output) = &view.processed {
@@ -6748,12 +6836,11 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 }
             }
             jump = ui
-                .add_enabled(
-                    matches!(view.save_status, Some(Ok(_))),
-                    egui::Button::new("🚀 Continue to pre-processing"),
+                .add_enabled(!saving, egui::Button::new("🚀 Continue to pre-processing"))
+                .on_hover_text(
+                    "work on the stacked projections — saving to HDF5 first is optional",
                 )
-                .on_hover_text("work on the saved stack of projections")
-                .on_disabled_hover_text("save to HDF5 first")
+                .on_disabled_hover_text("wait for the HDF5 write to finish")
                 .clicked();
         });
         if jump {
@@ -7522,22 +7609,7 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
             }
             // The current example must still belong to the selection;
             // otherwise fall back to the first sample image and rebuild.
-            let example_valid = view.nc_example.as_ref().is_some_and(|e| {
-                view.sample
-                    .selected
-                    .iter()
-                    .any(|(_, files, _)| files.contains(e))
-            });
-            if !example_valid {
-                let example = view.first_sample_image().cloned().expect("checked above");
-                view.nc_fields = white_beam::name_fields(&example);
-                view.nc_checked = vec![false; view.nc_fields.len()];
-                if let Some((i, j)) = white_beam::default_angle_fields(view.nc_fields.len()) {
-                    view.nc_checked[i] = true;
-                    view.nc_checked[j] = true;
-                }
-                view.nc_example = Some(example);
-            }
+            view.ensure_nc_defaults();
             let example = view.nc_example.clone().expect("set above");
             ui.horizontal(|ui| {
                 if ui
