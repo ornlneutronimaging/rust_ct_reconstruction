@@ -29,10 +29,11 @@ impl WbDetector {
         }
     }
 
-    /// Subdirectory of `<ipts>/images` this detector writes to. Only the
-    /// IkonXL location is confirmed; adjust the others once their layouts
-    /// are pinned down.
-    fn images_subdir(self) -> &'static str {
+    /// Prefix of the `<ipts>/images` subdirectories this detector writes to.
+    /// The QHY camera names its folder after the sensor model (`qhy411`,
+    /// `qhy600` — an experiment can have both), so the real folders are
+    /// discovered by prefix rather than hardcoded.
+    fn images_prefix(self) -> &'static str {
         match self {
             WbDetector::IkonXl => "ikonxl",
             WbDetector::Qhy => "qhy",
@@ -40,35 +41,72 @@ impl WbDetector {
         }
     }
 
-    /// Where the CT sample folders live. VENUS splits by detector
-    /// (`/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct`); MARS has a single
-    /// camera layout (`/HFIR/CG1D/IPTS-xxxx/raw/ct_scans`).
-    pub fn ct_root(self, instrument: Instrument, ipts: &Path) -> PathBuf {
+    /// This detector's data folders under `<ipts>/images` (VENUS layout):
+    /// every subdirectory whose name starts with the detector prefix
+    /// (case-insensitive), sorted. Falls back to the bare prefix when
+    /// nothing matches, so the UI can still show the expected location.
+    fn images_dirs(self, ipts: &Path) -> Vec<PathBuf> {
+        let images = ipts.join("images");
+        let prefix = self.images_prefix();
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&images)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name().is_some_and(|n| {
+                        n.to_string_lossy().to_lowercase().starts_with(prefix)
+                    })
+            })
+            .collect();
+        dirs.sort();
+        if dirs.is_empty() {
+            dirs.push(images.join(prefix));
+        }
+        dirs
+    }
+
+    /// Where the CT sample folders live — one root per detector data folder.
+    /// VENUS splits by detector (`/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct`,
+    /// with e.g. both `qhy411` and `qhy600` roots when the QHY wrote to both);
+    /// MARS has a single camera layout (`/HFIR/CG1D/IPTS-xxxx/raw/ct_scans`).
+    pub fn ct_roots(self, instrument: Instrument, ipts: &Path) -> Vec<PathBuf> {
         match instrument {
-            Instrument::Venus => ipts.join("images").join(self.images_subdir()).join("raw/ct"),
-            Instrument::Mars => ipts.join("raw/ct_scans"),
+            Instrument::Venus => self
+                .images_dirs(ipts)
+                .into_iter()
+                .map(|d| d.join("raw/ct"))
+                .collect(),
+            Instrument::Mars => vec![ipts.join("raw/ct_scans")],
         }
     }
 
     /// Where the open-beam folders live, e.g.
     /// `/SNS/VENUS/IPTS-36573/images/ikonxl/ob` or
     /// `/HFIR/CG1D/IPTS-xxxx/raw/ob`.
-    pub fn ob_root(self, instrument: Instrument, ipts: &Path) -> PathBuf {
+    pub fn ob_roots(self, instrument: Instrument, ipts: &Path) -> Vec<PathBuf> {
         match instrument {
-            Instrument::Venus => ipts.join("images").join(self.images_subdir()).join("ob"),
-            Instrument::Mars => ipts.join("raw/ob"),
+            Instrument::Venus => self
+                .images_dirs(ipts)
+                .into_iter()
+                .map(|d| d.join("ob"))
+                .collect(),
+            Instrument::Mars => vec![ipts.join("raw/ob")],
         }
     }
 
     /// Where the dark-current folders live (selecting them is optional):
     /// `/HFIR/CG1D/IPTS-xxxx/raw/dc` on MARS, and per detector on VENUS
     /// (`/SNS/VENUS/IPTS-xxxx/images/ikonxl/dc`), mirroring the ob layout.
-    pub fn dc_root(self, instrument: Instrument, ipts: &Path) -> Option<PathBuf> {
+    pub fn dc_roots(self, instrument: Instrument, ipts: &Path) -> Vec<PathBuf> {
         match instrument {
-            Instrument::Venus => {
-                Some(ipts.join("images").join(self.images_subdir()).join("dc"))
-            }
-            Instrument::Mars => Some(ipts.join("raw/dc")),
+            Instrument::Venus => self
+                .images_dirs(ipts)
+                .into_iter()
+                .map(|d| d.join("dc"))
+                .collect(),
+            Instrument::Mars => vec![ipts.join("raw/dc")],
         }
     }
 }
@@ -469,27 +507,40 @@ mod tests {
 
     #[test]
     fn detector_roots() {
-        let ipts = Path::new("/SNS/VENUS/IPTS-36573");
+        // Discovery reads the filesystem: build a fake IPTS with an ikonxl
+        // folder and two QHY model folders.
+        let ipts = std::env::temp_dir().join(format!("ct_recon_roots_{}", std::process::id()));
+        for d in ["images/ikonxl", "images/qhy411", "images/qhy600"] {
+            std::fs::create_dir_all(ipts.join(d)).unwrap();
+        }
         assert_eq!(
-            WbDetector::IkonXl.ct_root(Instrument::Venus, ipts),
-            Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/raw/ct")
+            WbDetector::IkonXl.ct_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/ikonxl/raw/ct")]
         );
         assert_eq!(
-            WbDetector::IkonXl.ob_root(Instrument::Venus, ipts),
-            Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/ob")
+            WbDetector::IkonXl.ob_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/ikonxl/ob")]
+        );
+        // The QHY folders are named after the sensor model; both are found.
+        assert_eq!(
+            WbDetector::Qhy.ct_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/qhy411/raw/ct"), ipts.join("images/qhy600/raw/ct")]
         );
         assert_eq!(
-            WbDetector::Qhy.ct_root(Instrument::Venus, ipts),
-            Path::new("/SNS/VENUS/IPTS-36573/images/qhy/raw/ct")
+            WbDetector::IkonXl.dc_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/ikonxl/dc")]
         );
         assert_eq!(
-            WbDetector::IkonXl.dc_root(Instrument::Venus, ipts).as_deref(),
-            Some(Path::new("/SNS/VENUS/IPTS-36573/images/ikonxl/dc"))
+            WbDetector::Qhy.dc_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/qhy411/dc"), ipts.join("images/qhy600/dc")]
         );
+        // No matching folder: fall back to the bare prefix so the UI can
+        // point at the expected location.
         assert_eq!(
-            WbDetector::Qhy.dc_root(Instrument::Venus, ipts).as_deref(),
-            Some(Path::new("/SNS/VENUS/IPTS-36573/images/qhy/dc"))
+            WbDetector::Scmos.ct_roots(Instrument::Venus, &ipts),
+            vec![ipts.join("images/scmos/raw/ct")]
         );
+        std::fs::remove_dir_all(&ipts).ok();
     }
 
     #[test]
@@ -497,16 +548,16 @@ mod tests {
         let ipts = Path::new("/HFIR/CG1D/IPTS-12345");
         for d in WbDetector::ALL {
             assert_eq!(
-                d.ct_root(Instrument::Mars, ipts),
-                Path::new("/HFIR/CG1D/IPTS-12345/raw/ct_scans")
+                d.ct_roots(Instrument::Mars, ipts),
+                vec![PathBuf::from("/HFIR/CG1D/IPTS-12345/raw/ct_scans")]
             );
             assert_eq!(
-                d.ob_root(Instrument::Mars, ipts),
-                Path::new("/HFIR/CG1D/IPTS-12345/raw/ob")
+                d.ob_roots(Instrument::Mars, ipts),
+                vec![PathBuf::from("/HFIR/CG1D/IPTS-12345/raw/ob")]
             );
             assert_eq!(
-                d.dc_root(Instrument::Mars, ipts).as_deref(),
-                Some(Path::new("/HFIR/CG1D/IPTS-12345/raw/dc"))
+                d.dc_roots(Instrument::Mars, ipts),
+                vec![PathBuf::from("/HFIR/CG1D/IPTS-12345/raw/dc")]
             );
         }
     }

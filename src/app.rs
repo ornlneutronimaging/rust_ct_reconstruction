@@ -2337,21 +2337,27 @@ impl WhiteBeamView {
         let instrument = session.instrument;
         let sample = MultiFolderPick::new(
             "sample",
-            detector.ct_root(instrument, &session.ipts.path),
+            detector.ct_roots(instrument, &session.ipts.path),
             &session.ipts.path,
         );
         let ob = MultiFolderPick::new(
             "open beam",
-            detector.ob_root(instrument, &session.ipts.path),
+            detector.ob_roots(instrument, &session.ipts.path),
             &session.ipts.path,
         );
-        let dc = detector
-            .dc_root(instrument, &session.ipts.path)
-            .map(|root| MultiFolderPick::new("dark current", root, &session.ipts.path));
+        let dc = Some(MultiFolderPick::new(
+            "dark current",
+            detector.dc_roots(instrument, &session.ipts.path),
+            &session.ipts.path,
+        ));
         let describe = |pick: &MultiFolderPick| {
             format!(
                 "{} ({})",
-                pick.root.display(),
+                pick.roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" + "),
                 match &pick.candidates {
                     Ok(dirs) => format!("{} folders", dirs.len()),
                     Err(_) => "unreadable".to_owned(),
@@ -2607,10 +2613,15 @@ impl WhiteBeamView {
 struct MultiFolderPick {
     /// "sample", "open beam" or "dark current" — used in headings and log lines.
     kind: &'static str,
-    root: PathBuf,
+    /// The detector data roots the candidates are drawn from — several when
+    /// the detector wrote to more than one folder (e.g. `qhy411` and
+    /// `qhy600` in the same experiment).
+    roots: Vec<PathBuf>,
     /// Where the Browse dialog opens: the experiment's `shared` folder.
     browse_start: PathBuf,
-    candidates: Result<Vec<PathBuf>, String>,
+    /// Candidate folders across every root, as `(label, path)`: the label
+    /// carries the detector folder name when several roots contribute.
+    candidates: Result<Vec<(String, PathBuf)>, String>,
     /// Selected folders (sorted by name): `(folder, used TIFFs, superseded
     /// TIFFs)` — superseded are older revisions of retaken projections,
     /// excluded automatically but kept visible.
@@ -2619,11 +2630,45 @@ struct MultiFolderPick {
 }
 
 impl MultiFolderPick {
-    fn new(kind: &'static str, root: PathBuf, ipts: &Path) -> Self {
-        let candidates = tof::list_subdirs(&root);
+    fn new(kind: &'static str, roots: Vec<PathBuf>, ipts: &Path) -> Self {
+        let images = ipts.join("images");
+        let several = roots.len() > 1;
+        let mut found: Vec<(String, PathBuf)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for root in &roots {
+            match tof::list_subdirs(root) {
+                Ok(dirs) => {
+                    // The detector folder (`qhy411`) the root sits under,
+                    // shown in the label when several roots contribute.
+                    let tag = root
+                        .strip_prefix(&images)
+                        .ok()
+                        .and_then(|rel| rel.components().next())
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned());
+                    for dir in dirs {
+                        let name = dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| dir.display().to_string());
+                        let label = match (&tag, several) {
+                            (Some(tag), true) => format!("{tag} — {name}"),
+                            _ => name,
+                        };
+                        found.push((label, dir));
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        // Unreadable roots only matter when no root produced candidates.
+        let candidates = if found.is_empty() && !errors.is_empty() {
+            Err(errors.join("; "))
+        } else {
+            Ok(found)
+        };
         Self {
             kind,
-            root,
+            roots,
             browse_start: ipts.join("shared"),
             candidates,
             selected: Vec::new(),
@@ -2680,7 +2725,9 @@ impl MultiFolderPick {
             _ => "Open beam",
         };
         ui.label(RichText::new(heading).size(16.0).strong());
-        ui.label(RichText::new(self.root.display().to_string()).weak().size(11.0));
+        for root in &self.roots {
+            ui.label(RichText::new(root.display().to_string()).weak().size(11.0));
+        }
         ui.add_space(4.0);
 
         let mut toggled: Option<PathBuf> = None;
@@ -2697,13 +2744,9 @@ impl MultiFolderPick {
                     .max_height(150.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        for dir in dirs {
-                            let name = dir
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| dir.display().to_string());
+                        for (label, dir) in dirs {
                             let mut checked = self.is_selected(dir);
-                            if ui.checkbox(&mut checked, name).changed() {
+                            if ui.checkbox(&mut checked, label).changed() {
                                 toggled = Some(dir.clone());
                             }
                         }
@@ -2714,27 +2757,41 @@ impl MultiFolderPick {
             self.toggle(dir);
         }
 
-        if ui.button("📂 Browse…").clicked() {
-            let mut dialog = rfd::FileDialog::new()
-                .set_title(format!("Select {} folder(s)", self.kind));
-            // Start in the experiment's shared folder; fall back to the
-            // detector data root when the experiment has none.
-            let start = if self.browse_start.is_dir() {
-                Some(self.browse_start.clone())
-            } else if self.root.is_dir() {
-                Some(self.root.clone())
-            } else {
-                self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
-            };
-            if let Some(dir) = start {
-                dialog = dialog.set_directory(dir);
-            }
-            for dir in dialog.pick_folders().unwrap_or_default() {
-                if !self.is_selected(&dir) {
-                    self.toggle(dir);
+        ui.horizontal(|ui| {
+            if ui.button("📂 Browse…").clicked() {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title(format!("Select {} folder(s)", self.kind));
+                // Start in the experiment's shared folder; fall back to the
+                // first existing detector data root when the experiment has
+                // none.
+                let start = if self.browse_start.is_dir() {
+                    Some(self.browse_start.clone())
+                } else {
+                    self.roots
+                        .iter()
+                        .find(|r| r.is_dir())
+                        .cloned()
+                        .or_else(|| {
+                            self.roots
+                                .first()
+                                .and_then(|r| r.parent())
+                                .filter(|p| p.is_dir())
+                                .map(PathBuf::from)
+                        })
+                };
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
+                }
+                for dir in dialog.pick_folders().unwrap_or_default() {
+                    if !self.is_selected(&dir) {
+                        self.toggle(dir);
+                    }
                 }
             }
-        }
+            // The OS dialog may only allow one folder at a time; browsing
+            // again adds to the selection instead of replacing it.
+            ui.label(RichText::new("each browse adds to the selection").weak().size(11.0));
+        });
 
         if let Some(e) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -7751,7 +7808,13 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         .set_title("Select the ASCII file containing the list of angles")
                         .add_filter("Text files", &["txt"])
                         .add_filter("All files", &["*"]);
-                    if let Some(dir) = view.sample.root.parent().filter(|p| p.is_dir()) {
+                    if let Some(dir) = view
+                        .sample
+                        .roots
+                        .first()
+                        .and_then(|r| r.parent())
+                        .filter(|p| p.is_dir())
+                    {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(path) = dialog.pick_file() {
