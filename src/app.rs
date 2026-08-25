@@ -2800,14 +2800,30 @@ impl MultiFolderPick {
         if self.selected.is_empty() {
             ui.label(RichText::new("no folder selected yet").weak());
         } else {
-            ui.label(
-                RichText::new(format!(
-                    "{} folder(s) — {} tiff images",
-                    self.selected.len(),
-                    self.total_files()
-                ))
-                .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} folder(s) — {} tiff images",
+                        self.selected.len(),
+                        self.total_files()
+                    ))
+                    .strong(),
+                );
+                if self.selected.len() > 1
+                    && ui
+                        .small_button("✖ remove all")
+                        .on_hover_text("clear the whole selection")
+                        .clicked()
+                {
+                    logger::log(format!(
+                        "{} selection cleared ({} folders)",
+                        self.kind,
+                        self.selected.len()
+                    ));
+                    self.selected.clear();
+                }
+            });
+            let mut removed: Option<PathBuf> = None;
             for (dir, files, superseded) in &self.selected {
                 let name = dir
                     .file_name()
@@ -2820,11 +2836,24 @@ impl MultiFolderPick {
                 };
                 let text =
                     RichText::new(format!("{name} — {} tiff{revisions}", files.len())).size(12.0);
-                if files.is_empty() {
-                    ui.colored_label(warn_text(ui), text.text());
-                } else {
-                    ui.label(text.weak());
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("remove this folder from the selection")
+                        .clicked()
+                    {
+                        removed = Some(dir.clone());
+                    }
+                    if files.is_empty() {
+                        ui.colored_label(warn_text(ui), text.text());
+                    } else {
+                        ui.label(text.weak());
+                    }
+                });
+            }
+            if let Some(dir) = removed {
+                // `toggle` on a selected folder removes it (and logs).
+                self.toggle(dir);
             }
         }
     }
