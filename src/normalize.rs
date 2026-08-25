@@ -9,7 +9,7 @@
 //! `rust_roi_selector` application on the integrated sample image.
 
 use crate::combine::{LoadedStack, Projection};
-use crate::crop::{CropRect, read_npy, write_npy, write_npy_stack};
+use crate::crop::{CropRect, read_npy, write_npy, write_npy_stack_ticking};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -181,23 +181,43 @@ fn run_roi_selector(stack: &LoadedStack) -> Result<Option<CropRect>, String> {
 const NEUNORM_SCRIPT: &str = r#"
 import sys
 import numpy as np
+
+sample_file, ob_file, out_file, df_file = sys.argv[1:5]
+
+# Stage progress for the Rust side's bar: "PROGRESS <done>/<total> <label>",
+# the label naming the stage that is starting (same line contract as the
+# workflow runner's normalize_tof.py). Old NeuNorm has no progress callback,
+# so the stages are the finest grain available.
+_done = 0
+_total = 6 if df_file != '-' else 5
+
+def stage(label):
+    global _done
+    print(f"PROGRESS {_done}/{_total} {label}", flush=True)
+    _done += 1
+
+stage('loading NeuNorm')
 from NeuNorm.normalization import Normalization
 from NeuNorm.roi import ROI
 
-sample_file, ob_file, out_file, df_file = sys.argv[1:5]
 o_norm = Normalization()
+stage('loading the sample stack')
 o_norm.load(data=np.load(sample_file))
+stage('loading the open beam')
 o_norm.load(data=np.load(ob_file), data_type='ob')
 if df_file != '-':
     # Dark current: NeuNorm subtracts the (mean) dark field from the sample
     # and the OB before dividing.
+    stage('subtracting the dark current')
     o_norm.load(data=np.load(df_file), data_type='df')
     o_norm.df_correction()
+stage('dividing by the mean open beam')
 if len(sys.argv) > 5:
     x0, y0, x1, y1 = (int(v) for v in sys.argv[5:9])
     o_norm.normalization(roi=ROI(x0=x0, y0=y0, x1=x1, y1=y1), force_mean_ob=True)
 else:
     o_norm.normalization(force_mean_ob=True)
+stage('saving the normalized stack')
 np.save(out_file, np.asarray(o_norm.get_normalized_data(), dtype=np.float32))
 "#;
 
@@ -208,6 +228,9 @@ pub struct NormJob {
     rx: Receiver<Result<(LoadedStack, String), String>>,
     /// Everything NeuNorm prints (stdout and stderr), appended live.
     pub output: Arc<std::sync::Mutex<String>>,
+    /// Live progress, drawn as a bar in the UI: a short note saying what is
+    /// happening plus a 0–1 completion fraction.
+    pub progress: Arc<std::sync::Mutex<(String, f32)>>,
 }
 
 impl NormJob {
@@ -215,10 +238,17 @@ impl NormJob {
         let (tx, rx) = channel();
         let output = Arc::new(std::sync::Mutex::new(String::new()));
         let output_thread = Arc::clone(&output);
+        let progress = Arc::new(std::sync::Mutex::new(("preparing the stacks…".to_owned(), 0.0)));
+        let progress_thread = Arc::clone(&progress);
         std::thread::spawn(move || {
-            let _ = tx.send(run_normalization(&stack, &settings, &output_thread));
+            let _ = tx.send(run_normalization(
+                &stack,
+                &settings,
+                &output_thread,
+                &progress_thread,
+            ));
         });
-        Self { rx, output }
+        Self { rx, output, progress }
     }
 
     pub fn poll(&mut self) -> Option<Result<(LoadedStack, String), String>> {
@@ -226,10 +256,27 @@ impl NormJob {
     }
 }
 
+/// The progress bands of one run, on the UI's 0–1 bar: writing the input
+/// stacks, then the Python script's own stages (its `PROGRESS` lines mapped
+/// into the middle band), then reading the result back.
+const WRITE_BAND_END: f32 = 0.30;
+const SCRIPT_BAND_END: f32 = 0.90;
+
+/// `<done>/<total> <label>` from the script's `PROGRESS` lines → the label
+/// and the completed fraction (same line contract as the workflow runner).
+fn parse_script_progress(rest: &str) -> Option<(String, f32)> {
+    let (count, label) = rest.split_once(' ')?;
+    let (done, total) = count.split_once('/')?;
+    let done: f32 = done.trim().parse().ok()?;
+    let total: f32 = total.trim().parse().ok()?;
+    (total > 0.0).then(|| (label.trim().to_owned(), (done / total).clamp(0.0, 1.0)))
+}
+
 fn run_normalization(
     stack: &LoadedStack,
     settings: &NormSettings,
     captured: &Arc<std::sync::Mutex<String>>,
+    progress: &Arc<std::sync::Mutex<(String, f32)>>,
 ) -> Result<(LoadedStack, String), String> {
     if stack.ob.is_empty() {
         return Err("no open beam in this stack — normalization needs at least one".to_owned());
@@ -263,19 +310,47 @@ fn run_normalization(
         }
         let _ = std::fs::remove_dir(&dir);
     };
+    let set_progress = |note: &str, frac: f32| {
+        *progress.lock().unwrap() = (note.to_owned(), frac);
+    };
+    // One shared counter across the three input stacks, so the write band
+    // advances smoothly from 0 to WRITE_BAND_END.
+    let n_images = stack.sample.len() + stack.ob.len() + stack.dc.len();
+    let image_written = |already: usize, kind: &'static str| {
+        move |i: usize| {
+            let done = already + i;
+            *progress.lock().unwrap() = (
+                format!("writing the {kind} stack ({done}/{n_images} images)…"),
+                WRITE_BAND_END * done as f32 / n_images.max(1) as f32,
+            );
+        }
+    };
     let run = || -> Result<Vec<f32>, String> {
         let sample_refs: Vec<&Projection> = stack.sample.iter().collect();
-        write_npy_stack(&sample_npy, &sample_refs)?;
+        write_npy_stack_ticking(
+            &sample_npy,
+            &sample_refs,
+            image_written(0, "sample"),
+        )?;
         let ob_refs: Vec<&Projection> = stack.ob.iter().collect();
-        write_npy_stack(&ob_npy, &ob_refs)?;
+        write_npy_stack_ticking(
+            &ob_npy,
+            &ob_refs,
+            image_written(stack.sample.len(), "open-beam"),
+        )?;
         // `-` = no dark current: the script skips the dark-field correction.
         let dc_arg = if stack.dc.is_empty() {
             "-".to_owned()
         } else {
             let dc_refs: Vec<&Projection> = stack.dc.iter().collect();
-            write_npy_stack(&dc_npy, &dc_refs)?;
+            write_npy_stack_ticking(
+                &dc_npy,
+                &dc_refs,
+                image_written(stack.sample.len() + stack.ob.len(), "dark-current"),
+            )?;
             dc_npy.display().to_string()
         };
+        set_progress("starting NeuNorm…", WRITE_BAND_END);
         std::fs::write(&script, NEUNORM_SCRIPT)
             .map_err(|e| format!("write {}: {e}", script.display()))?;
         let mut args: Vec<String> = vec![
@@ -307,8 +382,21 @@ fn run_normalization(
             .map_err(|e| format!("cannot launch {PYTHON}: {e}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stdout_buffer = Arc::clone(captured);
+        let stdout_progress = Arc::clone(progress);
         let stdout_reader = std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                // The script's PROGRESS stage lines are transient UI
+                // feedback (mapped into the script's band of the bar), not
+                // terminal output.
+                if let Some(rest) = line.strip_prefix("PROGRESS ") {
+                    if let Some((note, frac)) = parse_script_progress(rest) {
+                        *stdout_progress.lock().unwrap() = (
+                            note,
+                            WRITE_BAND_END + (SCRIPT_BAND_END - WRITE_BAND_END) * frac,
+                        );
+                    }
+                    continue;
+                }
                 crate::recon_run::append_output(&stdout_buffer, &line);
             }
         });
@@ -333,6 +421,7 @@ fn run_normalization(
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             return Err(format!("NeuNorm failed ({status}): {}", tail.join(" | ")));
         }
+        set_progress("reading the normalized stack back…", SCRIPT_BAND_END);
         let (shape, values) = read_npy(&out_npy)?;
         if shape != [stack.sample.len(), h, w] {
             return Err(format!(
@@ -345,6 +434,7 @@ fn run_normalization(
     let result = run();
     cleanup();
     let values = result?;
+    set_progress("clamping the projections to [0, 1]…", 0.97);
 
     let mut sample = Vec::with_capacity(stack.sample.len());
     for (i, p) in stack.sample.iter().enumerate() {

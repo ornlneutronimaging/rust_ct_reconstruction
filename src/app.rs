@@ -4776,10 +4776,8 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.norm_job = None;
             }
             None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("NeuNorm is running…");
-                });
+                let (note, frac) = job.progress.lock().unwrap().clone();
+                ui.add(egui::ProgressBar::new(frac).text(note));
                 ctx.request_repaint_after(Duration::from_millis(300));
                 let output = std::sync::Arc::clone(&job.output);
                 terminal_output_ui(

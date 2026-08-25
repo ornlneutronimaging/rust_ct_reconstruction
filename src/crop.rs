@@ -118,6 +118,17 @@ pub fn write_npy<'a>(
 /// Write projections as a NumPy `.npy` file, shape `(n, height, width)` —
 /// the 3-D-stack input form of the crop tool.
 pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String> {
+    write_npy_stack_ticking(path, stack, |_| {})
+}
+
+/// `write_npy_stack` with a tick as each projection goes out — progress
+/// feedback for the big stacks written over the network filesystem.
+/// `on_plane` receives the number of projections already written.
+pub fn write_npy_stack_ticking(
+    path: &Path,
+    stack: &[&Projection],
+    mut on_plane: impl FnMut(usize),
+) -> Result<(), String> {
     let first = stack
         .first()
         .ok_or("cannot write an empty stack to .npy")?;
@@ -131,7 +142,10 @@ pub fn write_npy_stack(path: &Path, stack: &[&Projection]) -> Result<(), String>
     write_npy(
         path,
         &[stack.len(), h, w],
-        stack.iter().map(|p| p.mean.as_slice()),
+        stack.iter().enumerate().map(|(i, p)| {
+            on_plane(i);
+            p.mean.as_slice()
+        }),
     )
 }
 
