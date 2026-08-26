@@ -343,6 +343,9 @@ impl CombineScan {
 pub struct SaveMeta {
     pub instrument: String,
     pub ipts: String,
+    /// `Mode::label()` of the workflow that produced the file ("White Beam"
+    /// or "TOF"), so loading it back can restore the setup-screen selection.
+    pub acquisition_mode: String,
     pub detector: String,
     pub sample_folder: String,
     pub ob_folder: String,
@@ -469,6 +472,7 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
     put("processing_stage", "combined")?;
     put("instrument", &meta.instrument)?;
     put("ipts", &meta.ipts)?;
+    put("acquisition_mode", &meta.acquisition_mode)?;
     put("detector", &meta.detector)?;
     put("sample_folder", &meta.sample_folder)?;
     put("ob_folder", &meta.ob_folder)?;
@@ -514,6 +518,7 @@ pub fn stack_from_output(
         ("method".to_owned(), "mean".to_owned()),
         ("instrument".to_owned(), meta.instrument.clone()),
         ("ipts".to_owned(), meta.ipts.clone()),
+        ("acquisition_mode".to_owned(), meta.acquisition_mode.clone()),
         ("detector".to_owned(), meta.detector.clone()),
         ("sample_folder".to_owned(), meta.sample_folder.clone()),
         ("ob_folder".to_owned(), meta.ob_folder.clone()),
@@ -870,6 +875,7 @@ mod tests {
         let meta = SaveMeta {
             instrument: "VENUS".to_owned(),
             ipts: "IPTS-1".to_owned(),
+            acquisition_mode: "TOF".to_owned(),
             detector: "IkonXL".to_owned(),
             sample_folder: "/a".to_owned(),
             ob_folder: "/b".to_owned(),
@@ -902,6 +908,10 @@ mod tests {
             .metadata
             .iter()
             .any(|(k, v)| k == "instrument" && v == "VENUS"));
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "acquisition_mode" && v == "TOF"));
         assert!(loaded
             .metadata
             .iter()

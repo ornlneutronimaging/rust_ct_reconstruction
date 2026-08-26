@@ -299,7 +299,7 @@ const RECON_ALGORITHMS: [ReconAlgorithm; 6] = [
         binary: Some(
             "/SNS/VENUS/shared/software/git/rust_astra_optimizer/target/release/astra_optimizer",
         ),
-        defaults: "{\"method\":\"SIRT_CUDA\",\"num_iter\":300,\"filter_name\":\"hann\",\"ratio\":1.0,\"pad\":null}",
+        defaults: "{\"method\":\"FBP_CUDA\",\"num_iter\":1,\"filter_name\":\"hann\",\"ratio\":1.0,\"pad\":null}",
         center_key: "center",
         center_is_offset: false,
     },
@@ -472,10 +472,97 @@ impl ReconView {
 const SPLIT_OVERLAP: usize = 10;
 
 /// Per-job slice cap for the algorithms whose reconstruction is split.
-fn split_cap_for(key: &str) -> Option<usize> {
+enum SplitCap {
+    /// Fixed cap (svmbir is CPU wall-time bound, and the mbirjax fallback
+    /// when the GPUs cannot be probed).
+    Fixed(usize),
+    /// Cap computed from the GPU memory model (mbirjax).
+    Gpu { cap: usize, gpus: usize, gib: f64 },
+    /// The data is too wide for mbirjax to fit in GPU memory at any slice
+    /// count — the run must be blocked, not just split smaller.
+    TooWide { gpus: usize, gib: f64 },
+}
+
+impl SplitCap {
+    fn cap(&self) -> Option<usize> {
+        match self {
+            SplitCap::Fixed(c) | SplitCap::Gpu { cap: c, .. } => Some(*c),
+            SplitCap::TooWide { .. } => None,
+        }
+    }
+}
+
+/// The GPUs mbirjax will use: (count, smallest per-GPU memory in MiB),
+/// probed through nvidia-smi once per app run.
+fn gpu_inventory() -> Option<(usize, u64)> {
+    fn probe() -> Option<(usize, u64)> {
+        let out = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mems: Vec<u64> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let min = *mems.iter().min()?;
+        Some((mems.len(), min))
+    }
+    static PROBE: std::sync::OnceLock<Option<(usize, u64)>> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(probe)
+}
+
+/// Largest slice count per mbirjax job that fits in GPU memory, from the
+/// model measured on the 2026-08-25 sweep (mbirjax 0.7.2, A100 40 GB):
+///
+///   per-GPU peak bytes ≈ W²·(A(n) + (B(n) + 8·V/(W·n))·S)
+///
+/// with W the sinogram width, V the number of views, n the GPU count and S
+/// the slices in the job. Solved for S against 90% of the XLA-usable
+/// memory (~93% of the card). Coefficients beyond 4 GPUs are clamped to
+/// the measured n=4 values (conservative — the S-independent working set
+/// barely shrinks with more GPUs).
+fn mbirjax_max_slices(width: usize, views: usize, n_gpus: usize, min_mib: u64) -> f64 {
+    let (a, b) = match n_gpus {
+        0 | 1 => (7500.0, 16.0),
+        2 => (7300.0, 10.0),
+        3 => (6300.0, 8.5),
+        _ => (5300.0, 7.0),
+    };
+    let (w, v, n) = (width as f64, views as f64, n_gpus as f64);
+    let budget = 0.9 * 0.93 * (min_mib as f64) * 1024.0 * 1024.0;
+    (budget / (w * w) - a) / (b + 8.0 * v / (w * n))
+}
+
+fn split_cap_for(key: &str, width: usize, views: usize) -> Option<SplitCap> {
     match key {
-        "svmbir" => Some(50),
-        "mbirjax" => Some(100),
+        "svmbir" => Some(SplitCap::Fixed(50)),
+        "mbirjax" => {
+            let Some((gpus, min_mib)) = gpu_inventory() else {
+                // No probeable GPU (jax would run on CPU anyway) — keep the
+                // historical cap.
+                return Some(SplitCap::Fixed(100));
+            };
+            if width == 0 || views == 0 {
+                return Some(SplitCap::Fixed(100));
+            }
+            let gib = min_mib as f64 / 1024.0;
+            let s = mbirjax_max_slices(width, views, gpus, min_mib);
+            // mbirjax pads the slice axis to a multiple of the GPU count, so
+            // an aligned cap wastes nothing.
+            let cap = if s.is_finite() && s > 0.0 {
+                (s as usize / gpus.max(1)) * gpus.max(1)
+            } else {
+                0
+            };
+            if cap <= 2 * SPLIT_OVERLAP {
+                Some(SplitCap::TooWide { gpus, gib })
+            } else {
+                Some(SplitCap::Gpu { cap, gpus, gib })
+            }
+        }
         _ => None,
     }
 }
@@ -556,6 +643,36 @@ fn shared_under_ipts(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Where the user last picked something with a file dialog, remembered for
+/// the lifetime of the program so later dialogs can reopen there instead of
+/// at the root of the filesystem.
+static LAST_PICK_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Record where a dialog selection came from: the path itself when it is a
+/// folder, its parent when it is a file (or a file about to be created).
+fn remember_pick(path: &Path) {
+    let dir = if path.is_dir() { Some(path) } else { path.parent() };
+    if let Some(dir) = dir.filter(|d| d.is_dir()) {
+        *LAST_PICK_DIR.lock().unwrap() = Some(dir.to_path_buf());
+    }
+}
+
+/// Where a file dialog opens: the first preferred folder that exists, then
+/// wherever the user last picked something, then the home folder — so a
+/// dialog never opens at the root of the filesystem.
+fn dialog_start(preferred: impl IntoIterator<Item = Option<PathBuf>>) -> Option<PathBuf> {
+    preferred
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_dir())
+        .or_else(|| LAST_PICK_DIR.lock().unwrap().clone().filter(|p| p.is_dir()))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+        })
 }
 
 /// The valid job-count range for splitting `h` slices into jobs of at most
@@ -1053,12 +1170,17 @@ fn recon_ui(
             );
             ui.add_space(6.0);
             let h = view.stack.sample.first().map(|p| p.height).unwrap_or(0);
+            let split_cap = split_cap_for(
+                algo.key,
+                view.stack.sample.first().map(|p| p.width).unwrap_or(0),
+                view.stack.sample.len(),
+            );
+            let too_wide = matches!(split_cap, Some(SplitCap::TooWide { .. }));
             if h > 0 {
                 // The svmbir/mbirjax volume is reconstructed in slice-range
                 // jobs (with an overlap so the stitching has context on both
                 // sides), then stitched back together.
                 const OVERLAP: usize = SPLIT_OVERLAP;
-                let split_cap = split_cap_for(algo.key);
                 // The slice range to reconstruct — defaults to everything.
                 view.slice_to = view.slice_to.min(h - 1);
                 view.slice_from = view.slice_from.min(view.slice_to);
@@ -1101,14 +1223,37 @@ fn recon_ui(
                     // Job splitting (svmbir/mbirjax only) over the selected
                     // range.
                     let mut ranges: Vec<(usize, usize)> = Vec::new();
-                    if let Some(cap) = split_cap {
+                    if let Some(SplitCap::TooWide { gpus, gib }) = &split_cap {
                         ui.add_space(6.0);
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!(
+                                "these projections are too wide for {} to fit on the \
+                                 {gpus} × {gib:.0} GB GPU{} at any slice count — crop or \
+                                 bin the data (≲ 2048 pixels wide) before reconstructing",
+                                algo.label,
+                                if *gpus == 1 { "" } else { "s" }
+                            ),
+                        );
+                    } else if let Some(cap) = split_cap.as_ref().and_then(SplitCap::cap) {
+                        ui.add_space(6.0);
+                        let reason = match &split_cap {
+                            Some(SplitCap::Gpu { gpus, gib, .. }) => format!(
+                                "at this data size the {gpus} × {gib:.0} GB GPU{} fit at \
+                                 most {cap} slices per {} job",
+                                if *gpus == 1 { "" } else { "s" },
+                                algo.label
+                            ),
+                            _ => format!(
+                                "{} handles at most {cap} slices per job",
+                                algo.label
+                            ),
+                        };
                         ui.label(
                             RichText::new(format!(
-                                "Splitting the reconstruction — {} handles at most {cap} \
-                                 slices per job; consecutive jobs overlap by {OVERLAP} \
-                                 slices and are stitched back together at the end",
-                                algo.label
+                                "Splitting the reconstruction — {reason}; consecutive \
+                                 jobs overlap by {OVERLAP} slices and are stitched back \
+                                 together at the end"
                             ))
                             .strong()
                             .size(12.0),
@@ -1339,22 +1484,16 @@ fn recon_ui(
                 if ui.button("📂 Select the output folder…").clicked() {
                     let mut dialog =
                         rfd::FileDialog::new().set_title("Select the output folder");
-                    let start = view
-                        .output_base
-                        .clone()
-                        .filter(|p| p.is_dir())
-                        .or_else(|| {
-                            view.stack
-                                .path
-                                .parent()
-                                .filter(|p| p.is_dir())
-                                .map(Path::to_path_buf)
-                        })
-                        .or_else(|| ipts_shared_folder(&view.stack));
+                    let start = dialog_start([
+                        view.output_base.clone(),
+                        view.stack.path.parent().map(Path::to_path_buf),
+                        ipts_shared_folder(&view.stack),
+                    ]);
                     if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(dir) = dialog.pick_folder() {
+                        remember_pick(&dir);
                         view.output_base = Some(dir);
                     }
                 }
@@ -1503,11 +1642,13 @@ fn recon_ui(
             ui.add_space(4.0);
             if ui
                 .add_enabled(
-                    view.output_base.is_some() && !running && h > 0,
+                    view.output_base.is_some() && !running && h > 0 && !too_wide,
                     egui::Button::new("▶ Run the full reconstruction"),
                 )
                 .on_disabled_hover_text(if running {
                     "a reconstruction is already running"
+                } else if too_wide {
+                    "the data is too wide to fit in GPU memory — crop or bin it first"
                 } else {
                     "select the output folder first"
                 })
@@ -1518,7 +1659,8 @@ fn recon_ui(
                     view.slice_to.min(h - 1),
                 );
                 let span = to - from + 1;
-                let jobs: Vec<(usize, usize)> = match split_cap_for(algo.key) {
+                let jobs: Vec<(usize, usize)> =
+                    match split_cap.as_ref().and_then(SplitCap::cap) {
                     Some(cap) if span > SPLIT_OVERLAP => {
                         let (n_min, n_max) = split_job_bounds(span, cap, SPLIT_OVERLAP);
                         let n = view.split_jobs.clamp(n_min, n_max);
@@ -1597,11 +1739,14 @@ fn recon_ui(
             match &view.run_result {
                 Some(Ok(stats)) => {
                     let dir = &stats.output_folder;
+                    ui.colored_label(
+                        ok_text(ui),
+                        format!("reconstruction written into {}", dir.display()),
+                    );
+                    // The viewer buttons live on their own row below the
+                    // path — appended to it, they fell off the window on
+                    // long output paths.
                     ui.horizontal(|ui| {
-                        ui.colored_label(
-                            ok_text(ui),
-                            format!("reconstruction written into {}", dir.display()),
-                        );
                         let viewing = view.viewer_job.is_some();
                         if ui
                             .add_enabled(
@@ -2340,16 +2485,22 @@ impl WhiteBeamView {
             detector.ct_roots(instrument, &session.ipts.path),
             &session.ipts.path,
         );
+        // OB and DC accept single image files on top of whole folders; the
+        // sample stays folder-based.
         let ob = MultiFolderPick::new(
             "open beam",
             detector.ob_roots(instrument, &session.ipts.path),
             &session.ipts.path,
+        )
+        .with_files();
+        let dc = Some(
+            MultiFolderPick::new(
+                "dark current",
+                detector.dc_roots(instrument, &session.ipts.path),
+                &session.ipts.path,
+            )
+            .with_files(),
         );
-        let dc = Some(MultiFolderPick::new(
-            "dark current",
-            detector.dc_roots(instrument, &session.ipts.path),
-            &session.ipts.path,
-        ));
         let describe = |pick: &MultiFolderPick| {
             format!(
                 "{} ({})",
@@ -2572,9 +2723,7 @@ impl WhiteBeamView {
     /// when the Next button is clicked before the user did it.
     fn start_read(&mut self, sample_runs: Vec<RunToCombine>) {
         let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
-            pick.selected
-                .iter()
-                .flat_map(|(_, files, _)| files.iter())
+            pick.iter_files()
                 .map(|file| RunToCombine {
                     name: file
                         .file_stem()
@@ -2619,6 +2768,9 @@ struct MultiFolderPick {
     roots: Vec<PathBuf>,
     /// Where the Browse dialog opens: the experiment's `shared` folder.
     browse_start: PathBuf,
+    /// The experiment (IPTS) folder itself — the floor every Browse dialog
+    /// falls back to when nothing more specific exists.
+    ipts: PathBuf,
     /// Candidate folders across every root, as `(label, path)`: the label
     /// carries the detector folder name when several roots contribute.
     candidates: Result<Vec<(String, PathBuf)>, String>,
@@ -2626,6 +2778,12 @@ struct MultiFolderPick {
     /// TIFFs)` — superseded are older revisions of retaken projections,
     /// excluded automatically but kept visible.
     selected: Vec<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)>,
+    /// Individually selected image files (sorted): used exactly as picked,
+    /// no folder inventory or revision filtering.
+    files: Vec<PathBuf>,
+    /// Show the file-picking button — single OB / DC images are allowed on
+    /// top of (or instead of) whole folders.
+    allow_files: bool,
     error: Option<String>,
 }
 
@@ -2670,10 +2828,36 @@ impl MultiFolderPick {
             kind,
             roots,
             browse_start: ipts.join("shared"),
+            ipts: ipts.to_path_buf(),
             candidates,
             selected: Vec::new(),
+            files: Vec::new(),
+            allow_files: false,
             error: None,
         }
+    }
+
+    /// Where the Browse dialogs open: the experiment's shared folder, then a
+    /// detector data root, then the experiment (IPTS) folder itself — with
+    /// [`dialog_start`]'s own fallbacks behind those, so the dialog never
+    /// opens at the root of the filesystem.
+    fn start_dir(&self) -> Option<PathBuf> {
+        let mut preferred = vec![Some(self.browse_start.clone())];
+        preferred.extend(self.roots.iter().cloned().map(Some));
+        preferred.push(
+            self.roots
+                .first()
+                .and_then(|r| r.parent())
+                .map(PathBuf::from),
+        );
+        preferred.push(Some(self.ipts.clone()));
+        dialog_start(preferred)
+    }
+
+    /// Also allow picking single image files, not just whole folders.
+    fn with_files(mut self) -> Self {
+        self.allow_files = true;
+        self
     }
 
     fn is_selected(&self, dir: &Path) -> bool {
@@ -2681,7 +2865,42 @@ impl MultiFolderPick {
     }
 
     fn total_files(&self) -> usize {
-        self.selected.iter().map(|(_, files, _)| files.len()).sum()
+        self.selected
+            .iter()
+            .map(|(_, files, _)| files.len())
+            .sum::<usize>()
+            + self.files.len()
+    }
+
+    /// Every image the selection contributes: the files of each selected
+    /// folder plus the individually selected files.
+    fn iter_files(&self) -> impl Iterator<Item = &PathBuf> {
+        self.selected
+            .iter()
+            .flat_map(|(_, files, _)| files.iter())
+            .chain(self.files.iter())
+    }
+
+    /// Add individually picked image files (duplicates are ignored).
+    fn add_files(&mut self, picked: Vec<PathBuf>) {
+        let mut added = 0usize;
+        for file in picked {
+            if !tof::is_image(&file) {
+                let msg = format!("not a TIFF image: {}", file.display());
+                logger::error(format!("{} file rejected: {msg}", self.kind));
+                self.error = Some(msg);
+                continue;
+            }
+            if !self.files.contains(&file) {
+                logger::log(format!("{} file selected: {}", self.kind, file.display()));
+                self.files.push(file);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.files.sort();
+            self.error = None;
+        }
     }
 
     /// Add (recording its TIFF files) or remove one folder.
@@ -2761,31 +2980,33 @@ impl MultiFolderPick {
             if ui.button("📂 Browse…").clicked() {
                 let mut dialog = rfd::FileDialog::new()
                     .set_title(format!("Select {} folder(s)", self.kind));
-                // Start in the experiment's shared folder; fall back to the
-                // first existing detector data root when the experiment has
-                // none.
-                let start = if self.browse_start.is_dir() {
-                    Some(self.browse_start.clone())
-                } else {
-                    self.roots
-                        .iter()
-                        .find(|r| r.is_dir())
-                        .cloned()
-                        .or_else(|| {
-                            self.roots
-                                .first()
-                                .and_then(|r| r.parent())
-                                .filter(|p| p.is_dir())
-                                .map(PathBuf::from)
-                        })
-                };
-                if let Some(dir) = start {
+                if let Some(dir) = self.start_dir() {
                     dialog = dialog.set_directory(dir);
                 }
                 for dir in dialog.pick_folders().unwrap_or_default() {
+                    remember_pick(&dir);
                     if !self.is_selected(&dir) {
                         self.toggle(dir);
                     }
+                }
+            }
+            if self.allow_files
+                && ui
+                    .button("🗋 Files…")
+                    .on_hover_text("select single image files instead of a whole folder")
+                    .clicked()
+            {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title(format!("Select {} image file(s)", self.kind))
+                    .add_filter("TIFF images", &["tif", "tiff"]);
+                if let Some(dir) = self.start_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(picked) = dialog.pick_files() {
+                    if let Some(first) = picked.first() {
+                        remember_pick(first);
+                    }
+                    self.add_files(picked);
                 }
             }
             // The OS dialog may only allow one folder at a time; browsing
@@ -2797,30 +3018,46 @@ impl MultiFolderPick {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
         ui.add_space(6.0);
-        if self.selected.is_empty() {
-            ui.label(RichText::new("no folder selected yet").weak());
+        if self.selected.is_empty() && self.files.is_empty() {
+            ui.label(
+                RichText::new(if self.allow_files {
+                    "no folder or file selected yet"
+                } else {
+                    "no folder selected yet"
+                })
+                .weak(),
+            );
         } else {
             ui.horizontal(|ui| {
+                let mut parts: Vec<String> = Vec::new();
+                if !self.selected.is_empty() {
+                    parts.push(format!("{} folder(s)", self.selected.len()));
+                }
+                if !self.files.is_empty() {
+                    parts.push(format!("{} file(s)", self.files.len()));
+                }
                 ui.label(
                     RichText::new(format!(
-                        "{} folder(s) — {} tiff images",
-                        self.selected.len(),
+                        "{} — {} tiff images",
+                        parts.join(" + "),
                         self.total_files()
                     ))
                     .strong(),
                 );
-                if self.selected.len() > 1
+                if self.selected.len() + self.files.len() > 1
                     && ui
                         .small_button("✖ remove all")
                         .on_hover_text("clear the whole selection")
                         .clicked()
                 {
                     logger::log(format!(
-                        "{} selection cleared ({} folders)",
+                        "{} selection cleared ({} folders, {} files)",
                         self.kind,
-                        self.selected.len()
+                        self.selected.len(),
+                        self.files.len()
                     ));
                     self.selected.clear();
+                    self.files.clear();
                 }
             });
             let mut removed: Option<PathBuf> = None;
@@ -2854,6 +3091,27 @@ impl MultiFolderPick {
             if let Some(dir) = removed {
                 // `toggle` on a selected folder removes it (and logs).
                 self.toggle(dir);
+            }
+            let mut removed_file: Option<usize> = None;
+            for (i, file) in self.files.iter().enumerate() {
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string());
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("remove this file from the selection")
+                        .clicked()
+                    {
+                        removed_file = Some(i);
+                    }
+                    ui.label(RichText::new(format!("🗋 {name}")).size(12.0).weak());
+                });
+            }
+            if let Some(i) = removed_file {
+                let file = self.files.remove(i);
+                logger::log(format!("{} file removed: {}", self.kind, file.display()));
             }
         }
     }
@@ -2996,6 +3254,9 @@ struct FolderPick {
     root: PathBuf,
     /// Where the Browse dialog opens: the experiment's `shared` folder.
     browse_start: PathBuf,
+    /// The experiment (IPTS) folder itself — the floor the Browse dialog
+    /// falls back to when nothing more specific exists.
+    ipts: PathBuf,
     candidates: Result<Vec<PathBuf>, String>,
     selected: Option<PathBuf>,
     scan: Option<FolderScan>,
@@ -3010,6 +3271,7 @@ impl FolderPick {
             kind,
             root,
             browse_start: ipts.join("shared"),
+            ipts: ipts.to_path_buf(),
             candidates,
             selected: None,
             scan: None,
@@ -3095,18 +3357,18 @@ impl FolderPick {
         if ui.button("📂 Browse…").clicked() {
             let mut dialog = rfd::FileDialog::new().set_title(format!("Select the {} folder", self.kind));
             // Start in the experiment's shared folder; fall back to the
-            // detector data root when the experiment has none.
-            let start = if self.browse_start.is_dir() {
-                Some(self.browse_start.clone())
-            } else if self.root.is_dir() {
-                Some(self.root.clone())
-            } else {
-                self.root.parent().filter(|p| p.is_dir()).map(PathBuf::from)
-            };
+            // detector data root, then the experiment folder itself.
+            let start = dialog_start([
+                Some(self.browse_start.clone()),
+                Some(self.root.clone()),
+                self.root.parent().map(PathBuf::from),
+                Some(self.ipts.clone()),
+            ]);
             if let Some(dir) = start {
                 dialog = dialog.set_directory(dir);
             }
             if let Some(path) = dialog.pick_folder() {
+                remember_pick(&path);
                 self.select(path);
             }
         }
@@ -3427,13 +3689,15 @@ impl CtApp {
             let mut dialog = rfd::FileDialog::new()
                 .set_title("Select a previously saved projections HDF5")
                 .add_filter("HDF5", &["h5", "hdf5"]);
-            if let Some(entry) = &self.selected {
-                let shared = entry.path.join("shared");
-                if shared.is_dir() {
-                    dialog = dialog.set_directory(shared);
-                }
+            let start = dialog_start([
+                self.selected.as_ref().map(|e| e.path.join("shared")),
+                self.selected.as_ref().map(|e| e.path.clone()),
+            ]);
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
             }
             if let Some(path) = dialog.pick_file() {
+                remember_pick(&path);
                 logger::log(format!("loading saved stack: {}", path.display()));
                 self.load_error = None;
                 self.load_job = Some(LoadJob::start(path));
@@ -3754,6 +4018,61 @@ impl CtApp {
         go
     }
 
+    /// Reflect a loaded stack's provenance back onto the setup screen: the
+    /// instrument, experiment and acquisition mode recorded in its metadata
+    /// become the current selection, so navigating back to the setup starts
+    /// from the context the file was produced in.
+    fn prefill_setup_from_stack(&mut self, stack: &LoadedStack) {
+        let meta = |name: &str| {
+            stack
+                .metadata
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        if let Some(inst) = meta("instrument").and_then(Instrument::parse)
+            && inst != self.instrument
+        {
+            self.instrument = inst;
+            self.selected = None;
+            self.filter.clear();
+            self.manual_error = None;
+        }
+        if let Some(name) = meta("ipts") {
+            match ipts::manual_entry(self.instrument, name) {
+                Ok(entry) => {
+                    self.selected = Some(entry);
+                    self.scroll_to_selected = true;
+                }
+                Err(e) => logger::error(format!("IPTS recorded in the file rejected: {e}")),
+            }
+        }
+        // Files saved before the explicit entry existed are recognized by
+        // the white-beam prefix their combine_mode note always starts with.
+        let mode = meta("acquisition_mode").and_then(Mode::parse).or_else(|| {
+            meta("combine_mode").map(|m| {
+                if m.starts_with("white beam") {
+                    Mode::WhiteBeam
+                } else {
+                    Mode::Tof
+                }
+            })
+        });
+        if let Some(mode) = mode {
+            self.mode = Some(if self.instrument == Instrument::Mars {
+                Mode::WhiteBeam
+            } else {
+                mode
+            });
+        }
+        logger::log(format!(
+            "setup prefilled from the file: {} / {} / {}",
+            self.instrument.name(),
+            self.selected.as_ref().map_or("no IPTS", |e| e.name.as_str()),
+            self.mode.map_or("no mode", Mode::label),
+        ));
+    }
+
     /// Load the debug config and prefill the setup screen from it. Turns the
     /// toggle back off when the config file itself cannot be read.
     fn enable_debug(&mut self) {
@@ -3872,7 +4191,9 @@ impl CtApp {
                         let mut dialog = rfd::FileDialog::new()
                             .add_filter("HDF5 config", &["h5", "hdf5"])
                             .set_title("Select a debug config file");
-                        if let Some(dir) = self.config_path.parent().filter(|d| d.is_dir()) {
+                        if let Some(dir) =
+                            dialog_start([self.config_path.parent().map(PathBuf::from)])
+                        {
                             dialog = dialog.set_directory(dir);
                         }
                         if let Some(path) = dialog.pick_file() {
@@ -4255,10 +4576,15 @@ fn stack_ui(
                     .set_title("Save the pre-processed stack")
                     .add_filter("HDF5", &["h5", "hdf5"])
                     .set_file_name(default_name);
-                if let Some(dir) = view.stack.path.parent().filter(|p| p.is_dir()) {
+                let start = dialog_start([
+                    view.stack.path.parent().map(Path::to_path_buf),
+                    ipts_shared_folder(&view.stack),
+                ]);
+                if let Some(dir) = start {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.save_file() {
+                    remember_pick(&path);
                     logger::log(format!(
                         "saving the pre-processing checkpoint to {} (cor: {:?})",
                         path.display(),
@@ -6574,7 +6900,7 @@ fn workflow_ui(
             } else if ready {
                 "continue to pre-processing".to_owned()
             } else if selection.is_ok() {
-                "select the open beam folder(s) first".to_owned()
+                "select the open beam folder(s) or file(s) first".to_owned()
             } else {
                 selection.err().unwrap_or_default()
             };
@@ -6849,6 +7175,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             pick.selected
                 .iter()
                 .map(|(dir, ..)| dir.display().to_string())
+                .chain(pick.files.iter().map(|f| f.display().to_string()))
                 .collect::<Vec<_>>()
                 .join("; ")
         };
@@ -6870,6 +7197,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         let meta = SaveMeta {
             instrument: session.instrument.name().to_owned(),
             ipts: session.ipts.name.clone(),
+            acquisition_mode: session.mode.label().to_owned(),
             // MARS has a single camera — no detector was picked there.
             detector: match session.instrument {
                 Instrument::Venus => view.detector.label().to_owned(),
@@ -6880,7 +7208,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             dc_folder: view
                 .dc
                 .as_ref()
-                .filter(|dc| !dc.selected.is_empty())
+                .filter(|dc| !dc.selected.is_empty() || !dc.files.is_empty())
                 .map(folder_list),
             combine_mode: mode,
             selections_json: None,
@@ -6904,11 +7232,15 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                     .set_title("Save the white beam projections")
                     .add_filter("HDF5", &["h5", "hdf5"])
                     .set_file_name(default_name);
-                let shared = session.ipts.path.join("shared");
-                if shared.is_dir() {
-                    dialog = dialog.set_directory(shared);
+                let start = dialog_start([
+                    Some(session.ipts.path.join("shared")),
+                    Some(session.ipts.path.clone()),
+                ]);
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.save_file() {
+                    remember_pick(&path);
                     logger::log(format!("saving white beam data to {}", path.display()));
                     view.save_status = None;
                     view.saved_path = Some(path.clone());
@@ -7835,16 +8167,19 @@ fn angle_source_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         .set_title("Select the ASCII file containing the list of angles")
                         .add_filter("Text files", &["txt"])
                         .add_filter("All files", &["*"]);
-                    if let Some(dir) = view
-                        .sample
-                        .roots
-                        .first()
-                        .and_then(|r| r.parent())
-                        .filter(|p| p.is_dir())
-                    {
+                    let start = dialog_start([
+                        view.sample
+                            .roots
+                            .first()
+                            .and_then(|r| r.parent())
+                            .map(PathBuf::from),
+                        Some(view.sample.ipts.clone()),
+                    ]);
+                    if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(path) = dialog.pick_file() {
+                        remember_pick(&path);
                         match white_beam::angles_from_ascii(&path) {
                             Ok(angles) => {
                                 logger::log(format!(
@@ -8278,6 +8613,7 @@ fn process_section_ui(
         let meta = SaveMeta {
             instrument: session.instrument.name().to_owned(),
             ipts: session.ipts.name.clone(),
+            acquisition_mode: session.mode.label().to_owned(),
             detector: view.detector.label().to_owned(),
             sample_folder: view
                 .sample
@@ -8322,11 +8658,15 @@ fn process_section_ui(
                     .set_title("Save the combined projections")
                     .add_filter("HDF5", &["h5", "hdf5"])
                     .set_file_name(default_name);
-                let shared = session.ipts.path.join("shared");
-                if shared.is_dir() {
-                    dialog = dialog.set_directory(shared);
+                let start = dialog_start([
+                    Some(session.ipts.path.join("shared")),
+                    Some(session.ipts.path.clone()),
+                ]);
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.save_file() {
+                    remember_pick(&path);
                     logger::log(format!("saving combined data to {}", path.display()));
                     view.save_status = None;
                     view.saved_path = Some(path.clone());
@@ -8960,6 +9300,7 @@ impl eframe::App for CtApp {
                             }
                         ));
                         crate::recent::record_loaded(&stack.path);
+                        self.prefill_setup_from_stack(&stack);
                         self.load_job = None;
                         self.back_stack.clear();
                         self.screen = if preprocessed {
@@ -9066,6 +9407,33 @@ impl eframe::App for CtApp {
                             logger::log("returned to the previous view");
                             self.screen = previous;
                         }
+                        // A stack opened straight from a file has no view
+                        // history; step back to the load screen of the
+                        // workflow the file came from (its session was
+                        // prefilled from the metadata) rather than home.
+                        None if matches!(self.screen, Screen::Stack(_))
+                            && self.mode.is_some()
+                            && self.selected.is_some() =>
+                        {
+                            let (mode, ipts) =
+                                (self.mode.unwrap(), self.selected.clone().unwrap());
+                            logger::log(format!(
+                                "returned to the {} load screen (rebuilt from the file's provenance)",
+                                mode.label()
+                            ));
+                            let session = Session {
+                                instrument: self.instrument,
+                                ipts,
+                                mode,
+                            };
+                            let view = match mode {
+                                Mode::WhiteBeam => {
+                                    WorkflowView::WhiteBeam(WhiteBeamView::new(&session))
+                                }
+                                Mode::Tof => WorkflowView::Tof(TofView::new(&session)),
+                            };
+                            self.screen = Screen::Workflow { session, view };
+                        }
                         None => {
                             logger::log("returned to the setup screen");
                             self.screen = Screen::Setup;
@@ -9128,5 +9496,38 @@ mod split_tests {
         assert_eq!(split_job_bounds(512, 50, 10).0, 13);
         assert_eq!(split_job_bounds(90, 100, 10).0, 1);
         assert_eq!(split_ranges(90, 1, 10), vec![(0, 90)]);
+    }
+}
+
+#[cfg(test)]
+mod mbirjax_cap_tests {
+    use super::mbirjax_max_slices;
+
+    // Boundaries observed in the 2026-08-25 memory sweep on 40 GB A100s
+    // (~500 views): the model must keep predicting them.
+    const A100_MIB: u64 = 40960;
+
+    #[test]
+    fn width_4096_never_fits() {
+        for n in [1, 2, 3, 4, 8] {
+            assert!(
+                mbirjax_max_slices(4096, 500, n, A100_MIB) <= 0.0,
+                "4096-wide data must not fit on {n} GPUs"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_orders_of_magnitude() {
+        // W=2048: ~60 slices on 1 GPU, several hundred on 4.
+        let s1 = mbirjax_max_slices(2048, 500, 1, A100_MIB);
+        assert!((30.0..120.0).contains(&s1), "got {s1}");
+        let s4 = mbirjax_max_slices(2048, 500, 4, A100_MIB);
+        assert!((300.0..600.0).contains(&s4), "got {s4}");
+        // W=1024: ~a thousand slices even on a single GPU.
+        let s1k = mbirjax_max_slices(1024, 500, 1, A100_MIB);
+        assert!(s1k > 800.0, "got {s1k}");
+        // More GPUs must never shrink the cap.
+        assert!(s4 > s1);
     }
 }

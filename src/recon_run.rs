@@ -137,6 +137,15 @@ if algo in ("svmbir", "mbirjax"):
 else:
     report(f"reconstructing {sino.shape[1]} slices with {algo}")
     if algo == "astra_fbp":
+        import astra
+        from numba import cuda
+
+        # algotom picks GPU or CPU with numba's CUDA detection, which
+        # reports no GPU whenever the numba-cuda package is missing (as in
+        # the pixi environment) and silently falls back to a CPU
+        # reconstruction hundreds of times slower; astra knows its own
+        # CUDA support, so let it answer instead.
+        cuda.is_available = astra.use_cuda
         import algotom.rec.reconstruction as rec_mod
 
         rec = rec_mod.astra_reconstruction(
