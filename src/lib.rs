@@ -27,3 +27,4 @@ pub mod theme;
 pub mod tilt;
 pub mod tof;
 pub mod white_beam;
+pub mod zoom;

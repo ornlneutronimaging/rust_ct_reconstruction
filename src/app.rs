@@ -3626,6 +3626,7 @@ impl CtApp {
                     }
                     ui.separator();
                     crate::theme::toggle_button(ui);
+                    crate::zoom::toggle_button(ui);
                     if let Some(tex) = &self.logo {
                         ui.add(egui::Image::from_texture(tex).max_height(32.0));
                     }

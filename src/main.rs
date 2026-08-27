@@ -67,6 +67,8 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             cc.egui_ctx.set_theme(ct_reconstruction::theme::load());
+            cc.egui_ctx
+                .set_zoom_factor(ct_reconstruction::zoom::load());
             Ok(Box::new(CtApp::new()))
         }),
     )
