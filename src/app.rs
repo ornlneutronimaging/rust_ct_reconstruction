@@ -9327,7 +9327,14 @@ impl eframe::App for CtApp {
                 self.admin_panel(ui);
             });
             egui::CentralPanel::default().show(ui, |ui| {
-                next = self.setup_ui(ui);
+                // A window shorter than the setup screen (small displays, the
+                // large-text mode) must scroll instead of hiding the bottom.
+                egui::ScrollArea::vertical()
+                    .id_salt("setup_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        next = self.setup_ui(ui);
+                    });
             });
             if next && let (Some(mode), Some(ipts)) = (self.mode, self.selected.clone()) {
                 logger::log(format!(
@@ -9354,10 +9361,16 @@ impl eframe::App for CtApp {
                     nav = workflow_ui(ui, session, view);
                 }
                 Screen::Stack(view) => {
-                    nav = stack_ui(ui, view);
+                    egui::ScrollArea::vertical()
+                        .id_salt("stack_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| nav = stack_ui(ui, view));
                 }
                 Screen::Recon(view) => {
-                    nav = recon_ui(ui, view);
+                    egui::ScrollArea::vertical()
+                        .id_salt("recon_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| nav = recon_ui(ui, view));
                 }
                 Screen::Setup => {}
             });
