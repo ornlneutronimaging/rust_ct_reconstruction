@@ -2493,8 +2493,13 @@ struct WhiteBeamView {
     intensities: Option<IntensityCache>,
     /// Images with an intensity below this are excluded.
     threshold: f64,
+    /// Optional upper threshold: when `threshold_max_enabled`, images with an
+    /// intensity above this are excluded too (saturated frames, beam spikes).
+    threshold_max: f64,
+    threshold_max_enabled: bool,
     threshold_bounds: (f64, f64),
-    threshold_dragging: bool,
+    /// Which slider handle the current drag moves (`true` = upper).
+    threshold_dragging: Option<bool>,
     /// Show the intensity plot with a log10 y axis.
     intensity_log: bool,
 
@@ -2625,8 +2630,10 @@ impl WhiteBeamView {
             intensity_job: None,
             intensities: None,
             threshold: 0.0,
+            threshold_max: 1.0,
+            threshold_max_enabled: false,
             threshold_bounds: (0.0, 1.0),
-            threshold_dragging: false,
+            threshold_dragging: None,
             intensity_log: false,
             process: None,
             processed: None,
@@ -2638,6 +2645,13 @@ impl WhiteBeamView {
             auto_continue: false,
             open_section: Some(WbSection::Angles),
         }
+    }
+
+    /// `true` when an image with this integrated intensity is dropped by the
+    /// threshold(s): below the lower one, or above the optional upper one.
+    fn intensity_excluded(&self, intensity: f64) -> bool {
+        intensity < self.threshold
+            || (self.threshold_max_enabled && intensity > self.threshold_max)
     }
 
     /// The final sample selection: used files (highest revisions) that
@@ -2672,7 +2686,7 @@ impl WhiteBeamView {
             }
             if let Some(cache) = thresholded
                 && let Some(Some(v)) = cache.values.get(index)
-                && v.intensity < self.threshold
+                && self.intensity_excluded(v.intensity)
             {
                 continue;
             }
@@ -7474,6 +7488,9 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
         if view.intensities.is_some() {
             mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
+            if view.threshold_max_enabled {
+                mode.push_str(&format!(", upper threshold {:.4e}", view.threshold_max));
+            }
         }
         let meta = SaveMeta {
             instrument: session.instrument.name().to_owned(),
@@ -7586,9 +7603,10 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     }
 }
 
-/// Manual run-number exclusion plus an intensity threshold: the integrated
+/// Manual run-number exclusion plus intensity thresholds: the integrated
 /// intensity of every image against its run number, with a draggable
-/// horizontal threshold under which images are dropped.
+/// horizontal threshold under which images are dropped and an optional upper
+/// one above which they are dropped too.
 fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
     let ctx = ui.ctx().clone();
     let files: Vec<PathBuf> = view
@@ -7666,8 +7684,9 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                     (lo.min(v.intensity), hi.max(v.intensity))
                 });
             let span = (max - min).max(max.abs() * 1e-3).max(1e-9);
-            // Default threshold below every value: nothing excluded yet.
+            // Default thresholds outside every value: nothing excluded yet.
             view.threshold = min - span * 0.05;
+            view.threshold_max = max + span * 0.05;
             view.threshold_bounds = (min - span * 0.1, max + span * 0.1);
             logger::log(format!(
                 "integrated intensities: {} images (range {:.4e} to {:.4e}), {} failed",
@@ -7769,7 +7788,41 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
         .map(|(i, f)| (white_beam::revision_base(f), i))
         .collect();
 
-    ui.checkbox(&mut view.intensity_log, "log y scale");
+    let mut typed = false;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut view.intensity_log, "log y scale");
+        ui.separator();
+        ui.label("exclude below:");
+        typed |= ui
+            .add(
+                egui::DragValue::new(&mut view.threshold)
+                    .speed((view.threshold_bounds.1 - view.threshold_bounds.0).abs() / 500.0)
+                    .custom_formatter(|v, _| format!("{v:.4e}")),
+            )
+            .on_hover_text("images with an integrated intensity below this are excluded")
+            .changed();
+        ui.separator();
+        let was_enabled = view.threshold_max_enabled;
+        ui.checkbox(&mut view.threshold_max_enabled, "also exclude above:")
+            .on_hover_text(
+                "optional upper threshold: images with an integrated intensity above it \
+                 are excluded too (saturated frames, beam spikes)",
+            );
+        if view.threshold_max_enabled != was_enabled {
+            typed = true;
+        }
+        typed |= ui
+            .add_enabled(
+                view.threshold_max_enabled,
+                egui::DragValue::new(&mut view.threshold_max)
+                    .speed((view.threshold_bounds.1 - view.threshold_bounds.0).abs() / 500.0)
+                    .custom_formatter(|v, _| format!("{v:.4e}")),
+            )
+            .changed();
+    });
+    if view.threshold_max_enabled && view.threshold_max < view.threshold {
+        view.threshold_max = view.threshold;
+    }
     let log_scale = view.intensity_log;
     let y_of = |v: f64| if log_scale { v.max(1e-30).log10() } else { v };
 
@@ -7784,10 +7837,10 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
         old_revision: bool,
     }
 
-    let threshold = view.threshold;
     let is_manual = |v: &ImageIntensity| v.run_number.is_some_and(|r| view.excluded_runs.contains(&r));
     let mut kept: Vec<[f64; 2]> = Vec::new();
     let mut dropped: Vec<[f64; 2]> = Vec::new();
+    let mut dropped_above: Vec<[f64; 2]> = Vec::new();
     let mut manual: Vec<[f64; 2]> = Vec::new();
     let mut old_revisions: Vec<[f64; 2]> = Vec::new();
     let mut dots: Vec<Dot> = Vec::new();
@@ -7820,8 +7873,10 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
             old_revisions.push(point);
         } else if is_manual(v) {
             manual.push(point);
-        } else if v.intensity < threshold {
+        } else if v.intensity < view.threshold {
             dropped.push(point);
+        } else if view.threshold_max_enabled && v.intensity > view.threshold_max {
+            dropped_above.push(point);
         } else {
             kept.push(point);
         }
@@ -7840,18 +7895,29 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                 view.threshold_bounds.1.max(1e-30).log10(),
             );
             let mut value = view.threshold.max(1e-30).log10();
+            let mut upper = view.threshold_max.max(1e-30).log10();
             released = vertical_threshold_slider(
                 ui,
                 &mut value,
+                view.threshold_max_enabled.then_some(&mut upper),
                 bounds,
                 PLOT_HEIGHT,
                 &mut view.threshold_dragging,
             );
-            view.threshold = 10f64.powf(value);
+            // Write back only while a handle moves: a typed value must not
+            // drift through the log10 round trip every frame.
+            if released || view.threshold_dragging.is_some() {
+                view.threshold = 10f64.powf(value);
+                if view.threshold_max_enabled {
+                    view.threshold_max = 10f64.powf(upper);
+                }
+            }
         } else {
+            let (lower, upper) = (&mut view.threshold, &mut view.threshold_max);
             released = vertical_threshold_slider(
                 ui,
-                &mut view.threshold,
+                lower,
+                view.threshold_max_enabled.then_some(upper),
                 view.threshold_bounds,
                 PLOT_HEIGHT,
                 &mut view.threshold_dragging,
@@ -7900,6 +7966,13 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         .color(Color32::from_rgb(230, 100, 100))
                         .width(1.5),
                 );
+                if view.threshold_max_enabled {
+                    plot_ui.hline(
+                        egui_plot::HLine::new("upper threshold", y_of(view.threshold_max))
+                            .color(Color32::from_rgb(230, 150, 60))
+                            .width(1.5),
+                    );
+                }
                 plot_ui.points(
                     egui_plot::Points::new("kept", kept.clone())
                         .radius(3.0)
@@ -7910,6 +7983,13 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
                         .radius(3.0)
                         .color(Color32::from_gray(110)),
                 );
+                if view.threshold_max_enabled {
+                    plot_ui.points(
+                        egui_plot::Points::new("above threshold", dropped_above.clone())
+                            .radius(3.0)
+                            .color(Color32::from_gray(150)),
+                    );
+                }
                 plot_ui.points(
                     egui_plot::Points::new("manual", manual.clone())
                         .radius(3.5)
@@ -7980,16 +8060,26 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
     }
 
     let n_kept = kept.len();
+    let above = if view.threshold_max_enabled {
+        format!(", {} above the upper threshold", dropped_above.len())
+    } else {
+        String::new()
+    };
     let line = format!(
-        "keeping {n_kept} of {} images — {} below threshold, {} excluded manually, {} old revisions",
-        kept.len() + dropped.len() + manual.len(),
+        "keeping {n_kept} of {} images — {} below threshold{above}, {} excluded manually, {} old revisions",
+        kept.len() + dropped.len() + dropped_above.len() + manual.len(),
         dropped.len(),
         manual.len(),
         old_revisions.len()
     );
-    if released {
+    if released || typed {
+        let upper = if view.threshold_max_enabled {
+            format!(", upper threshold {:.4e}", view.threshold_max)
+        } else {
+            String::new()
+        };
         logger::log(format!(
-            "intensity threshold set to {:.4e}: {line}",
+            "intensity threshold set to {:.4e}{upper}: {line}",
             view.threshold
         ));
     }
@@ -8000,14 +8090,17 @@ fn exclude_images_ui(ui: &mut egui::Ui, view: &mut WhiteBeamView) {
     }
 }
 
-/// A custom-painted vertical single-handle threshold slider; the zone below
-/// the handle (excluded) is tinted red. Returns `true` when a drag ends.
+/// A custom-painted vertical threshold slider: a lower handle (the zone
+/// below it, excluded, is tinted red) and an optional upper handle (the zone
+/// above it tinted orange). A drag grabs the closer handle; `dragging`
+/// remembers which one (`true` = upper). Returns `true` when a drag ends.
 fn vertical_threshold_slider(
     ui: &mut egui::Ui,
     value: &mut f64,
+    mut upper: Option<&mut f64>,
     bounds: (f64, f64),
     height: f32,
-    dragging: &mut bool,
+    dragging: &mut Option<bool>,
 ) -> bool {
     use egui::{Pos2, Rect, Sense, Stroke, vec2};
     const WIDTH: f32 = 34.0;
@@ -8020,16 +8113,24 @@ fn vertical_threshold_slider(
     let to_v = |y: f32| bounds.1 - f64::from((y - inner_top) / inner_height).clamp(0.0, 1.0) * span;
 
     if let Some(pos) = response.interact_pointer_pos() {
-        if response.drag_started() || response.clicked() {
-            *dragging = true;
+        if response.drag_started() || (response.clicked() && dragging.is_none()) {
+            let grab_upper = upper
+                .as_deref()
+                .is_some_and(|u| (pos.y - to_y(*u)).abs() < (pos.y - to_y(*value)).abs());
+            *dragging = Some(grab_upper);
         }
-        if *dragging {
-            *value = to_v(pos.y);
+        if let Some(grab_upper) = *dragging {
+            let v = to_v(pos.y);
+            match (grab_upper, upper.as_deref_mut()) {
+                (true, Some(u)) => *u = v.max(*value),
+                (_, Some(u)) => *value = v.min(*u),
+                (_, None) => *value = v,
+            }
         }
     }
-    let released = *dragging && response.drag_stopped();
+    let released = dragging.is_some() && response.drag_stopped();
     if released {
-        *dragging = false;
+        *dragging = None;
     }
 
     let painter = ui.painter();
@@ -8038,7 +8139,7 @@ fn vertical_threshold_slider(
         [Pos2::new(cx, inner_top), Pos2::new(cx, inner_top + inner_height)],
         Stroke::new(4.0, Color32::from_gray(70)),
     );
-    // Excluded zone: below the handle.
+    // Excluded zone: below the lower handle.
     let y = to_y(*value);
     painter.rect_filled(
         Rect::from_min_max(
@@ -8048,6 +8149,14 @@ fn vertical_threshold_slider(
         2.0,
         Color32::from_rgba_unmultiplied(230, 100, 100, 120),
     );
+    // And above the upper one.
+    if let Some(u) = upper.as_deref() {
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(cx - 3.0, inner_top), Pos2::new(cx + 3.0, to_y(*u))),
+            2.0,
+            Color32::from_rgba_unmultiplied(230, 150, 60, 120),
+        );
+    }
     // A light handle disappears on the light panel background.
     let handle = if ui.visuals().dark_mode {
         Color32::from_gray(230)
@@ -8055,6 +8164,9 @@ fn vertical_threshold_slider(
         Color32::from_gray(60)
     };
     painter.circle_filled(Pos2::new(cx, y), HANDLE_R, handle);
+    if let Some(u) = upper.as_deref() {
+        painter.circle_filled(Pos2::new(cx, to_y(*u)), HANDLE_R, handle);
+    }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
