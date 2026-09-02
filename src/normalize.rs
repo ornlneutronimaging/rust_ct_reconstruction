@@ -522,7 +522,10 @@ impl VisualizeJob {
 
 /// Write projections as float32 TIFFs into `dir` (created if needed), one
 /// file per projection, ordered by index.
-fn write_projection_tiffs(dir: &Path, projections: &[Projection]) -> Result<(), String> {
+pub(crate) fn write_projection_tiffs(
+    dir: &Path,
+    projections: &[Projection],
+) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     for (i, p) in projections.iter().enumerate() {
         let safe: String = p

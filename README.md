@@ -72,6 +72,33 @@ white-beam sample folder holds one TIFF per projection, with the run number
 and angle in the file name. Folder selection works like the TOF screen; the
 per-projection processing steps are next.
 
+## Pre-processing exports
+
+Every section of the pre-processing screen (crop, remove outliers,
+normalization, ring artifact removal, remove stripes, rotation, tilt
+correction, log conversion) ends with an **📤 Export the images (TIFF)…**
+button, enabled once the step was applied. It asks for a folder and creates
+a sub-folder named after the step (`crop/`, `remove_outliers/`,
+`normalization/`, `ring_artifact_removal/`, `remove_stripes/`, `rotation/`,
+`tilt_correction/`, `log_conversion/`) holding the stack as it is at that
+point — this step and everything applied before it — as float32 TIFFs, one
+per projection in stack order (`0000_<name>.tif`, …). The crop and outlier
+steps also write the open beams (and dark currents) into `ob/` and `dc/`
+sub-folders, since they transform those too. A `provenance.txt` records the
+step, the source file and the stack metadata. An existing step folder is
+never reused: a second export goes to `<step>_2/`, then `<step>_3/`, ….
+
+## Sinogram viewer
+
+The ring-artifact removal (bm3dornl) and remove-stripes sections both start
+with a **📈 Visualize the sinograms…** button: it writes the current stack
+to a work HDF5 next to the loaded file and opens the sibling
+`rust_sinogram_viewer` tool on it (any row, band average, contrast window,
+hover readout), so the vertical streaks those steps target can be judged
+before running them. The work file is deleted when the viewer closes;
+nothing comes back into the pipeline. This replaced the in-app *Sinogram*
+section.
+
 ## Admin section
 
 A collapsible **🔧 Admin** section sits at the bottom of the setup screen,

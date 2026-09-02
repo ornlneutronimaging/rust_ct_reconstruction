@@ -12,6 +12,7 @@ pub mod combine;
 pub mod config;
 pub mod credits;
 pub mod crop;
+pub mod export;
 pub mod instrument;
 pub mod ipts;
 pub mod logger;

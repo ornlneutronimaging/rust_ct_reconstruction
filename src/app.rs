@@ -11,6 +11,7 @@ use crate::combine::{
 use crate::clean::{self, CleanJob, CleanSettings, CleanStats, LogConvertJob, LogStats};
 use crate::config;
 use crate::crop::{CropJob, CropRect};
+use crate::export::{ExportExtra, ExportJob};
 use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
@@ -234,6 +235,11 @@ const SVMBIR_OPTIMIZER_BIN: &str =
 
 /// The standalone tilt & center-of-rotation tool of the sibling repo.
 const TILT_COR_BIN: &str = "/SNS/VENUS/shared/software/git/rust_tilt_center_of_rotation/target/release/tilt_center_of_rotation";
+/// The quick standalone sinogram viewer (sibling repo), opened on the
+/// current stack to judge whether the ring-artifact / stripe removals are
+/// needed.
+const SINOGRAM_VIEWER_BIN: &str =
+    "/SNS/VENUS/shared/software/git/rust_sinogram_viewer/target/release/sinogram_viewer";
 
 /// The reconstruction algorithms of the pipeline (the Python
 /// `ReconstructionAlgorithm` list); each gets its own standalone evaluation
@@ -1923,7 +1929,6 @@ enum StackSection {
     Stripes,
     Rotate,
     TiltCor,
-    Sinogram,
     Log,
 }
 
@@ -2018,6 +2023,57 @@ fn run_tilt_tool(
     result
 }
 
+/// The standalone sinogram viewer, opened on the CURRENT in-memory stack:
+/// the stack is written to a work HDF5 next to the loaded file, the viewer
+/// runs on it, and the work file is deleted when the viewer closes. Nothing
+/// comes back — it is a viewer.
+struct SinogramViewerJob {
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    /// `true` once the work file is written and the viewer is open.
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SinogramViewerJob {
+    fn start(stack: std::sync::Arc<LoadedStack>, cor: Option<f64>, dir: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open_thread = std::sync::Arc::clone(&open);
+        std::thread::spawn(move || {
+            let _ = tx.send(run_sinogram_viewer(&stack, cor, &dir, &open_thread));
+        });
+        Self { rx, open }
+    }
+
+    fn poll(&mut self) -> Option<Result<(), String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+fn run_sinogram_viewer(
+    stack: &LoadedStack,
+    cor: Option<f64>,
+    dir: &Path,
+    open: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    let work = dir.join(format!(".sinogram_work_{}.h5", std::process::id()));
+    combine::save_stack_hdf5(&work, stack, cor, &[])?;
+    open.store(true, std::sync::atomic::Ordering::Relaxed);
+    let output = std::process::Command::new(SINOGRAM_VIEWER_BIN)
+        .arg(&work)
+        .arg("--called-from-app")
+        .output();
+    let _ = std::fs::remove_file(&work);
+    let output = output.map_err(|e| format!("cannot launch {SINOGRAM_VIEWER_BIN}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the sinogram viewer failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Shown on a section's header: whether the step was run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SectionStatus {
@@ -2095,11 +2151,10 @@ struct StackView {
     /// Preview texture, keyed by (baseline, frame, quarters).
     rot_tex: Option<((usize, usize, usize), egui::TextureHandle)>,
 
-    // Sinogram view (after normalization).
-    /// Detector row (slice) whose sinogram is shown.
-    sino_row: usize,
-    /// Sinogram texture, keyed by (stack, row).
-    sino_tex: Option<((usize, usize), egui::TextureHandle)>,
+    // The standalone sinogram viewer (after normalization), to judge whether
+    // the ring-artifact / stripe removals are needed.
+    sino_viewer_job: Option<SinogramViewerJob>,
+    sino_viewer_error: Option<String>,
 
     // Tilt correction (after normalization).
     /// Row range (y_top, y_bottom) the tilt fit samples.
@@ -2160,6 +2215,11 @@ struct StackView {
     /// The transmission stack, kept so the conversion can be undone.
     unlogged: Option<std::sync::Arc<LoadedStack>>,
 
+    // Exporting the stack as TIFFs after a step (one export at a time).
+    export_job: Option<ExportJob>,
+    /// Outcome of the last export, tagged with its step.
+    export_status: Option<(&'static str, Result<String, String>)>,
+
     // Saving the pre-processing checkpoint.
     stack_save_job: Option<StackSaveJob>,
     stack_save_status: Option<Result<String, String>>,
@@ -2213,8 +2273,8 @@ impl StackView {
             rotate_job: None,
             rot_frame: 0,
             rot_tex: None,
-            sino_row: 0,
-            sino_tex: None,
+            sino_viewer_job: None,
+            sino_viewer_error: None,
             tilt_range: None,
             tilt_frame: 0,
             tilt_preview_corrected: false,
@@ -2249,6 +2309,8 @@ impl StackView {
             log_stats: None,
             log_visualize_job: None,
             unlogged: None,
+            export_job: None,
+            export_status: None,
             stack_save_job: None,
             stack_save_status: None,
             stack_saved_path: None,
@@ -4326,6 +4388,8 @@ fn stack_ui(
         }
     });
     ui.add_space(10.0);
+    poll_export(view, ui.ctx());
+    poll_sinogram_viewer(view, ui.ctx());
 
     let stack = &view.stack;
     let angles: Vec<f64> = stack.sample.iter().filter_map(|p| p.angle_deg).collect();
@@ -4477,16 +4541,6 @@ fn stack_ui(
             ),
             &mut |ui, view| {
                 tilt_cor_section_ui(ui, view);
-            },
-        );
-        section(
-            ui,
-            view,
-            StackSection::Sinogram,
-            "Sinogram",
-            SectionStatus::NoStatus,
-            &mut |ui, view| {
-                sinogram_section_ui(ui, view);
             },
         );
         section(
@@ -4648,6 +4702,109 @@ fn stack_ui(
             }
         });
     nav
+}
+
+/// Fold a finished TIFF export into the view (polled every frame, whichever
+/// section is open, so a finished export is never missed).
+fn poll_export(view: &mut StackView, ctx: &egui::Context) {
+    if let Some(job) = &mut view.export_job {
+        match job.poll() {
+            Some(Ok(msg)) => {
+                logger::log(format!("{} images exported: {msg}", job.step));
+                view.export_status = Some((job.step, Ok(msg)));
+                view.export_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("exporting the {} images failed: {e}", job.step));
+                view.export_status = Some((job.step, Err(e)));
+                view.export_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+}
+
+/// The "export the images" row at the bottom of a pre-processing section:
+/// writes the stack as it currently is (this step and everything applied
+/// before it) as TIFFs into a new `<step>` folder created under a folder
+/// the user picks. `ran` gates the button on the step having been applied.
+fn export_step_ui(
+    ui: &mut egui::Ui,
+    view: &mut StackView,
+    step: &'static str,
+    extra: ExportExtra,
+    ran: bool,
+) {
+    ui.add_space(6.0);
+    let running = view.export_job.as_ref().map(|j| j.step);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                ran && running.is_none(),
+                egui::Button::new("📤 Export the images (TIFF)…"),
+            )
+            .on_hover_text(format!(
+                "writes the stack as it is now (this step and everything applied before \
+                 it) as float32 TIFFs into a new '{step}' folder created under the folder \
+                 you pick{}",
+                match extra {
+                    ExportExtra::WithObDc => " (open beams in its ob/ sub-folder)",
+                    ExportExtra::SampleOnly => "",
+                }
+            ))
+            .on_disabled_hover_text(if ran {
+                "another export is still running"
+            } else {
+                "run this step first"
+            })
+            .clicked()
+        {
+            let mut dialog = rfd::FileDialog::new().set_title(format!(
+                "Export the {step} images — pick where the '{step}' folder is created"
+            ));
+            let start = dialog_start([
+                view.stack.path.parent().map(Path::to_path_buf),
+                ipts_shared_folder(&view.stack),
+            ]);
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(base) = dialog.pick_folder() {
+                remember_pick(&base);
+                logger::log(format!(
+                    "exporting the {step} images ({} projections) under {}",
+                    view.stack.sample.len(),
+                    base.display()
+                ));
+                view.export_status = None;
+                view.export_job = Some(ExportJob::start(
+                    base,
+                    step,
+                    std::sync::Arc::clone(&view.stack),
+                    extra,
+                ));
+            }
+        }
+        if running == Some(step) {
+            ui.spinner();
+            ui.label(format!("writing the TIFFs into the {step} folder…"));
+        } else {
+            ui.label(
+                RichText::new(format!("creates a folder named '{step}'"))
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    });
+    match &view.export_status {
+        Some((s, Ok(msg))) if *s == step => {
+            ui.colored_label(ok_text(ui), format!("exported: {msg}"));
+        }
+        Some((s, Err(e))) if *s == step => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("export failed: {e}"));
+        }
+        _ => {}
+    }
 }
 
 /// "Remove outliers": the three cleaning methods of the Python
@@ -4937,6 +5094,13 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
     }
+    export_step_ui(
+        ui,
+        view,
+        "remove_outliers",
+        ExportExtra::WithObDc,
+        view.clean_stats.is_some(),
+    );
 }
 
 /// Histogram of the edge-trimmed summed image (sample or ob) of one stack,
@@ -5282,6 +5446,7 @@ fn normalization_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             &mut view.show_norm_output,
         );
     }
+    export_step_ui(ui, view, "normalization", ExportExtra::SampleOnly, view.normalized);
 }
 
 /// Rotate the stack in 90° steps so the scan's rotation axis is vertical —
@@ -5419,6 +5584,7 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 .size(11.0),
         );
     }
+    export_step_ui(ui, view, "rotation", ExportExtra::SampleOnly, view.rotation_applied != 0);
 }
 
 /// Tilt correction (neutompy find_COR port): estimate the rotation-axis
@@ -5480,6 +5646,13 @@ fn tilt_cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         "Go deeper — standalone application",
         view.tilt_tool_summary.is_some(),
         &mut |ui, view| tilt_tool_section_ui(ui, view),
+    );
+    export_step_ui(
+        ui,
+        view,
+        "tilt_correction",
+        ExportExtra::SampleOnly,
+        view.tilt_applied.is_some() || view.tilt_tool_summary.is_some(),
     );
 }
 
@@ -5887,6 +6060,84 @@ fn log_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         ));
         view.log_job = Some(LogConvertJob::start(std::sync::Arc::clone(&view.stack)));
     }
+    export_step_ui(ui, view, "log_conversion", ExportExtra::SampleOnly, view.log_converted);
+}
+
+/// Fold a closed sinogram viewer into the view (polled every frame).
+fn poll_sinogram_viewer(view: &mut StackView, ctx: &egui::Context) {
+    if let Some(job) = &mut view.sino_viewer_job {
+        match job.poll() {
+            Some(Ok(())) => {
+                logger::log("sinogram viewer closed");
+                view.sino_viewer_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("sinogram viewer: {e}"));
+                view.sino_viewer_error = Some(e);
+                view.sino_viewer_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
+}
+
+/// The "visualize the sinograms" row at the top of the ring-artifact and
+/// stripe-removal sections: opens the standalone sinogram viewer on the
+/// current stack, so the streaks those steps target can be judged first.
+fn sinogram_viewer_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                view.sino_viewer_job.is_none() && !view.stack.sample.is_empty(),
+                egui::Button::new("📈 Visualize the sinograms…"),
+            )
+            .on_hover_text(
+                "opens the standalone sinogram viewer on the current stack (any row, \
+                 with a band average and contrast window) — vertical streaks in the \
+                 sinogram are what this step removes; close the viewer to come back",
+            )
+            .on_disabled_hover_text("the sinogram viewer is already open")
+            .clicked()
+        {
+            let dir = view
+                .stack
+                .path
+                .parent()
+                .filter(|p| p.is_dir())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            logger::log(format!(
+                "opening the sinogram viewer on the current stack ({} projections, work \
+                 file in {})",
+                view.stack.sample.len(),
+                dir.display()
+            ));
+            view.sino_viewer_error = None;
+            view.sino_viewer_job = Some(SinogramViewerJob::start(
+                std::sync::Arc::clone(&view.stack),
+                view.cor_result,
+                dir,
+            ));
+        }
+        if let Some(job) = &view.sino_viewer_job {
+            ui.spinner();
+            ui.label(if job.open.load(std::sync::atomic::Ordering::Relaxed) {
+                "the sinogram viewer is open — close it to continue here"
+            } else {
+                "writing the stack to a work file for the viewer…"
+            });
+        } else {
+            ui.label(
+                RichText::new("look at the sinograms first to decide whether this step is needed")
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    });
+    if let Some(e) = &view.sino_viewer_error {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+    ui.add_space(4.0);
 }
 
 /// "Ring artifact removal (bm3dornl)": the sample stack is handed to the
@@ -5903,6 +6154,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         .weak()
         .size(11.0),
     );
+    sinogram_viewer_ui(ui, view);
 
     if let Some(job) = &mut view.bm3d_job {
         match job.poll() {
@@ -5994,6 +6246,13 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if let Some(e) = &view.bm3d_error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
+    export_step_ui(
+        ui,
+        view,
+        "ring_artifact_removal",
+        ExportExtra::SampleOnly,
+        view.bm3d_summary.is_some(),
+    );
 }
 
 /// "Remove stripes": the tomopy stripe-removal algorithms of the Python
@@ -6001,6 +6260,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// (before/after sinograms), then apply to the whole stack.
 fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let ctx = ui.ctx().clone();
+    sinogram_viewer_ui(ui, view);
     // Fold finished background work into the view.
     if let Some(job) = &mut view.stripe_test_job {
         match job.poll() {
@@ -6264,6 +6524,13 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if let Some(e) = &view.stripe_error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
+    export_step_ui(
+        ui,
+        view,
+        "remove_stripes",
+        ExportExtra::SampleOnly,
+        view.stripes_applied.is_some(),
+    );
 }
 
 /// Center of rotation — optional: without running it, the horizontal center
@@ -6655,79 +6922,6 @@ fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
 }
 
-fn sinogram_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
-    let stack = std::sync::Arc::clone(&view.stack);
-    let Some(first) = stack.sample.first() else {
-        return;
-    };
-    let (w, h, n) = (first.width, first.height, stack.sample.len());
-    if stack.sample.iter().any(|p| (p.width, p.height) != (w, h)) {
-        ui.colored_label(ui.visuals().error_fg_color, "projections have inconsistent sizes");
-        return;
-    }
-
-    view.sino_row = view.sino_row.min(h - 1);
-    ui.horizontal(|ui| {
-        ui.add(egui::Slider::new(&mut view.sino_row, 0..=h - 1).text("slice (row)"));
-        ui.label(
-            RichText::new(format!("{n} projections × {w} columns"))
-                .weak()
-                .size(11.0),
-        );
-    });
-
-    let key = (std::sync::Arc::as_ptr(&stack) as usize, view.sino_row);
-    if view.sino_tex.as_ref().map(|(k, _)| *k) != Some(key) {
-        // One sinogram line per projection at the chosen row, columns
-        // stride-sampled so wide CCD frames stay a reasonable texture.
-        let stride = (w / 1024).max(1);
-        let sino_w = w.div_ceil(stride);
-        let mut values = Vec::with_capacity(n * sino_w);
-        for p in &stack.sample {
-            let row = &p.mean[view.sino_row * w..(view.sino_row + 1) * w];
-            for x in (0..w).step_by(stride) {
-                values.push(row[x]);
-            }
-        }
-        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for v in &values {
-            lo = lo.min(*v);
-            hi = hi.max(*v);
-        }
-        let span = (hi - lo).max(1e-6);
-        let pixels: Vec<Color32> = values
-            .iter()
-            .map(|v| Color32::from_gray((((v - lo) / span) * 255.0) as u8))
-            .collect();
-        let image = egui::ColorImage {
-            size: [sino_w, n],
-            source_size: egui::vec2(sino_w as f32, n as f32),
-            pixels,
-        };
-        // Nearest-neighbor so individual projection rows stay crisp when the
-        // sinogram is stretched vertically (few projections).
-        let tex = ui
-            .ctx()
-            .load_texture("sinogram", image, egui::TextureOptions::NEAREST);
-        view.sino_tex = Some((key, tex));
-    }
-    if let Some((_, tex)) = &view.sino_tex {
-        let size = tex.size_vec2();
-        let width = (ui.available_width() - 16.0).clamp(400.0, 950.0).min(size.x * 4.0);
-        // Stretch small projection counts so every row stays readable.
-        let height = (size.y * 4.0).clamp(350.0, 620.0);
-        ui.add(egui::Image::from_texture(tex).fit_to_exact_size(egui::vec2(width, height)));
-        ui.label(
-            RichText::new(
-                "columns: detector x at the selected row — rows: projections, top to \
-                 bottom in increasing angle",
-            )
-            .weak()
-            .size(11.0),
-        );
-    }
-}
-
 /// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
 /// handed over, and the returned region is applied to the sample AND the
 /// open beams.
@@ -6840,6 +7034,7 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if let Some(e) = &view.crop_error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
+    export_step_ui(ui, view, "crop", ExportExtra::WithObDc, view.crop.is_some());
 }
 
 /// The workflow screen: shared header, then the mode-specific view; returns
