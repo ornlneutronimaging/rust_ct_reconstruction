@@ -34,6 +34,7 @@ fn main() {
         instrument: Instrument::Venus,
         ipts: "IPTS-36573".to_owned(),
         mode: Mode::WhiteBeam,
+        detector: None,
     };
     if let Some(path) = std::env::args().nth(1).map(PathBuf::from) {
         write(&path, &white_beam);
@@ -50,6 +51,7 @@ fn main() {
             instrument: Instrument::Venus,
             ipts: "IPTS-37118".to_owned(),
             mode: Mode::Tof,
+            detector: None,
         },
     );
 }

@@ -1,6 +1,11 @@
 //! Combining the images of each kept run folder into one mean projection,
 //! and saving the stack (projections sorted by increasing angle) to HDF5.
+//!
+//! Raw frames are re-oriented as they are read (see [`crate::orientation`]:
+//! Timepix transposed, CCD flipped vertically), so every projection of the
+//! output is in the sample orientation the rest of the pipeline works on.
 
+pub use crate::orientation::Orientation;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -139,10 +144,13 @@ pub fn read_tiff_f32(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
 }
 
 /// Mean of the selected images of one folder, accumulated in f64 so summing
-/// thousands of 16-bit frames does not lose precision.
+/// thousands of 16-bit frames does not lose precision. Every frame is
+/// re-oriented with `orientation` as it is read, so `width`/`height` of the
+/// projection are those of the oriented frame.
 fn combine_run(
     run: &RunToCombine,
     selection: &ImageSelection,
+    orientation: Orientation,
     progress: &AtomicUsize,
 ) -> Result<Projection, String> {
     let picked = selection.pick(&run.images);
@@ -153,6 +161,8 @@ fn combine_run(
     let (mut width, mut height) = (0usize, 0usize);
     for path in &picked {
         let (w, h, values) = read_tiff_f32(path)?;
+        let values = orientation.apply_vec(&values, w, h);
+        let (w, h) = orientation.dims(w, h);
         if sum.is_empty() {
             (width, height) = (w, h);
             sum = vec![0.0; w * h];
@@ -277,6 +287,7 @@ impl CombineScan {
         dc: Vec<RunToCombine>,
         selection: ImageSelection,
         combine_same_angle: bool,
+        orientation: Orientation,
     ) -> Self {
         let progress = Arc::new(AtomicUsize::new(0));
         let total_images = sample
@@ -292,7 +303,7 @@ impl CombineScan {
             let mut run_all = |runs: Vec<RunToCombine>| -> Vec<Projection> {
                 let results: Vec<Result<Projection, String>> = runs
                     .par_iter()
-                    .map(|run| combine_run(run, &selection, &thread_progress))
+                    .map(|run| combine_run(run, &selection, orientation, &thread_progress))
                     .collect();
                 let mut projections = Vec::new();
                 for result in results {
@@ -347,6 +358,9 @@ pub struct SaveMeta {
     /// or "TOF"), so loading it back can restore the setup-screen selection.
     pub acquisition_mode: String,
     pub detector: String,
+    /// How the raw frames were re-oriented on load (`detector_orientation`
+    /// metadata entry: `as-is`, `transposed` or `flipped vertically`).
+    pub orientation: Orientation,
     pub sample_folder: String,
     pub ob_folder: String,
     /// Dark-current folder(s), when the instrument provides them.
@@ -474,6 +488,7 @@ pub fn save_hdf5(path: &Path, output: &CombineOutput, meta: &SaveMeta) -> Result
     put("ipts", &meta.ipts)?;
     put("acquisition_mode", &meta.acquisition_mode)?;
     put("detector", &meta.detector)?;
+    put("detector_orientation", meta.orientation.label())?;
     put("sample_folder", &meta.sample_folder)?;
     put("ob_folder", &meta.ob_folder)?;
     if let Some(dc_folder) = &meta.dc_folder {
@@ -520,6 +535,7 @@ pub fn stack_from_output(
         ("ipts".to_owned(), meta.ipts.clone()),
         ("acquisition_mode".to_owned(), meta.acquisition_mode.clone()),
         ("detector".to_owned(), meta.detector.clone()),
+        ("detector_orientation".to_owned(), meta.orientation.label().to_owned()),
         ("sample_folder".to_owned(), meta.sample_folder.clone()),
         ("ob_folder".to_owned(), meta.ob_folder.clone()),
         ("combine_mode".to_owned(), meta.combine_mode.clone()),
@@ -877,6 +893,7 @@ mod tests {
             ipts: "IPTS-1".to_owned(),
             acquisition_mode: "TOF".to_owned(),
             detector: "IkonXL".to_owned(),
+            orientation: Orientation::Transpose,
             sample_folder: "/a".to_owned(),
             ob_folder: "/b".to_owned(),
             dc_folder: Some("/c".to_owned()),
@@ -916,7 +933,49 @@ mod tests {
             .metadata
             .iter()
             .any(|(k, v)| k == "detector_offset_us" && v == "12.5"));
+        assert!(loaded
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "detector_orientation" && v == "transposed"));
         assert!(load_hdf5(Path::new("/nonexistent.h5")).is_err());
+    }
+
+    /// 3 wide × 2 tall u16 TIFF: rows [1 2 3] / [4 5 6].
+    fn write_test_tiff(path: &Path) {
+        use tiff::encoder::{TiffEncoder, colortype::Gray16};
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        enc.write_image::<Gray16>(3, 2, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+    }
+
+    #[test]
+    fn combine_run_orients_frames() {
+        let dir = std::env::temp_dir().join(format!("ct_recon_orient_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("img_0000.tif");
+        write_test_tiff(&path);
+        let run = RunToCombine {
+            name: "run".to_owned(),
+            run_number: None,
+            images: vec![path],
+            angle_deg: Some(0.0),
+        };
+        let progress = AtomicUsize::new(0);
+        // as-is
+        let p = combine_run(&run, &ImageSelection::All, Orientation::Identity, &progress).unwrap();
+        assert_eq!((p.width, p.height), (3, 2));
+        assert_eq!(p.mean, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // Timepix: transposed, 2 wide × 3 tall
+        let p = combine_run(&run, &ImageSelection::All, Orientation::Transpose, &progress).unwrap();
+        assert_eq!((p.width, p.height), (2, 3));
+        assert_eq!(p.mean, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        // CCD: flipped vertically, same size
+        let p =
+            combine_run(&run, &ImageSelection::All, Orientation::FlipVertical, &progress).unwrap();
+        assert_eq!((p.width, p.height), (3, 2));
+        assert_eq!(p.mean, vec![4.0, 5.0, 6.0, 1.0, 2.0, 3.0]);
+        assert_eq!(p.total_counts, 21.0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

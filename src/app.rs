@@ -16,6 +16,7 @@ use crate::instrument::Instrument;
 use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{CompareJob, NormJob, NormSettings, RoiJob, VisualizeJob};
+use crate::orientation::{self, OrientDetector, Orientation, Selection as OrientSelection};
 use crate::rotate::{self, RotateJob};
 use crate::stripes::{self, StripeAlgo, StripeApplyJob, StripeTestJob};
 use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
@@ -2453,6 +2454,9 @@ struct WhiteBeamView {
     /// The accordion section currently open.
     open_section: Option<WbSection>,
     detector: WbDetector,
+    /// User override of the frame orientation on load (`None` = from the
+    /// camera, see [`WhiteBeamView::orientation`]).
+    orientation_override: Option<OrientDetector>,
     sample: MultiFolderPick,
     ob: MultiFolderPick,
     /// Dark-current picker, on the instruments that record one (MARS).
@@ -2536,6 +2540,16 @@ enum AngleData {
 }
 
 impl WhiteBeamView {
+    /// How the raw frames are oriented on load: from the camera unless the
+    /// user overrode it.
+    fn orientation(&self, session: &Session) -> OrientSelection {
+        orientation::auto_for_white_beam(
+            session.instrument,
+            self.detector,
+            self.orientation_override,
+        )
+    }
+
     fn new(session: &Session) -> Self {
         Self::with_detector(WbDetector::IkonXl, session)
     }
@@ -2589,6 +2603,7 @@ impl WhiteBeamView {
         ));
         Self {
             detector,
+            orientation_override: session.orientation_override,
             sample,
             ob,
             dc,
@@ -2783,7 +2798,7 @@ impl WhiteBeamView {
     /// Kick off reading + stacking the current selection — what the
     /// "Read & stack the projections" button does, also run automatically
     /// when the Next button is clicked before the user did it.
-    fn start_read(&mut self, sample_runs: Vec<RunToCombine>) {
+    fn start_read(&mut self, sample_runs: Vec<RunToCombine>, orientation: Orientation) {
         let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
             pick.iter_files()
                 .map(|file| RunToCombine {
@@ -2802,10 +2817,11 @@ impl WhiteBeamView {
         let ob_runs = one_run_per_file(&self.ob);
         let dc_runs = self.dc.as_ref().map(one_run_per_file).unwrap_or_default();
         logger::log(format!(
-            "reading white beam stack: {} projections, {} ob images, {} dc images",
+            "reading white beam stack: {} projections, {} ob images, {} dc images (frames {})",
             sample_runs.len(),
             ob_runs.len(),
-            dc_runs.len()
+            dc_runs.len(),
+            orientation
         ));
         self.processed = None;
         self.save_status = None;
@@ -2815,6 +2831,7 @@ impl WhiteBeamView {
             dc_runs,
             ImageSelection::All,
             false,
+            orientation,
         ));
     }
 }
@@ -3195,6 +3212,9 @@ struct TofView {
     /// The accordion section currently open.
     open_section: Option<TofSection>,
     detector: Detector,
+    /// User override of the frame orientation on load (`None` = Timepix,
+    /// see [`TofView::orientation`]).
+    orientation_override: Option<OrientDetector>,
     sample: FolderPick,
     ob: FolderPick,
     /// The (sample, OB) pair whose selection summary was already written to
@@ -3243,6 +3263,12 @@ struct TofView {
 }
 
 impl TofView {
+    /// How the raw frames are oriented on load: Timepix (transposed) unless
+    /// the user overrode it.
+    fn orientation(&self) -> OrientSelection {
+        orientation::auto_for_tof(self.orientation_override)
+    }
+
     fn new(session: &Session) -> Self {
         Self::with_detector(Detector::Tpx1FromAugust2025, session)
     }
@@ -3268,6 +3294,7 @@ impl TofView {
         ));
         Self {
             detector,
+            orientation_override: session.orientation_override,
             sample,
             ob,
             summary_logged: None,
@@ -3491,6 +3518,9 @@ pub struct CtApp {
     selected: Option<IptsEntry>,
     /// Acquisition mode picked with the two large buttons; `Next` needs it.
     mode: Option<Mode>,
+    /// Frame orientation override from the debug config, handed to the
+    /// session (`None` = automatic).
+    orientation_override: Option<OrientDetector>,
     filter: String,
     manual: String,
     manual_error: Option<String>,
@@ -3545,6 +3575,7 @@ impl CtApp {
             scans: HashMap::new(),
             selected: None,
             mode: None,
+            orientation_override: None,
             filter: String::new(),
             manual: String::new(),
             manual_error: None,
@@ -4158,6 +4189,10 @@ impl CtApp {
                     }
                 }
                 self.mode = Some(cfg.mode);
+                self.orientation_override = cfg.detector;
+                if let Some(d) = cfg.detector {
+                    logger::log(format!("debug config forces the frame orientation: {}", d.label()));
+                }
                 if cfg.instrument == Instrument::Mars && cfg.mode == Mode::Tof {
                     logger::error("debug config asks for TOF on MARS — forcing White Beam");
                     self.mode = Some(Mode::WhiteBeam);
@@ -7148,6 +7183,48 @@ fn workflow_ui(
     nav
 }
 
+/// "Orientation" combobox: how the raw frames are re-oriented when read
+/// (Timepix → transposed, CCD → flipped vertically, QHY → as-is for now).
+/// "auto" follows the detector of the workflow; the other entries force one.
+/// `auto` is the current selection (its guess is shown in the auto entry).
+fn orientation_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    auto: OrientSelection,
+    override_: &mut Option<OrientDetector>,
+) {
+    ui.label(RichText::new("Orientation:").strong()).on_hover_text(
+        "How every raw frame is re-oriented when read, before the 90° rotation step: \
+         Timepix → transposed, CCD (iKon-XL) → flipped vertically, QHY → not decided yet \
+         (as-is). Same convention as the Python notebooks (swapaxes / flipud).",
+    );
+    let guess = auto.auto.map(|(d, _)| d).unwrap_or_default();
+    let auto_text = format!("auto: {} ({})", guess.label(), guess.orientation());
+    let current = match override_ {
+        None => auto_text.clone(),
+        Some(d) => format!("{} ({})", d.label(), d.orientation()),
+    };
+    let before = *override_;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(override_, None, auto_text)
+                .on_hover_text("Follow the detector picked for this workflow");
+            for d in OrientDetector::ALL {
+                ui.selectable_value(override_, Some(d), format!("{} ({})", d.label(), d.orientation()))
+                    .on_hover_text(d.description());
+            }
+        });
+    if *override_ != before {
+        let sel = OrientSelection { manual: *override_, ..auto };
+        logger::log(format!(
+            "frame orientation changed: {} — frames {}",
+            sel.summary(),
+            sel.orientation()
+        ));
+    }
+}
+
 fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     // Detector — it decides where the sample and OB folders are looked for,
     // so changing it rebuilds the pickers. MARS has a single camera layout,
@@ -7165,7 +7242,9 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
                 });
             if detector != view.detector {
                 logger::log(format!("white beam detector changed: {}", detector.label()));
+                let orientation_override = view.orientation_override;
                 *view = WhiteBeamView::with_detector(detector, session);
+                view.orientation_override = orientation_override;
             }
         }
         ui.label(
@@ -7173,6 +7252,9 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
                 .weak()
                 .size(11.0),
         );
+        ui.separator();
+        let auto = view.orientation(session);
+        orientation_combo(ui, "wb_orientation", auto, &mut view.orientation_override);
     });
     ui.add_space(10.0);
     ui.separator();
@@ -7297,7 +7379,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             view.preprocess_pending = 1;
         } else if view.process.is_none() {
             match view.final_selection() {
-                Ok(runs) => view.start_read(runs),
+                Ok(runs) => view.start_read(runs, view.orientation(session).orientation()),
                 Err(e) => {
                     logger::error(format!("cannot continue to pre-processing: {e}"));
                     view.auto_continue = false;
@@ -7340,7 +7422,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         .clicked()
         && let Ok(sample_runs) = selection
     {
-        view.start_read(sample_runs);
+        view.start_read(sample_runs, view.orientation(session).orientation());
     }
 
     if let Some(output) = &view.processed {
@@ -7402,6 +7484,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 Instrument::Venus => view.detector.label().to_owned(),
                 Instrument::Mars => "CCD".to_owned(),
             },
+            orientation: view.orientation(session).orientation(),
             sample_folder: folder_list(&view.sample),
             ob_folder: folder_list(&view.ob),
             dc_folder: view
@@ -8522,8 +8605,13 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             });
         if detector != view.detector {
             logger::log(format!("TOF detector changed: {}", detector.label()));
+            let orientation_override = view.orientation_override;
             *view = TofView::with_detector(detector, session);
+            view.orientation_override = orientation_override;
         }
+        ui.separator();
+        let auto = view.orientation();
+        orientation_combo(ui, "tof_orientation", auto, &mut view.orientation_override);
     });
     ui.add_space(10.0);
     ui.separator();
@@ -8758,8 +8846,10 @@ fn process_section_ui(
         };
         let sample_runs = to_combine(&kept_sample);
         let ob_runs = to_combine(&kept_ob);
+        let orientation = view.orientation().orientation();
         logger::log(format!(
-            "combining the TOF images ({}) of each run with the mean: {} sample runs, {} ob runs",
+            "combining the TOF images ({}) of each run with the mean: {} sample runs, {} ob runs \
+             (frames {orientation})",
             sel.describe(),
             sample_runs.len(),
             ob_runs.len()
@@ -8772,6 +8862,7 @@ fn process_section_ui(
             Vec::new(),
             sel,
             view.merge_same_angle,
+            orientation,
         ));
     }
 
@@ -8814,6 +8905,7 @@ fn process_section_ui(
             ipts: session.ipts.name.clone(),
             acquisition_mode: session.mode.label().to_owned(),
             detector: view.detector.label().to_owned(),
+            orientation: view.orientation().orientation(),
             sample_folder: view
                 .sample
                 .selected
@@ -9545,6 +9637,7 @@ impl eframe::App for CtApp {
                     instrument: self.instrument,
                     ipts,
                     mode,
+                    orientation_override: self.orientation_override,
                 };
                 let view = match mode {
                     Mode::WhiteBeam => WorkflowView::WhiteBeam(WhiteBeamView::new(&session)),
@@ -9637,6 +9730,7 @@ impl eframe::App for CtApp {
                                 instrument: self.instrument,
                                 ipts,
                                 mode,
+                                orientation_override: self.orientation_override,
                             };
                             let view = match mode {
                                 Mode::WhiteBeam => {

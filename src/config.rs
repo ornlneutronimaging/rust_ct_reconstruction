@@ -7,6 +7,7 @@
 //! or inspected with `h5dump`.
 
 use crate::instrument::Instrument;
+use crate::orientation::OrientDetector;
 use crate::session::Mode;
 use hdf5_metno::types::VarLenUnicode;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ pub struct DebugConfig {
     pub instrument: Instrument,
     pub ipts: String,
     pub mode: Mode,
+    /// Optional `detector_orientation` entry (`timepix`, `ccd`, `qhy`,
+    /// `as-is`): forces how the raw frames are oriented on load. Absent (old
+    /// configs) = automatic from the workflow.
+    pub detector: Option<OrientDetector>,
 }
 
 /// `<repo>/config/config_jean.h5`, resolving the repo root from the running
@@ -51,7 +56,16 @@ pub fn read(path: &Path) -> Result<DebugConfig, String> {
     let mode_s = get("mode")?;
     let mode = Mode::parse(&mode_s)
         .ok_or_else(|| format!("unknown mode '{mode_s}' in {}", path.display()))?;
-    Ok(DebugConfig { instrument, ipts, mode })
+    let detector = match get("detector_orientation") {
+        Ok(s) => Some(OrientDetector::parse(&s).ok_or_else(|| {
+            format!(
+                "unknown detector_orientation '{s}' in {} (expected timepix, ccd, qhy or as-is)",
+                path.display()
+            )
+        })?),
+        Err(_) => None,
+    };
+    Ok(DebugConfig { instrument, ipts, mode, detector })
 }
 
 pub fn write(path: &Path, config: &DebugConfig) -> Result<(), String> {
@@ -72,7 +86,11 @@ pub fn write(path: &Path, config: &DebugConfig) -> Result<(), String> {
     };
     put("instrument", config.instrument.name())?;
     put("ipts", &config.ipts)?;
-    put("mode", config.mode.label())
+    put("mode", config.mode.label())?;
+    if let Some(d) = config.detector {
+        put("detector_orientation", d.label())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -86,7 +104,12 @@ mod tests {
             instrument: Instrument::Venus,
             ipts: "IPTS-36202".to_owned(),
             mode: Mode::Tof,
+            detector: None,
         };
+        write(&path, &config).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back, config);
+        let config = DebugConfig { detector: Some(OrientDetector::Ccd), ..config };
         write(&path, &config).unwrap();
         let back = read(&path).unwrap();
         std::fs::remove_file(&path).ok();

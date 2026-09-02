@@ -5,6 +5,9 @@ edition = "2024"
 description = "GUI for neutron CT reconstruction on VENUS and MARS (white beam and TOF workflows)"
 
 [dependencies]
+# Detector → orientation of the raw frames on load (Timepix: transpose,
+# CCD: flip vertically). Vec API only: this crate has no ndarray.
+detector_orientation = { path = "../rust_detector_orientation", default-features = false }
 chrono = "0.4"
 eframe = "0.35"
 egui = "0.35"

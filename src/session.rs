@@ -3,6 +3,7 @@
 
 use crate::instrument::Instrument;
 use crate::ipts::IptsEntry;
+use crate::orientation::OrientDetector;
 
 /// Acquisition mode chosen with the two large buttons on the setup screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,6 +41,10 @@ pub struct Session {
     pub instrument: Instrument,
     pub ipts: IptsEntry,
     pub mode: Mode,
+    /// Detector the raw frames are oriented as when loaded (see
+    /// [`crate::orientation`]); `None` = guess it from the workflow. Set by
+    /// the debug config, changed from the load screens.
+    pub orientation_override: Option<OrientDetector>,
 }
 
 #[cfg(test)]
