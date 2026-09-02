@@ -5588,7 +5588,7 @@ fn rotation_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 }
 
 /// Tilt correction (neutompy find_COR port): estimate the rotation-axis
-/// tilt and offset from the 0° and 180° projections, then rotate + roll
+/// tilt and offset from the 0° and 180° projections, then rotate + shift
 /// every projection to straighten it.
 /// The tilt & center-of-rotation section: the two in-tool calculations as
 /// sub-sections, and the standalone application for going deeper when the
@@ -5691,7 +5691,7 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         if let Some(corrected) = job.poll() {
             let applied = view.tilt_result.take();
             logger::log(format!(
-                "tilt correction applied: {:.4} deg, {} px roll",
+                "tilt correction applied: {:.4} deg, {} px shift",
                 applied.map(|r| r.tilt_deg).unwrap_or(0.0),
                 applied.map(|r| r.shift_px).unwrap_or(0)
             ));
@@ -5927,7 +5927,10 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     if view.tilt_result.is_some()
         && ui
             .add_enabled(!busy, egui::Button::new("▶ Apply the correction to the stack"))
-            .on_hover_text("rotates every projection by the tilt and rolls it by the axis shift")
+            .on_hover_text(
+                "rotates every projection by the tilt and shifts it by the axis offset \
+                 (edge-padded, no wrap-around)",
+            )
             .clicked()
         && let Some(result) = view.tilt_result
     {

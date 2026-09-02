@@ -6,8 +6,9 @@
 //! integer shift best aligning it with the 0° projection is found by RMSE,
 //! and a linear fit of shift versus row gives the rotation-axis tilt
 //! `atan(slope / 2)` and its offset from the detector center. The correction
-//! rotates every projection by the tilt (bilinear, edge-padded) and rolls it
-//! horizontally by the offset.
+//! rotates every projection by the tilt (bilinear, edge-padded) and shifts it
+//! horizontally by the offset (edge-padded too, not wrapped as `np.roll`
+//! would).
 
 use crate::combine::{LoadedStack, Projection};
 use rayon::prelude::*;
@@ -19,7 +20,7 @@ pub struct TiltResult {
     /// Tilt of the rotation axis with respect to the vertical, in degrees.
     pub tilt_deg: f64,
     /// Horizontal shift of the rotation axis with respect to the detector
-    /// center, in pixels (the roll applied by the correction).
+    /// center, in pixels (the horizontal shift applied by the correction).
     pub shift_px: i64,
     /// Fit diagnostics: shift-per-row slope, intercept, rows used.
     pub slope: f64,
@@ -265,8 +266,11 @@ impl CorJob {
 }
 
 /// Rotate an image by `theta_deg` around its center (bilinear interpolation,
-/// edge-clamped like neutompy's edge padding) and then roll it horizontally
-/// by `shift` pixels.
+/// edge-clamped like neutompy's edge padding) and then shift it horizontally
+/// by `shift` pixels. Unlike neutompy's `np.roll`, the shift does not wrap:
+/// the columns pushed off one edge are lost and the ones exposed on the
+/// other edge are filled by replicating the edge pixel (a wrap would put the
+/// far side of the object at the opposite edge of every projection).
 pub fn rotate_roll(
     data: &[f32],
     width: usize,
@@ -282,9 +286,9 @@ pub fn rotate_roll(
     out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
         let dy = y as f64 - cy;
         for (x, value) in row.iter_mut().enumerate() {
-            // The output pixel, rolled back, then rotated back to the source.
-            let xr = (x as i64 - shift).rem_euclid(width as i64) as f64;
-            let dx = xr - cx;
+            // The output pixel, shifted back (no wrap: an out-of-range source
+            // column is edge-clamped below), then rotated back to the source.
+            let dx = (x as i64 - shift) as f64 - cx;
             let sx = cos * dx - sin * dy + cx;
             let sy = sin * dx + cos * dy + cy;
             // Bilinear sample with edge clamping.
@@ -385,7 +389,7 @@ impl TiltApplyJob {
             metadata.push((
                 "tilt_correction".to_owned(),
                 format!(
-                    "tilt {:.4} deg, axis shift {} px (neutompy find_COR port)",
+                    "tilt {:.4} deg, axis shift {} px, edge-padded (neutompy find_COR port)",
                     result.tilt_deg, result.shift_px
                 ),
             ));
@@ -474,5 +478,31 @@ mod tests {
         let after = find_cor(&c0, &c180, W, H, 8, H - 8, 3).unwrap();
         assert!(after.tilt_deg.abs() < 0.15, "residual tilt {}", after.tilt_deg);
         assert!(after.shift_px.abs() <= 1, "residual shift {}", after.shift_px);
+    }
+
+    #[test]
+    fn shift_does_not_wrap_around() {
+        // A bright column at the left edge shifted right by 5 px: nothing
+        // may reappear on the right, and the exposed left columns take the
+        // edge value.
+        let mut img = vec![1.0f32; W * H];
+        for y in 0..H {
+            img[y * W] = 9.0;
+            img[y * W + W - 1] = 3.0;
+        }
+        let out = rotate_roll(&img, W, H, 0.0, 5);
+        for y in 0..H {
+            let row = &out[y * W..(y + 1) * W];
+            assert!(row[..6].iter().all(|v| *v == 9.0), "row {y}: {:?}", &row[..6]);
+            // The right-edge column was pushed off the image, not wrapped.
+            assert!(row[6..].iter().all(|v| *v == 1.0), "row {y}: {:?}", &row[W - 6..]);
+        }
+        // And the other way: the right edge column is lost, not wrapped.
+        let out = rotate_roll(&img, W, H, 0.0, -5);
+        for y in 0..H {
+            let row = &out[y * W..(y + 1) * W];
+            assert!(row[W - 6..].iter().all(|v| *v == 3.0), "row {y}: {:?}", &row[W - 6..]);
+            assert!(row[..W - 6].iter().all(|v| *v == 1.0), "row {y}: {:?}", &row[..8]);
+        }
     }
 }
