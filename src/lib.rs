@@ -20,6 +20,7 @@ pub mod morph;
 pub mod normalize;
 pub mod notify;
 pub mod orientation;
+pub mod rebin;
 pub mod recent;
 pub mod recon_run;
 pub mod rotate;

@@ -17,6 +17,7 @@ use crate::ipts::{self, IptsEntry, IptsScan};
 use crate::logger;
 use crate::normalize::{CompareJob, NormJob, NormSettings, RoiJob, VisualizeJob};
 use crate::orientation::{self, OrientDetector, Orientation, Selection as OrientSelection};
+use crate::rebin::{self, RebinJob};
 use crate::rotate::{self, RotateJob};
 use crate::stripes::{self, StripeAlgo, StripeApplyJob, StripeTestJob};
 use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
@@ -1926,6 +1927,7 @@ fn stack_is_preprocessed(stack: &LoadedStack) -> bool {
 enum StackSection {
     Provenance,
     Crop,
+    Rebin,
     Clean,
     Normalize,
     Bm3d,
@@ -2102,6 +2104,17 @@ struct StackView {
     crop: Option<CropRect>,
     crop_job: Option<CropJob>,
     crop_error: Option<String>,
+
+    // Rebin (n×n block mean) — what mbirjax needs on full-frame data.
+    /// The factor applied to the current stack (restored from a loaded
+    /// checkpoint's metadata too).
+    rebin: Option<usize>,
+    /// The factor picked in the combobox for the next run.
+    rebin_factor: usize,
+    rebin_job: Option<RebinJob>,
+    /// The stack before the rebin (the crop output), so the rebin can be
+    /// undone or re-run with another factor.
+    unrebinned: Option<std::sync::Arc<LoadedStack>>,
 
     // Remove outliers.
     clean_settings: CleanSettings,
@@ -2325,6 +2338,10 @@ impl StackView {
             stack,
             crop: None,
             crop_job: None,
+            rebin: None,
+            rebin_factor: 2,
+            rebin_job: None,
+            unrebinned: None,
             crop_error: None,
             clean_settings: CleanSettings::default(),
             clean_job: None,
@@ -2417,6 +2434,9 @@ impl StackView {
             view.unrotated = Some(std::sync::Arc::clone(&view.stack));
             view.norm_summary = Some(format!("restored from the loaded file ({desc})"));
         }
+        if let Some(desc) = meta("rebin") {
+            view.rebin = rebin::factor_from_description(&desc);
+        }
         if let Some(desc) = meta("ring_artifact_removal") {
             view.bm3d_summary = Some(format!("restored from the loaded file ({desc})"));
         }
@@ -2465,6 +2485,32 @@ impl StackView {
             view.cor_result = Some(value);
         }
         view
+    }
+
+    /// The image size changed (rebin applied or undone): everything applied
+    /// after the rebin is void, the summed images and ROI included.
+    fn invalidate_after_rebin(&mut self) {
+        self.uncleaned = None;
+        self.clean_stats = None;
+        self.clean_compare_job = None;
+        self.clean_compare_error = None;
+        self.bm3d_summary = None;
+        self.bm3d_error = None;
+        self.unbm3d = None;
+        self.sum_cache.clear();
+        self.sum_jobs.clear();
+        self.hist_cache.clear();
+        self.normalized = false;
+        self.norm_summary = None;
+        self.norm_settings.roi = None;
+        self.unrotated = None;
+        self.rotation_quarters = 0;
+        self.rotation_applied = 0;
+        self.rot_tex = None;
+        self.clear_tilt();
+        self.clear_stripes();
+        self.clear_log();
+        self.clear_cor();
     }
 
     fn clear_log(&mut self) {
@@ -4663,14 +4709,19 @@ fn stack_ui(
                 .size(15.0)
                 .strong(),
         );
-        let busy =
-            view.crop_job.is_some() || view.clean_job.is_some() || view.norm_job.is_some();
-        let touched = view.crop.is_some() || view.clean_stats.is_some() || view.normalized;
+        let busy = view.crop_job.is_some()
+            || view.rebin_job.is_some()
+            || view.clean_job.is_some()
+            || view.norm_job.is_some();
+        let touched = view.crop.is_some()
+            || view.rebin.is_some()
+            || view.clean_stats.is_some()
+            || view.normalized;
         if ui
             .add_enabled(!busy && touched, egui::Button::new("🔄 Reset to the loaded data"))
             .on_hover_text(
-                "discard the crop and outlier removal and start over from the data set \
-                 this screen was opened with",
+                "discard the crop, rebin and outlier removal and start over from the data \
+                 set this screen was opened with",
             )
             .clicked()
         {
@@ -4678,6 +4729,8 @@ fn stack_ui(
             view.stack = std::sync::Arc::clone(&view.original);
             view.crop = None;
             view.crop_error = None;
+            view.rebin = None;
+            view.unrebinned = None;
             view.uncleaned = None;
             view.clean_stats = None;
             view.clean_compare_job = None;
@@ -4788,6 +4841,16 @@ fn stack_ui(
         run_status(view.crop.is_some()),
         &mut |ui, view| {
             crop_section_ui(ui, view);
+        },
+    );
+    section(
+        ui,
+        view,
+        StackSection::Rebin,
+        "Rebin (needed for mbirjax)",
+        run_status(view.rebin.is_some()),
+        &mut |ui, view| {
+            rebin_section_ui(ui, view);
         },
     );
     section(
@@ -7323,6 +7386,148 @@ fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// Cropping the stack with the rust_crop_tiff tool: the sample 3-D array is
 /// handed over, and the returned region is applied to the sample AND the
 /// open beams.
+/// Rebin: n×n blocks of pixels averaged into one, on the sample, open beam
+/// and dark current images. Sits right after the crop, so every later step
+/// (cleaning, normalization, tilt / center of rotation…) works on the
+/// rebinned images.
+fn rebin_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
+    let ctx = ui.ctx().clone();
+    if let Some(job) = &mut view.rebin_job {
+        if let Some(rebinned) = job.poll() {
+            let n = job.factor;
+            let (w, h) = view
+                .stack
+                .sample
+                .first()
+                .map(|p| (p.width, p.height))
+                .unwrap_or((0, 0));
+            logger::log(format!(
+                "rebin {n}x{n} applied to sample, open beams and dark currents: {}",
+                rebin::describe(n, w, h)
+            ));
+            if view.unrebinned.is_none() {
+                view.unrebinned = Some(std::sync::Arc::clone(&view.stack));
+            }
+            view.stack = std::sync::Arc::new(rebinned);
+            view.rebin = Some(n);
+            view.rebin_job = None;
+            view.invalidate_after_rebin();
+        } else {
+            let done = job.done();
+            let frac = (done as f32 / job.total.max(1) as f32).min(1.0);
+            ui.add(egui::ProgressBar::new(frac).text(format!(
+                "rebinning {}x{}: {done}/{} images",
+                job.factor, job.factor, job.total
+            )));
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+    }
+
+    ui.label(
+        RichText::new(
+            "the mbirjax reconstruction runs on the GPU and its memory use grows with the \
+             width of the projections: full-frame (4096 px wide) stacks do not fit, however \
+             few slices are reconstructed at a time. Rebinning averages every n×n block of \
+             pixels into one — n times narrower and shorter images, n² better statistics per \
+             pixel, n times coarser resolution. It is applied to the sample, open beam and \
+             dark current images alike, and every later step works on the rebinned data, so \
+             do it before the tilt / center of rotation.",
+        )
+        .weak(),
+    );
+    ui.add_space(4.0);
+
+    let (width, height) = view
+        .unrebinned
+        .as_ref()
+        .unwrap_or(&view.stack)
+        .sample
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((0, 0));
+    match view.rebin {
+        Some(n) => {
+            let (w, h) = view
+                .stack
+                .sample
+                .first()
+                .map(|p| (p.width, p.height))
+                .unwrap_or((0, 0));
+            ui.label(
+                RichText::new(format!(
+                    "rebin {n}x{n} applied — the images are now {w}x{h} px{}",
+                    if view.unrebinned.is_some() {
+                        format!(" (were {width}x{height})")
+                    } else {
+                        " (restored from the loaded file)".to_owned()
+                    }
+                ))
+                .strong(),
+            );
+        }
+        None => {
+            ui.label(
+                RichText::new(format!("no rebin applied — the images are {width}x{height} px"))
+                    .weak(),
+            );
+        }
+    }
+
+    let busy = view.crop_job.is_some() || view.clean_job.is_some();
+    ui.horizontal(|ui| {
+        ui.label("Factor:");
+        let n = view.rebin_factor;
+        egui::ComboBox::from_id_salt("rebin_factor")
+            .selected_text(format!("{n}x{n}"))
+            .show_ui(ui, |ui| {
+                for f in rebin::FACTORS {
+                    ui.selectable_value(&mut view.rebin_factor, f, format!("{f}x{f}"));
+                }
+            });
+        let n = view.rebin_factor;
+        let (w, h) = rebin::rebinned_size(width, height, n);
+        ui.label(RichText::new(format!("→ {w}x{h} px")).weak());
+        let label = match view.rebin {
+            Some(applied) if applied == n => format!("▶ Rebin {n}x{n} again"),
+            Some(_) => format!("▶ Rebin {n}x{n} instead"),
+            None => format!("▶ Rebin the images {n}x{n}"),
+        };
+        if ui
+            .add_enabled(!busy && w > 0 && h > 0, egui::Button::new(label))
+            .on_hover_text("averages every n×n block of pixels into one pixel")
+            .clicked()
+        {
+            // Always rebin the un-rebinned data (the crop output), so a
+            // second run with another factor does not compound.
+            let base = view
+                .unrebinned
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::clone(&view.stack));
+            logger::log(format!(
+                "rebinning the images {n}x{n} ({} projections, {} ob, {} dc)",
+                base.sample.len(),
+                base.ob.len(),
+                base.dc.len()
+            ));
+            view.rebin_job = Some(RebinJob::start(base, n));
+        }
+        if view.unrebinned.is_some()
+            && ui
+                .button("↺ Undo the rebin")
+                .on_hover_text("go back to the full-resolution images")
+                .clicked()
+            && let Some(before) = view.unrebinned.take()
+        {
+            logger::log("rebin undone: back to the full-resolution images");
+            view.stack = before;
+            view.rebin = None;
+            view.invalidate_after_rebin();
+        }
+    });
+    export_step_ui(ui, view, "rebin", ExportExtra::WithObDc, view.rebin.is_some());
+}
+
 fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let ctx = ui.ctx().clone();
     if let Some(job) = &mut view.crop_job {
@@ -7341,8 +7546,11 @@ fn crop_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 view.crop = Some(rect);
                 view.crop_error = None;
                 view.crop_job = None;
-                // Cleaning and normalization applied to the previous crop
-                // are void — and the ROI coordinates no longer match.
+                // The rebin, cleaning and normalization applied to the
+                // previous crop are void — and the ROI coordinates no
+                // longer match.
+                view.rebin = None;
+                view.unrebinned = None;
                 view.uncleaned = None;
                 view.clean_stats = None;
                 view.sum_cache.clear();
