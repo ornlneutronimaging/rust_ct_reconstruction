@@ -377,6 +377,11 @@ struct ReconView {
     /// split into; 0 = automatic (the smallest count that fits the
     /// per-job cap). Clamped to the valid range every frame.
     split_jobs: usize,
+    /// mbirjax: run regardless of the GPU memory model, with jobs of at
+    /// most `unchecked_cap` slices (the user's call — a job that does not
+    /// fit fails with an out-of-memory error).
+    ignore_gpu_limit: bool,
+    unchecked_cap: usize,
     /// Slice range to reconstruct, inclusive; clamped to the stack height
     /// every frame (`usize::MAX` = everything).
     slice_from: usize,
@@ -429,6 +434,8 @@ impl ReconView {
             open_section: Some(ReconSection::Evaluate),
             selected_algo: 0,
             split_jobs: 0,
+            ignore_gpu_limit: false,
+            unchecked_cap: UNCHECKED_CAP_DEFAULT,
             slice_from: 0,
             slice_to: usize::MAX,
             preview_frame: 0,
@@ -469,6 +476,12 @@ impl ReconView {
             if let Some(v) = doc.get("split_jobs").and_then(|v| v.as_u64()) {
                 view.split_jobs = v as usize;
             }
+            if let Some(v) = doc.get("ignore_gpu_limit").and_then(|v| v.as_bool()) {
+                view.ignore_gpu_limit = v;
+            }
+            if let Some(v) = doc.get("max_slices_per_job").and_then(|v| v.as_u64()) {
+                view.unchecked_cap = (v as usize).max(1);
+            }
             if let Some(dir) = doc.get("output_folder").and_then(|v| v.as_str()) {
                 view.output_base = Some(PathBuf::from(dir));
             }
@@ -488,6 +501,9 @@ enum SplitCap {
     Fixed(usize),
     /// Cap computed from the GPU memory model (mbirjax).
     Gpu { cap: usize, gpus: usize, gib: f64 },
+    /// The user switched the GPU memory check off (mbirjax): a plain
+    /// per-job cap of their choosing, whatever the data size.
+    Unchecked(usize),
     /// The data is too wide for mbirjax to fit in GPU memory at any slice
     /// count — the run must be blocked, not just split smaller.
     TooWide { gpus: usize, gib: f64 },
@@ -496,7 +512,9 @@ enum SplitCap {
 impl SplitCap {
     fn cap(&self) -> Option<usize> {
         match self {
-            SplitCap::Fixed(c) | SplitCap::Gpu { cap: c, .. } => Some(*c),
+            SplitCap::Fixed(c) | SplitCap::Gpu { cap: c, .. } | SplitCap::Unchecked(c) => {
+                Some(*c)
+            }
             SplitCap::TooWide { .. } => None,
         }
     }
@@ -546,10 +564,21 @@ fn mbirjax_max_slices(width: usize, views: usize, n_gpus: usize, min_mib: u64) -
     (budget / (w * w) - a) / (b + 8.0 * v / (w * n))
 }
 
-fn split_cap_for(key: &str, width: usize, views: usize) -> Option<SplitCap> {
+/// Per-job slice cap when the mbirjax GPU memory check is switched off.
+const UNCHECKED_CAP_DEFAULT: usize = 500;
+
+fn split_cap_for(
+    key: &str,
+    width: usize,
+    views: usize,
+    unchecked: Option<usize>,
+) -> Option<SplitCap> {
     match key {
         "svmbir" => Some(SplitCap::Fixed(50)),
         "mbirjax" => {
+            if let Some(cap) = unchecked {
+                return Some(SplitCap::Unchecked(cap.max(2 * SPLIT_OVERLAP + 1)));
+            }
             let Some((gpus, min_mib)) = gpu_inventory() else {
                 // No probeable GPU (jax would run on CPU anyway) — keep the
                 // historical cap.
@@ -1180,10 +1209,54 @@ fn recon_ui(
             );
             ui.add_space(6.0);
             let h = view.stack.sample.first().map(|p| p.height).unwrap_or(0);
+            if algo.key == "mbirjax" {
+                // The GPU memory model is conservative: let the user run
+                // anyway, with a plain per-job cap.
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(
+                            &mut view.ignore_gpu_limit,
+                            "Skip the GPU memory check",
+                        )
+                        .on_hover_text(
+                            "run mbirjax whatever the GPU memory model says, with jobs of at \
+                             most the slice count on the right (default 500). A job that does \
+                             not fit on the GPUs fails with an out-of-memory error — lower the \
+                             cap and run again",
+                        )
+                        .changed()
+                    {
+                        logger::log(format!(
+                            "mbirjax GPU memory check {}",
+                            if view.ignore_gpu_limit {
+                                format!("skipped (max {} slices per job)", view.unchecked_cap)
+                            } else {
+                                "on".to_owned()
+                            }
+                        ));
+                    }
+                    if view.ignore_gpu_limit {
+                        ui.label("max slices per job:");
+                        let speed = drag_speed(ui, 1.0);
+                        ui.add(
+                            egui::DragValue::new(&mut view.unchecked_cap)
+                                .speed(speed)
+                                .range(2 * SPLIT_OVERLAP + 1..=100_000),
+                        );
+                        if view.unchecked_cap != UNCHECKED_CAP_DEFAULT
+                            && ui.small_button("reset to 500").clicked()
+                        {
+                            view.unchecked_cap = UNCHECKED_CAP_DEFAULT;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
             let split_cap = split_cap_for(
                 algo.key,
                 view.stack.sample.first().map(|p| p.width).unwrap_or(0),
                 view.stack.sample.len(),
+                view.ignore_gpu_limit.then_some(view.unchecked_cap),
             );
             let too_wide = matches!(split_cap, Some(SplitCap::TooWide { .. }));
             if h > 0 {
@@ -1252,6 +1325,11 @@ fn recon_ui(
                                 "at this data size the {gpus} × {gib:.0} GB GPU{} fit at \
                                  most {cap} slices per {} job",
                                 if *gpus == 1 { "" } else { "s" },
+                                algo.label
+                            ),
+                            Some(SplitCap::Unchecked(_)) => format!(
+                                "GPU memory check skipped — at most {cap} slices per {} job, \
+                                 as set above",
                                 algo.label
                             ),
                             _ => format!(
@@ -1592,6 +1670,8 @@ fn recon_ui(
                     "slice_from": view.slice_from.min(h.saturating_sub(1)),
                     "slice_to": view.slice_to.min(h.saturating_sub(1)),
                     "split_jobs": view.split_jobs,
+                    "ignore_gpu_limit": view.ignore_gpu_limit,
+                    "max_slices_per_job": view.unchecked_cap,
                     "output_folder": view
                         .output_base
                         .as_ref()
