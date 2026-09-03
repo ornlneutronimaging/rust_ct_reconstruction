@@ -7553,46 +7553,46 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    selection.is_ok() && !busy && !saving,
-                    egui::Button::new("💾 Save to HDF5…"),
-                )
-                .on_hover_text(
-                    "read the selected projections and write them to an HDF5 file",
-                )
-                .on_disabled_hover_text(if saving || busy {
-                    "wait for the current read / write to finish"
-                } else {
-                    "complete the selection first"
-                })
-                .clicked()
-            {
-                let default_name = view
-                    .sample
-                    .selected
-                    .first()
-                    .and_then(|(dir, ..)| dir.file_name())
-                    .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
-                    .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
-                let mut dialog = rfd::FileDialog::new()
-                    .set_title("Save the white beam projections")
-                    .add_filter("HDF5", &["h5", "hdf5"])
-                    .set_file_name(default_name);
-                let start = dialog_start([
-                    Some(session.ipts.path.join("shared")),
-                    Some(session.ipts.path.clone()),
-                ]);
-                if let Some(dir) = start {
-                    dialog = dialog.set_directory(dir);
+                if ui
+                    .add_enabled(
+                        selection.is_ok() && !busy && !saving,
+                        egui::Button::new("💾 Save to HDF5…"),
+                    )
+                    .on_hover_text(
+                        "read the selected projections and write them to an HDF5 file",
+                    )
+                    .on_disabled_hover_text(if saving || busy {
+                        "wait for the current read / write to finish"
+                    } else {
+                        "complete the selection first"
+                    })
+                    .clicked()
+                {
+                    let default_name = view
+                        .sample
+                        .selected
+                        .first()
+                        .and_then(|(dir, ..)| dir.file_name())
+                        .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
+                        .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title("Save the white beam projections")
+                        .add_filter("HDF5", &["h5", "hdf5"])
+                        .set_file_name(default_name);
+                    let start = dialog_start([
+                        Some(session.ipts.path.join("shared")),
+                        Some(session.ipts.path.clone()),
+                    ]);
+                    if let Some(dir) = start {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        remember_pick(&path);
+                        view.save_status = None;
+                        view.pending_save = Some(path);
+                        ctx.request_repaint();
+                    }
                 }
-                if let Some(path) = dialog.save_file() {
-                    remember_pick(&path);
-                    view.save_status = None;
-                    view.pending_save = Some(path);
-                    ctx.request_repaint();
-                }
-            }
             });
             if saving {
                 ui.horizontal(|ui| {
