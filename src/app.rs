@@ -2511,15 +2511,22 @@ struct WhiteBeamView {
     /// Path of the last HDF5 save, handed to pre-processing as the real
     /// checkpoint path.
     saved_path: Option<PathBuf>,
-    /// Set by the "continue to pre-processing" button; the main loop picks
-    /// it up and switches to the pre-processing screen.
+    /// Set by the Next button once the projections are in memory; the main
+    /// loop picks it up and switches to the pre-processing screen.
     goto_preprocess: Option<LoadedStack>,
     /// 1 = show the wait spinner this frame, 2 = build the stack next
     /// frame (so the spinner is on screen during the heavy copy).
     preprocess_pending: u8,
-    /// The Next button was clicked before the projections were read: run
-    /// the read automatically and continue to pre-processing when it lands.
+    /// The Next button was clicked: read the projections if they are not in
+    /// memory yet (or the selection changed since) and continue to
+    /// pre-processing as soon as they are.
     auto_continue: bool,
+    /// "Save to HDF5" picked this file: read the projections if needed, then
+    /// write them there.
+    pending_save: Option<PathBuf>,
+    /// Fingerprint of the selection `processed` was read from (files and
+    /// orientation), to notice when the stack in memory went stale.
+    processed_key: Option<u64>,
 }
 
 /// Integrated intensities cached per selection: the scan covers the used
@@ -2643,6 +2650,8 @@ impl WhiteBeamView {
             goto_preprocess: None,
             preprocess_pending: 0,
             auto_continue: false,
+            pending_save: None,
+            processed_key: None,
             open_section: Some(WbSection::Angles),
         }
     }
@@ -2809,10 +2818,36 @@ impl WhiteBeamView {
         self.nc_example = Some(example);
     }
 
-    /// Kick off reading + stacking the current selection — what the
-    /// "Read & stack the projections" button does, also run automatically
-    /// when the Next button is clicked before the user did it.
+    /// Fingerprint of what a read of `sample_runs` (plus the current open
+    /// beam / dark current picks) would load: the image paths and the frame
+    /// orientation.
+    fn selection_key(&self, sample_runs: &[RunToCombine], orientation: &Orientation) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for run in sample_runs {
+            run.images.hash(&mut hasher);
+        }
+        for file in self.ob.iter_files() {
+            file.hash(&mut hasher);
+        }
+        for file in self.dc.iter().flat_map(|dc| dc.iter_files()) {
+            file.hash(&mut hasher);
+        }
+        orientation.to_string().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `true` when the stack in memory was read from exactly this selection.
+    fn stack_is_current(&self, sample_runs: &[RunToCombine], orientation: &Orientation) -> bool {
+        self.processed.is_some()
+            && self.processed_key == Some(self.selection_key(sample_runs, orientation))
+    }
+
+    /// Kick off reading + stacking the current selection. Run automatically
+    /// by "Save to HDF5" and by the Next button whenever the stack in memory
+    /// is missing or stale — there is no separate button for it.
     fn start_read(&mut self, sample_runs: Vec<RunToCombine>, orientation: Orientation) {
+        self.processed_key = Some(self.selection_key(&sample_runs, &orientation));
         let one_run_per_file = |pick: &MultiFolderPick| -> Vec<RunToCombine> {
             pick.iter_files()
                 .map(|file| RunToCombine {
@@ -3268,7 +3303,7 @@ struct TofView {
     /// Path of the last HDF5 save, handed to pre-processing as the real
     /// checkpoint path.
     saved_path: Option<PathBuf>,
-    /// Set by the "continue to pre-processing" button; the main loop picks
+    /// Set by the Next button once the stack is saved; the main loop picks
     /// it up and switches to the pre-processing screen.
     goto_preprocess: Option<LoadedStack>,
     /// 1 = show the wait spinner this frame, 2 = build the stack next
@@ -7128,23 +7163,24 @@ fn workflow_ui(
                 .show(ui, |ui| tof_ui(ui, session, tof_view));
         }
     }
-    // The same bottom-right `Next` pill as the setup screen; it continues to
-    // pre-processing exactly like the button inside the save section, which
+    // The same bottom-right `Next` pill as the setup screen; the save section
     // drives the actual hand-over (clicking reopens that section). On the
     // white beam side it is available as soon as the sample and open beam
-    // folders are picked (dark current stays optional): clicking runs the
-    // skipped intermediate steps — reading + stacking the projections —
-    // automatically before handing over.
+    // folders are picked (dark current stays optional): clicking reads the
+    // projections into memory when they are not there yet — saving to HDF5
+    // is optional — and hands over as soon as they are.
     let (ready, pending, hint) = match view {
         WorkflowView::WhiteBeam(v) => {
             // Default the naming-convention angle fields so a user who never
             // opened the angles section still gets a valid selection.
             v.ensure_nc_defaults();
             let selection = v.final_selection();
-            let ready =
-                v.processed.is_some() || (selection.is_ok() && v.ob.total_files() > 0);
+            let ready = selection.is_ok() && v.ob.total_files() > 0;
+            let writing = v.save_job.is_some() || v.pending_save.is_some();
             let hint = if v.process.is_some() || v.auto_continue {
                 "reading the projections…".to_owned()
+            } else if writing {
+                "wait for the HDF5 write to finish".to_owned()
             } else if ready {
                 "continue to pre-processing".to_owned()
             } else if selection.is_ok() {
@@ -7154,7 +7190,7 @@ fn workflow_ui(
             };
             (
                 ready,
-                v.preprocess_pending == 0 && v.process.is_none() && !v.auto_continue,
+                v.preprocess_pending == 0 && v.process.is_none() && !v.auto_continue && !writing,
                 hint,
             )
         }
@@ -7178,14 +7214,10 @@ fn workflow_ui(
             if response.clicked() {
                 match view {
                     WorkflowView::WhiteBeam(v) => {
+                        // The save section reads the projections if needed
+                        // and continues once they are in memory.
                         v.open_section = Some(WbSection::Save);
-                        if v.processed.is_some() {
-                            v.preprocess_pending = 1;
-                        } else {
-                            // Projections not read yet: the save section
-                            // starts the read and continues once it lands.
-                            v.auto_continue = true;
-                        }
+                        v.auto_continue = true;
                     }
                     WorkflowView::Tof(v) => {
                         v.preprocess_pending = 1;
@@ -7334,8 +7366,11 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
     }
 }
 
-/// Read the final selection (one image per projection, exclusions applied,
-/// increasing angle) and save it in the same HDF5 layout as the TOF side.
+/// Save the final selection (one image per projection, exclusions applied,
+/// increasing angle) in the same HDF5 layout as the TOF side, and hand it to
+/// pre-processing. Reading the projections into memory happens on demand:
+/// "Save to HDF5" and the Next button both trigger it when the stack is
+/// missing or stale, so the user never has to run it as a separate step.
 fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
     let ctx = ui.ctx().clone();
     // Fold finished background work into the view.
@@ -7356,11 +7391,13 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             }
             view.processed = Some(std::sync::Arc::new(output));
             view.process = None;
+            // A pending save / hand-over picks the stack up next frame.
+            ctx.request_repaint();
         } else {
             let done = scan.progress();
             let frac = (done as f32 / scan.total_images.max(1) as f32).min(1.0);
             ui.add(egui::ProgressBar::new(frac).text(format!(
-                "{done}/{} images",
+                "reading the projections: {done}/{} images",
                 scan.total_images
             )));
             ctx.request_repaint_after(Duration::from_millis(300));
@@ -7385,20 +7422,93 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
     }
 
-    // The Next button was clicked before the projections were read: run the
-    // read now, then continue to pre-processing as soon as it lands.
-    if view.auto_continue {
-        if view.processed.is_some() {
-            view.auto_continue = false;
-            view.preprocess_pending = 1;
-        } else if view.process.is_none() {
-            match view.final_selection() {
-                Ok(runs) => view.start_read(runs, view.orientation(session).orientation()),
-                Err(e) => {
-                    logger::error(format!("cannot continue to pre-processing: {e}"));
-                    view.auto_continue = false;
+    // Everything recorded next to the data in the HDF5 file, and handed to
+    // pre-processing as the stack's provenance.
+    let folder_list = |pick: &MultiFolderPick| {
+        pick.selected
+            .iter()
+            .map(|(dir, ..)| dir.display().to_string())
+            .chain(pick.files.iter().map(|f| f.display().to_string()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut mode = format!(
+        "white beam, one image per projection; angles from {}",
+        view.angle_source.label()
+    );
+    if view.use_percentage {
+        mode.push_str(&format!("; {}% coverage selection", view.percentage));
+    }
+    if !view.excluded_runs.is_empty() {
+        let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
+        sorted.sort();
+        mode.push_str(&format!("; excluded runs {sorted:?}"));
+    }
+    if view.intensities.is_some() {
+        mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
+        if view.threshold_max_enabled {
+            mode.push_str(&format!(", upper threshold {:.4e}", view.threshold_max));
+        }
+    }
+    let meta = SaveMeta {
+        instrument: session.instrument.name().to_owned(),
+        ipts: session.ipts.name.clone(),
+        acquisition_mode: session.mode.label().to_owned(),
+        // MARS has a single camera — no detector was picked there.
+        detector: match session.instrument {
+            Instrument::Venus => view.detector.label().to_owned(),
+            Instrument::Mars => "CCD".to_owned(),
+        },
+        orientation: view.orientation(session).orientation(),
+        sample_folder: folder_list(&view.sample),
+        ob_folder: folder_list(&view.ob),
+        dc_folder: view
+            .dc
+            .as_ref()
+            .filter(|dc| !dc.selected.is_empty() || !dc.files.is_empty())
+            .map(folder_list),
+        combine_mode: mode,
+        selections_json: None,
+        detector_offset_us: None,
+    };
+
+    // "Save to HDF5" or Next was clicked: both need the projections in
+    // memory. Read them when they are not there (or when the selection
+    // changed since the last read), then save and/or continue as soon as
+    // they land.
+    if (view.pending_save.is_some() || view.auto_continue) && view.process.is_none() {
+        match view.final_selection() {
+            Ok(runs) => {
+                let orientation = view.orientation(session).orientation();
+                if !view.stack_is_current(&runs, &orientation) {
+                    view.start_read(runs, orientation);
                 }
             }
+            Err(e) => {
+                logger::error(format!("cannot read the projections: {e}"));
+                view.pending_save = None;
+                view.auto_continue = false;
+            }
+        }
+    }
+    if view.process.is_none()
+        && let Some(output) = &view.processed
+    {
+        if let Some(path) = view.pending_save.take() {
+            logger::log(format!("saving white beam data to {}", path.display()));
+            view.save_status = None;
+            view.saved_path = Some(path.clone());
+            view.save_job = Some(SaveJob::start(
+                path,
+                std::sync::Arc::clone(output),
+                meta.clone(),
+            ));
+        }
+        // Hand over after the write finished: pre-processing is told the
+        // saved file is its checkpoint.
+        if view.auto_continue && view.save_job.is_none() {
+            view.auto_continue = false;
+            view.preprocess_pending = 1;
         }
     }
 
@@ -7423,21 +7533,54 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
     }
 
-    let busy = view.process.is_some();
-    if ui
-        .add_enabled(
-            selection.is_ok() && !busy,
-            // MARS has one image per projection: nothing gets combined.
-            egui::Button::new(match session.instrument {
-                Instrument::Venus => "▶ Read & stack the projections",
-                Instrument::Mars => "▶ Read the projections",
-            }),
-        )
-        .clicked()
-        && let Ok(sample_runs) = selection
-    {
-        view.start_read(sample_runs, view.orientation(session).orientation());
-    }
+    let busy = view.process.is_some() || view.pending_save.is_some();
+    let saving = view.save_job.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                selection.is_ok() && !busy && !saving,
+                egui::Button::new("💾 Save to HDF5…"),
+            )
+            .on_hover_text(
+                "read the selected projections and write them to an HDF5 file — \
+                 optional, the Next button continues to pre-processing without saving",
+            )
+            .on_disabled_hover_text(if saving || busy {
+                "wait for the current read / write to finish"
+            } else {
+                "complete the selection first"
+            })
+            .clicked()
+        {
+            let default_name = view
+                .sample
+                .selected
+                .first()
+                .and_then(|(dir, ..)| dir.file_name())
+                .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
+                .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save the white beam projections")
+                .add_filter("HDF5", &["h5", "hdf5"])
+                .set_file_name(default_name);
+            let start = dialog_start([
+                Some(session.ipts.path.join("shared")),
+                Some(session.ipts.path.clone()),
+            ]);
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(path) = dialog.save_file() {
+                remember_pick(&path);
+                view.save_status = None;
+                view.pending_save = Some(path);
+                ctx.request_repaint();
+            }
+        }
+        ui.label(
+            RichText::new("optional — Next continues to pre-processing without saving").weak(),
+        );
+    });
 
     if let Some(output) = &view.processed {
         let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
@@ -7448,7 +7591,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             .unwrap_or_else(|| "?".to_owned());
         ui.label(
             RichText::new(format!(
-                "stacked: {} projections ({dims}), angles {} — {} ob images{}",
+                "in memory: {} projections ({dims}), angles {} — {} ob images{}",
                 output.sample.len(),
                 match (angles.first(), angles.last()) {
                     (Some(a), Some(b)) => format!("{a:.3}° to {b:.3}°"),
@@ -7465,101 +7608,6 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         );
         for e in &output.skipped {
             ui.colored_label(warn_text(ui), format!("skipped: {e}"));
-        }
-        let folder_list = |pick: &MultiFolderPick| {
-            pick.selected
-                .iter()
-                .map(|(dir, ..)| dir.display().to_string())
-                .chain(pick.files.iter().map(|f| f.display().to_string()))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        let mut mode = format!(
-            "white beam, one image per projection; angles from {}",
-            view.angle_source.label()
-        );
-        if view.use_percentage {
-            mode.push_str(&format!("; {}% coverage selection", view.percentage));
-        }
-        if !view.excluded_runs.is_empty() {
-            let mut sorted: Vec<u32> = view.excluded_runs.iter().copied().collect();
-            sorted.sort();
-            mode.push_str(&format!("; excluded runs {sorted:?}"));
-        }
-        if view.intensities.is_some() {
-            mode.push_str(&format!("; intensity threshold {:.4e}", view.threshold));
-            if view.threshold_max_enabled {
-                mode.push_str(&format!(", upper threshold {:.4e}", view.threshold_max));
-            }
-        }
-        let meta = SaveMeta {
-            instrument: session.instrument.name().to_owned(),
-            ipts: session.ipts.name.clone(),
-            acquisition_mode: session.mode.label().to_owned(),
-            // MARS has a single camera — no detector was picked there.
-            detector: match session.instrument {
-                Instrument::Venus => view.detector.label().to_owned(),
-                Instrument::Mars => "CCD".to_owned(),
-            },
-            orientation: view.orientation(session).orientation(),
-            sample_folder: folder_list(&view.sample),
-            ob_folder: folder_list(&view.ob),
-            dc_folder: view
-                .dc
-                .as_ref()
-                .filter(|dc| !dc.selected.is_empty() || !dc.files.is_empty())
-                .map(folder_list),
-            combine_mode: mode,
-            selections_json: None,
-            detector_offset_us: None,
-        };
-        let saving = view.save_job.is_some();
-        let mut jump = false;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
-                .clicked()
-            {
-                let default_name = view
-                    .sample
-                    .selected
-                    .first()
-                    .and_then(|(dir, ..)| dir.file_name())
-                    .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
-                    .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
-                let mut dialog = rfd::FileDialog::new()
-                    .set_title("Save the white beam projections")
-                    .add_filter("HDF5", &["h5", "hdf5"])
-                    .set_file_name(default_name);
-                let start = dialog_start([
-                    Some(session.ipts.path.join("shared")),
-                    Some(session.ipts.path.clone()),
-                ]);
-                if let Some(dir) = start {
-                    dialog = dialog.set_directory(dir);
-                }
-                if let Some(path) = dialog.save_file() {
-                    remember_pick(&path);
-                    logger::log(format!("saving white beam data to {}", path.display()));
-                    view.save_status = None;
-                    view.saved_path = Some(path.clone());
-                    view.save_job = Some(SaveJob::start(
-                        path,
-                        std::sync::Arc::clone(output),
-                        meta.clone(),
-                    ));
-                }
-            }
-            jump = ui
-                .add_enabled(!saving, egui::Button::new("🚀 Continue to pre-processing"))
-                .on_hover_text(
-                    "work on the stacked projections — saving to HDF5 first is optional",
-                )
-                .on_disabled_hover_text("wait for the HDF5 write to finish")
-                .clicked();
-        });
-        if jump {
-            view.preprocess_pending = 1;
         }
         // Draw the spinner one frame before the heavy stack copy, so the
         // user sees the button did something.
@@ -9044,7 +9092,6 @@ fn process_section_ui(
             detector_offset_us: result.detector_offset_us,
         };
         let saving = view.save_job.is_some();
-        let mut jump = false;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!saving, egui::Button::new("💾 Save to HDF5…"))
@@ -9080,20 +9127,10 @@ fn process_section_ui(
                     ));
                 }
             }
-            jump = ui
-                .add_enabled(
-                    matches!(view.save_status, Some(Ok(_))),
-                    egui::Button::new("🚀 Continue to pre-processing"),
-                )
-                .on_hover_text("work on the saved combined stack")
-                .on_disabled_hover_text("save to HDF5 first")
-                .clicked();
+            ui.label(RichText::new("then click Next to continue to pre-processing").weak());
         });
-        if jump {
-            view.preprocess_pending = 1;
-        }
         // Draw the spinner one frame before the heavy stack copy, so the
-        // user sees the button did something.
+        // user sees the Next button did something.
         if view.preprocess_pending > 0 {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -9777,8 +9814,8 @@ impl eframe::App for CtApp {
                 }
                 Screen::Setup => {}
             });
-            // A workflow's "continue to pre-processing" button hands its
-            // combined stack over without going through a file.
+            // A workflow's Next button hands its combined stack over without
+            // going through a file.
             let pending = match &mut self.screen {
                 Screen::Workflow {
                     view: WorkflowView::Tof(tof_view),
