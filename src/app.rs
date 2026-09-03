@@ -786,14 +786,316 @@ fn terminal_output_ui(
 
 /// Show a saved `<algorithm>_config` JSON as one "name: value" row per
 /// field.
-fn config_json_rows(ui: &mut egui::Ui, json: &str) {
+/// One reconstruction parameter, explained for the user.
+struct ParamDoc {
+    name: &'static str,
+    doc: &'static str,
+}
+
+/// What an algorithm's parameters do, and where the full documentation is
+/// (the evaluator tools tune them; the same keys end up in the checkpoint's
+/// `<algo>_config` and in the full reconstruction).
+struct AlgoDoc {
+    key: &'static str,
+    summary: &'static str,
+    url: &'static str,
+    url_label: &'static str,
+    params: &'static [ParamDoc],
+}
+
+const ALGO_DOCS: [AlgoDoc; 6] = [
+    AlgoDoc {
+        key: "svmbir",
+        summary: "Model-based iterative reconstruction (super-voxel MBIR, CPU). Fits a \
+                  volume to the sinogram under a qGGMRF prior: slow, but the best \
+                  quality on noisy or sparse-view data.",
+        url: "https://svmbir.readthedocs.io/en/latest/svmbir.html",
+        url_label: "svmbir.recon documentation",
+        params: &[
+            ParamDoc {
+                name: "sharpness",
+                doc: "level of sharpness of the reconstruction: 0 is neutral, > 0 sharper \
+                      (more detail, more noise), < 0 smoother. Typical range -2 to 2.",
+            },
+            ParamDoc {
+                name: "snr_db",
+                doc: "assumed signal-to-noise ratio of the sinogram in dB (default 30). \
+                      Higher trusts the data more (less regularization, noisier); lower \
+                      smooths more. Typical range 25 to 35.",
+            },
+            ParamDoc {
+                name: "positivity",
+                doc: "constrain the reconstructed attenuation to be >= 0. Keep it on unless \
+                      the data legitimately produces negative values.",
+            },
+            ParamDoc {
+                name: "max_iterations",
+                doc: "maximum number of iterations (the solver may stop earlier when the \
+                      update falls under its stop threshold). More iterations for limited \
+                      angles or strong regularization; each one costs the same time.",
+            },
+            ParamDoc {
+                name: "max_resolutions",
+                doc: "number of coarser grid resolutions used to initialize the solve \
+                      (multi-resolution): 0 solves at full resolution only, 2 to 3 converges \
+                      faster.",
+            },
+            ParamDoc {
+                name: "center_offset",
+                doc: "center of rotation as an offset in pixels from the detector center \
+                      (-(width/2 - COR)). Derived from the center of rotation found in \
+                      pre-processing, refine it in the evaluator.",
+            },
+        ],
+    },
+    AlgoDoc {
+        key: "mbirjax",
+        summary: "Model-based iterative reconstruction on the GPU (JAX). Same kind of result \
+                  as SVMBIR, much faster on a GPU, but its memory use grows with the \
+                  projection width.",
+        url: "https://mbirjax.readthedocs.io/en/latest/usr_parameters.html",
+        url_label: "MBIRJAX parameters documentation",
+        params: &[
+            ParamDoc {
+                name: "sharpness",
+                doc: "sharpness of the reconstruction (default 1.0): higher is sharper and \
+                      noisier, lower is smoother.",
+            },
+            ParamDoc {
+                name: "snr_db",
+                doc: "assumed signal-to-noise ratio of the sinogram in dB (default 30). \
+                      Higher trusts the data more (less regularization); lower smooths \
+                      more. Typical range 25 to 35.",
+            },
+            ParamDoc {
+                name: "positivity",
+                doc: "enforce positivity (positivity_flag): reconstructed values >= 0. Off by \
+                      default in MBIRJAX.",
+            },
+            ParamDoc {
+                name: "max_iterations",
+                doc: "number of VCD iterations of the solver (10 to 25 is usual). More \
+                      iterations converge further at a proportional cost.",
+            },
+            ParamDoc {
+                name: "row_scale",
+                doc: "scale of the reconstruction grid rows relative to the detector \
+                      (scale_recon_shape): 1.0 reconstructs at detector resolution, 2.0 a \
+                      grid twice as large, 0.5 half. Set together with col_scale.",
+            },
+            ParamDoc {
+                name: "col_scale",
+                doc: "scale of the reconstruction grid columns, same as row_scale.",
+            },
+            ParamDoc {
+                name: "det_channel_offset",
+                doc: "center of rotation as an offset in detector channels (pixels) from the \
+                      detector center (-(width/2 - COR)). Derived from the center of \
+                      rotation found in pre-processing, refine it in the evaluator.",
+            },
+        ],
+    },
+    AlgoDoc {
+        key: "astra_fbp",
+        summary: "ASTRA toolbox through algotom: analytic filtered back projection, or the \
+                  iterative SIRT / SART / CGLS, on the GPU (_CUDA methods) or the CPU.",
+        url: "https://astra-toolbox.com/docs/algs/index.html",
+        url_label: "ASTRA algorithms documentation",
+        params: &[
+            ParamDoc {
+                name: "method",
+                doc: "reconstruction method: BP (plain back projection), FBP (filtered back \
+                      projection, fast), SIRT / SART / CGLS (iterative, slower, less noise). \
+                      The _CUDA suffix runs it on the GPU.",
+            },
+            ParamDoc {
+                name: "num_iter",
+                doc: "number of iterations for the iterative methods (SIRT, SART, CGLS; \
+                      typically 100 to 300). Ignored by BP and FBP.",
+            },
+            ParamDoc {
+                name: "filter_name",
+                doc: "FBP filter: ram-lak (sharpest, noisiest), hamming, hann, lanczos, \
+                      kaiser, parzen (smoothest). Only used by FBP.",
+            },
+            ParamDoc {
+                name: "ratio",
+                doc: "radius of the circular mask applied to the reconstructed slice, as a \
+                      fraction of the half width (1.0 = the inscribed circle; larger keeps \
+                      the corners).",
+            },
+            ParamDoc {
+                name: "pad",
+                doc: "padding (pixels) added to each side of the sinogram before the FFT, \
+                      to reduce the edge artifacts; null = automatic.",
+            },
+            ParamDoc {
+                name: "center",
+                doc: "center of rotation in pixels from the left edge of the sinogram, \
+                      from the pre-processing (refine it in the evaluator).",
+            },
+        ],
+    },
+    AlgoDoc {
+        key: "tomopy_fbp",
+        summary: "TomoPy's filtered back projection (CPU): the reference implementation, \
+                  versatile and well tested.",
+        url: "https://tomopy.readthedocs.io/en/stable/api/tomopy.recon.algorithm.html",
+        url_label: "tomopy.recon documentation",
+        params: &[
+            ParamDoc {
+                name: "algorithm",
+                doc: "TomoPy algorithm: fbp (filtered back projection) here; gridrec, art, \
+                      sirt, mlem… exist in TomoPy.",
+            },
+            ParamDoc {
+                name: "filter_name",
+                doc: "FBP filter: none, shepp (Shepp-Logan), cosine, hann, hamming, ramlak \
+                      (sharpest, noisiest), parzen (smoothest), butterworth.",
+            },
+            ParamDoc {
+                name: "center",
+                doc: "center of rotation in pixels from the left edge of the sinogram, \
+                      from the pre-processing (refine it in the evaluator).",
+            },
+        ],
+    },
+    AlgoDoc {
+        key: "algotom_fbp",
+        summary: "algotom's filtered back projection: designed for large data, with an \
+                  optional GPU (cupy) path.",
+        url: "https://algotom.readthedocs.io/en/latest/toc/api/algotom.rec.reconstruction.html",
+        url_label: "algotom.rec.reconstruction documentation",
+        params: &[
+            ParamDoc {
+                name: "filter_name",
+                doc: "smoothing filter applied before the back projection: none (sharpest, \
+                      noisiest), hann, bartlett, blackman, hamming, nuttall, parzen, triang.",
+            },
+            ParamDoc {
+                name: "gpu",
+                doc: "run on the GPU (cupy) instead of the CPU.",
+            },
+            ParamDoc {
+                name: "ratio",
+                doc: "radius of the circular mask applied to the reconstructed slice, as a \
+                      fraction of the half width (1.0 = the inscribed circle).",
+            },
+            ParamDoc {
+                name: "pad",
+                doc: "padding (pixels) added to the sinogram before the FFT, to reduce the \
+                      edge artifacts; null = 10% of the image width.",
+            },
+            ParamDoc {
+                name: "pad_mode",
+                doc: "how the padding is filled (numpy.pad modes): edge repeats the border \
+                      values.",
+            },
+            ParamDoc {
+                name: "center",
+                doc: "center of rotation in pixels from the left edge of the sinogram, \
+                      from the pre-processing (refine it in the evaluator).",
+            },
+        ],
+    },
+    AlgoDoc {
+        key: "algotom_gridrec",
+        summary: "algotom's gridrec (TomoPy's Fourier-grid reconstruction): the fastest \
+                  option, good for quick previews.",
+        url: "https://algotom.readthedocs.io/en/latest/toc/api/algotom.rec.reconstruction.html",
+        url_label: "algotom.rec.reconstruction documentation",
+        params: &[
+            ParamDoc {
+                name: "filter_name",
+                doc: "smoothing filter: none, shepp (Shepp-Logan), cosine, hann, hamming, \
+                      ramlak (sharpest, noisiest), parzen (smoothest), butterworth.",
+            },
+            ParamDoc {
+                name: "filter_par",
+                doc: "strength of the filter (butterworth cutoff): smaller is stronger, \
+                      i.e. smoother; 0.9 is mild.",
+            },
+            ParamDoc {
+                name: "ratio",
+                doc: "radius of the circular mask applied to the reconstructed slice, as a \
+                      fraction of the half width (1.0 = the inscribed circle).",
+            },
+            ParamDoc {
+                name: "pad",
+                doc: "edge padding (pixels) of the sinogram before the FFT, to reduce the \
+                      edge artifacts (100 by default).",
+            },
+            ParamDoc {
+                name: "center",
+                doc: "center of rotation in pixels from the left edge of the sinogram, \
+                      from the pre-processing (refine it in the evaluator).",
+            },
+        ],
+    },
+];
+
+fn algo_doc(key: &str) -> Option<&'static AlgoDoc> {
+    ALGO_DOCS.iter().find(|d| d.key == key)
+}
+
+fn param_doc(algo_key: &str, name: &str) -> Option<&'static str> {
+    algo_doc(algo_key)?
+        .params
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.doc)
+}
+
+/// The ℹ button of an algorithm: a popup with what it does, what every
+/// parameter means, and a link to the documentation.
+fn algo_info_button(ui: &mut egui::Ui, algo: &ReconAlgorithm) {
+    let Some(doc) = algo_doc(algo.key) else {
+        return;
+    };
+    ui.menu_button(RichText::new("ℹ").size(14.0), |ui| {
+        ui.set_max_width(460.0);
+        ui.label(RichText::new(algo.label).strong());
+        ui.label(RichText::new(doc.summary).size(12.0));
+        ui.add_space(4.0);
+        ui.label(RichText::new("Parameters").strong().size(12.0));
+        for p in doc.params {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{}:", p.name)).strong().size(12.0));
+                ui.label(RichText::new(p.doc).size(12.0));
+            });
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("🔗").size(12.0));
+            ui.hyperlink_to(doc.url_label, doc.url)
+                .on_hover_text(doc.url);
+        });
+    })
+    .response
+    .on_hover_text(format!("what {} and its parameters do", algo.label));
+}
+
+/// The `name: value` rows of a saved `<algo>_config`; hovering a name
+/// explains the parameter.
+fn config_json_rows(ui: &mut egui::Ui, algo_key: &str, json: &str) {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(serde_json::Value::Object(map)) => {
             for (name, value) in &map {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    let label = ui.label(RichText::new(format!("{name}:")).strong().size(12.0));
+                    if let Some(doc) = param_doc(algo_key, name) {
+                        label.on_hover_text(doc);
+                    }
                     ui.label(RichText::new(value.to_string()).size(12.0));
                 });
+            }
+            if algo_doc(algo_key).is_some() {
+                ui.label(
+                    RichText::new("hover a parameter name for what it does; ℹ next to the \
+                                   algorithm has the full list and the documentation link")
+                        .weak()
+                        .size(11.0),
+                );
             }
         }
         _ => {
@@ -1079,6 +1381,7 @@ fn recon_ui(
                 {
                     launch = Some((binary, format!("the {} evaluator", algo.label)));
                 }
+                algo_info_button(ui, algo);
                 let config_key = format!("{}_config", algo.key);
                 let config = view
                     .stack
@@ -1102,7 +1405,7 @@ fn recon_ui(
                             .strong(),
                         );
                         match &config {
-                            Some(json) => config_json_rows(ui, json),
+                            Some(json) => config_json_rows(ui, algo.key, json),
                             None => {
                                 ui.label(
                                     RichText::new(
@@ -1113,6 +1416,7 @@ fn recon_ui(
                                 );
                                 config_json_rows(
                                     ui,
+                                    algo.key,
                                     &algo_default_config(algo, cor_px, width_px),
                                 );
                             }
@@ -1182,7 +1486,7 @@ fn recon_ui(
                             .strong()
                             .size(12.0),
                     );
-                    config_json_rows(ui, json);
+                    config_json_rows(ui, algo.key, json);
                 }
                 None => {
                     ui.label(
@@ -1194,7 +1498,7 @@ fn recon_ui(
                         .weak()
                         .size(12.0),
                     );
-                    config_json_rows(ui, &algo_default_config(algo, cor_px, width_px));
+                    config_json_rows(ui, algo.key, &algo_default_config(algo, cor_px, width_px));
                 }
             }
             ui.add_space(4.0);
@@ -10710,6 +11014,24 @@ mod split_tests {
         assert_eq!(split_job_bounds(512, 50, 10).0, 13);
         assert_eq!(split_job_bounds(90, 100, 10).0, 1);
         assert_eq!(split_ranges(90, 1, 10), vec![(0, 90)]);
+    }
+}
+
+#[cfg(test)]
+mod algo_doc_tests {
+    use super::{RECON_ALGORITHMS, algo_doc, param_doc};
+
+    #[test]
+    fn every_default_parameter_is_documented() {
+        for algo in &RECON_ALGORITHMS {
+            let doc = algo_doc(algo.key).unwrap_or_else(|| panic!("no doc for {}", algo.key));
+            assert!(doc.url.starts_with("https://"));
+            let defaults: serde_json::Value = serde_json::from_str(algo.defaults).unwrap();
+            for name in defaults.as_object().unwrap().keys() {
+                assert!(param_doc(algo.key, name).is_some(), "{}.{name} undocumented", algo.key);
+            }
+            assert!(param_doc(algo.key, algo.center_key).is_some(), "{} center", algo.key);
+        }
     }
 }
 
