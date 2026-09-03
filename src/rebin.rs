@@ -1,8 +1,9 @@
-//! "Rebin" pre-processing step: every n×n block of pixels is averaged into
-//! one pixel, on the sample, open beam and dark current images alike. The
+//! "Rebin" pre-processing step — the last one, run on the normalized
+//! projections: every n×n block of pixels is averaged into one pixel. The
 //! images get n times narrower and shorter (trailing rows / columns that do
 //! not fill a whole block are dropped), with better statistics per pixel
-//! and a coarser resolution.
+//! and a coarser resolution. Open beam / dark current images still in the
+//! stack are rebinned the same way.
 //!
 //! The mbirjax reconstruction is the reason this step exists: its GPU memory
 //! use grows with the projection width, and full-frame (4096 px wide)

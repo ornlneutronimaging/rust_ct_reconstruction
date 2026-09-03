@@ -74,31 +74,33 @@ per-projection processing steps are next.
 
 ## Pre-processing exports
 
-Every section of the pre-processing screen (crop, rebin, remove outliers,
+Every section of the pre-processing screen (crop, remove outliers,
 normalization, ring artifact removal, remove stripes, rotation, tilt
-correction, log conversion) ends with an **📤 Export the images (TIFF)…**
+correction, log conversion, rebin) ends with an **📤 Export the images (TIFF)…**
 button, enabled once the step was applied. It asks for a folder and creates
-a sub-folder named after the step (`crop/`, `rebin/`, `remove_outliers/`,
+a sub-folder named after the step (`crop/`, `remove_outliers/`,
 `normalization/`, `ring_artifact_removal/`, `remove_stripes/`, `rotation/`,
-`tilt_correction/`, `log_conversion/`) holding the stack as it is at that
+`tilt_correction/`, `log_conversion/`, `rebin/`) holding the stack as it is at that
 point — this step and everything applied before it — as float32 TIFFs, one
-per projection in stack order (`0000_<name>.tif`, …). The crop, rebin and
-outlier steps also write the open beams (and dark currents) into `ob/` and `dc/`
+per projection in stack order (`0000_<name>.tif`, …). The crop and outlier
+steps also write the open beams (and dark currents) into `ob/` and `dc/`
 sub-folders, since they transform those too. A `provenance.txt` records the
 step, the source file and the stack metadata. An existing step folder is
 never reused: a second export goes to `<step>_2/`, then `<step>_3/`, ….
 
 ## Rebin
 
-The **Rebin (needed for mbirjax)** section, right after the crop, averages
-every n×n block of pixels (2×2 … 8×8) into one on the sample, open beam and
-dark current images. The mbirjax reconstruction runs on the GPU and its
-memory use grows with the projection width: full-frame (4096 px wide) stacks
-do not fit, however few slices are reconstructed at a time. Every later step
-works on the rebinned images, so rebin before the tilt / center of rotation.
-The factor is recorded in the checkpoint metadata (`rebin`), a stored center
-of rotation is rescaled, and the step can be undone or re-run with another
-factor (always from the un-rebinned data).
+The **Rebin (mbirjax only)** section, last on the pre-processing screen,
+averages every n×n block of pixels (2×2 … 8×8) into one on the normalized
+(and log-converted) projections. The mbirjax reconstruction runs on the GPU
+and its memory use grows with the projection width: full-frame (4096 px
+wide) stacks do not fit, however few slices are reconstructed at a time —
+the other algorithms do not need the step. The factor is recorded in the
+checkpoint metadata (`rebin`), the center of rotation is rescaled with the
+pixels, and the step can be undone or re-run with another factor (always
+from the un-rebinned data) as long as no later step was applied on the
+rebinned data. The reconstruction screen also offers to skip the GPU memory
+check altogether and run mbirjax with jobs of at most 500 slices.
 
 ## Sinogram viewer
 
