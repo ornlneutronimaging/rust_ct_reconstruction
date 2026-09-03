@@ -25,7 +25,9 @@ use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
     RunInfo, ViewerJob,
 };
-use crate::white_beam::{self, AngleSource, ImageIntensity, IntensityScan, MetaAnglesScan, WbDetector};
+use crate::white_beam::{
+    self, AcqSignature, AngleSource, ImageIntensity, IntensityScan, MetaAnglesScan, WbDetector,
+};
 
 use egui::{Align, Color32, Layout, RichText};
 use sha2::{Digest, Sha256};
@@ -2462,6 +2464,10 @@ struct WhiteBeamView {
     /// Dark-current picker, on the instruments that record one (MARS).
     /// Selecting folders is optional even there.
     dc: Option<MultiFolderPick>,
+    /// "Smart selection": whenever the sample folders change, pick the open
+    /// beam and dark current folders acquired with the same exposure time
+    /// and wavelength (per the folder naming convention) and drop the rest.
+    smart_selection: bool,
 
     // Projection angle retrieval.
     angle_source: AngleSource,
@@ -2566,6 +2572,47 @@ impl WhiteBeamView {
         Self::with_detector(WbDetector::IkonXl, session)
     }
 
+    /// Smart selection: align the open beam and dark current picks with the
+    /// sample's exposure time and wavelength. Called whenever the sample
+    /// selection changes (and when the toggle is switched on); with the
+    /// toggle off it only clears the highlighting.
+    fn apply_smart_selection(&mut self) {
+        let signature = if self.smart_selection {
+            self.sample.signature()
+        } else {
+            None
+        };
+        self.ob.smart_filter = signature;
+        if let Some(dc) = &mut self.dc {
+            dc.smart_filter = signature;
+        }
+        if !self.smart_selection {
+            return;
+        }
+        let Some(signature) = signature else {
+            if self.sample.total_files() > 0 {
+                logger::error(
+                    "smart selection: no exposure time / wavelength in the sample folder name \
+                     — open beam and dark current left as they are",
+                );
+            }
+            return;
+        };
+        let mut report = Vec::new();
+        for pick in std::iter::once(&mut self.ob).chain(self.dc.iter_mut()) {
+            let (selected, removed) = pick.apply_smart(&signature);
+            report.push(format!(
+                "{} {} folder(s) selected, {removed} removed",
+                selected, pick.kind
+            ));
+        }
+        logger::log(format!(
+            "smart selection ({}): {}",
+            signature.label(),
+            report.join("; ")
+        ));
+    }
+
     fn with_detector(detector: WbDetector, session: &Session) -> Self {
         let instrument = session.instrument;
         let sample = MultiFolderPick::new(
@@ -2619,6 +2666,7 @@ impl WhiteBeamView {
             sample,
             ob,
             dc,
+            smart_selection: true,
             angle_source: AngleSource::NamingConvention,
             nc_example: None,
             nc_fields: Vec::new(),
@@ -2913,6 +2961,10 @@ struct MultiFolderPick {
     /// top of (or instead of) whole folders.
     allow_files: bool,
     error: Option<String>,
+    /// Smart selection in force: the sample's exposure / wavelength this
+    /// picker is aligned with. Candidates with a different signature are
+    /// dimmed in the list.
+    smart_filter: Option<AcqSignature>,
 }
 
 impl MultiFolderPick {
@@ -2962,6 +3014,7 @@ impl MultiFolderPick {
             files: Vec::new(),
             allow_files: false,
             error: None,
+            smart_filter: None,
         }
     }
 
@@ -2990,6 +3043,69 @@ impl MultiFolderPick {
 
     fn is_selected(&self, dir: &Path) -> bool {
         self.selected.iter().any(|(d, ..)| d == dir)
+    }
+
+    /// The exposure / wavelength signature of the selection, from the first
+    /// selected folder's name (or the first picked file's).
+    fn signature(&self) -> Option<AcqSignature> {
+        self.selected
+            .first()
+            .map(|(dir, ..)| dir.as_path())
+            .or_else(|| self.files.first().map(PathBuf::as_path))
+            .and_then(|p| AcqSignature::from_name(&p.file_name()?.to_string_lossy()))
+    }
+
+    /// Select every candidate folder whose name carries `signature`, and
+    /// drop the selected folders and files that carry a different one
+    /// (names without a signature are left alone). Returns how many
+    /// folders ended up selected and how many folders / files were dropped.
+    fn apply_smart(&mut self, signature: &AcqSignature) -> (usize, usize) {
+        let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let mut removed = 0usize;
+        let stale: Vec<PathBuf> = self
+            .selected
+            .iter()
+            .filter(|(dir, ..)| {
+                name_of(dir)
+                    .and_then(|n| AcqSignature::from_name(&n))
+                    .is_some_and(|s| !s.matches(signature))
+            })
+            .map(|(dir, ..)| dir.clone())
+            .collect();
+        for dir in stale {
+            self.toggle(dir);
+            removed += 1;
+        }
+        let before = self.files.len();
+        self.files.retain(|f| {
+            let keep = name_of(f)
+                .and_then(|n| AcqSignature::from_name(&n))
+                .is_none_or(|s| s.matches(signature));
+            if !keep {
+                logger::log(format!("{} file removed (smart selection): {}", self.kind, f.display()));
+            }
+            keep
+        });
+        removed += before - self.files.len();
+        let wanted: Vec<PathBuf> = self
+            .candidates
+            .as_ref()
+            .map(|dirs| {
+                dirs.iter()
+                    .filter(|(_, dir)| {
+                        !self.is_selected(dir)
+                            && name_of(dir)
+                                .and_then(|n| AcqSignature::from_name(&n))
+                                .is_some_and(|s| s.matches(signature))
+                    })
+                    .map(|(_, dir)| dir.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for dir in wanted {
+            self.toggle(dir);
+        }
+        (self.selected.len(), removed)
     }
 
     fn total_files(&self) -> usize {
@@ -3075,6 +3191,13 @@ impl MultiFolderPick {
         for root in &self.roots {
             ui.label(RichText::new(root.display().to_string()).weak().size(11.0));
         }
+        if let Some(sig) = &self.smart_filter {
+            ui.label(
+                RichText::new(format!("smart selection: folders acquired at {}", sig.label()))
+                    .size(11.0)
+                    .color(ok_text(ui)),
+            );
+        }
         ui.add_space(4.0);
 
         let mut toggled: Option<PathBuf> = None;
@@ -3093,7 +3216,24 @@ impl MultiFolderPick {
                     .show(ui, |ui| {
                         for (label, dir) in dirs {
                             let mut checked = self.is_selected(dir);
-                            if ui.checkbox(&mut checked, label).changed() {
+                            // Under smart selection, folders taken with
+                            // another exposure / wavelength are dimmed.
+                            let mismatch = self.smart_filter.as_ref().and_then(|sig| {
+                                AcqSignature::from_name(label)
+                                    .filter(|s| !s.matches(sig))
+                                    .map(|s| s.label())
+                            });
+                            let text = match &mismatch {
+                                Some(_) => RichText::new(label).weak(),
+                                None => RichText::new(label),
+                            };
+                            let mut response = ui.checkbox(&mut checked, text);
+                            if let Some(other) = mismatch {
+                                response = response.on_hover_text(format!(
+                                    "acquired at {other} — not the sample's settings"
+                                ));
+                            }
+                            if response.changed() {
                                 toggled = Some(dir.clone());
                             }
                         }
@@ -7289,8 +7429,10 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
             if detector != view.detector {
                 logger::log(format!("white beam detector changed: {}", detector.label()));
                 let orientation_override = view.orientation_override;
+                let smart_selection = view.smart_selection;
                 *view = WhiteBeamView::with_detector(detector, session);
                 view.orientation_override = orientation_override;
+                view.smart_selection = smart_selection;
             }
         }
         ui.label(
@@ -7306,6 +7448,35 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
     ui.separator();
     ui.add_space(10.0);
 
+    ui.horizontal(|ui| {
+        if ui
+            .toggle_value(&mut view.smart_selection, "✨ Smart selection")
+            .on_hover_text(
+                "when a sample folder is picked, select the open beam and dark current \
+                 folders acquired with the same exposure time and wavelength (from the \
+                 folder names, e.g. 300_000s_0_700AngsMin) and drop the others",
+            )
+            .changed()
+        {
+            logger::log(format!(
+                "smart selection {}",
+                if view.smart_selection { "on" } else { "off" }
+            ));
+            view.apply_smart_selection();
+        }
+        ui.label(
+            RichText::new(if view.smart_selection {
+                "on — open beam / dark current follow the sample's exposure time and wavelength"
+            } else {
+                "off — pick the open beam / dark current folders by hand"
+            })
+            .weak()
+            .size(11.0),
+        );
+    });
+    ui.add_space(6.0);
+
+    let sample_before: Vec<PathBuf> = view.sample.selected.iter().map(|(d, ..)| d.clone()).collect();
     let n_cols = if view.dc.is_some() { 3 } else { 2 };
     ui.columns(n_cols, |cols| {
         view.sample.ui(&mut cols[0]);
@@ -7319,6 +7490,10 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
             );
         }
     });
+    let sample_after: Vec<PathBuf> = view.sample.selected.iter().map(|(d, ..)| d.clone()).collect();
+    if sample_after != sample_before && view.smart_selection {
+        view.apply_smart_selection();
+    }
 
     ui.add_space(10.0);
     let mut clicked: Option<WbSection> = None;

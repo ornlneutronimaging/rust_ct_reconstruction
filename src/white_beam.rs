@@ -305,6 +305,59 @@ pub fn angles_from_ascii(path: &Path) -> Result<Vec<f64>, String> {
     Ok(angles)
 }
 
+/// The acquisition settings encoded in VENUS white beam folder and file
+/// names: `..._300_000s_0_700AngsMin...` is a 300.000 s exposure at a
+/// 0.700 Å minimum wavelength. Open beam and dark current folders taken
+/// with the same pair are the ones that go with a sample folder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcqSignature {
+    pub exposure_s: f64,
+    pub wavelength_a: f64,
+}
+
+impl AcqSignature {
+    /// Parse the `<int>_<frac>s` and `<int>_<frac>Angs[Min]` token pairs of
+    /// a folder or file name; `None` unless both are present.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let stem = name.rsplit('/').next().unwrap_or(name);
+        let stem = stem.strip_suffix(".tiff").or_else(|| stem.strip_suffix(".tif")).unwrap_or(stem);
+        let tokens: Vec<&str> = stem.split('_').collect();
+        let all_digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+        let value = |int: &str, frac: &str| -> Option<f64> {
+            all_digits(int).then(|| format!("{int}.{frac}").parse().ok()).flatten()
+        };
+        let mut exposure = None;
+        let mut wavelength = None;
+        for pair in tokens.windows(2) {
+            let (int, next) = (pair[0], pair[1]);
+            if let Some(frac) = next.strip_suffix("AngsMin").or_else(|| next.strip_suffix("Angs"))
+                && all_digits(frac)
+            {
+                wavelength = wavelength.or_else(|| value(int, frac));
+            } else if let Some(frac) = next.strip_suffix('s')
+                && all_digits(frac)
+            {
+                exposure = exposure.or_else(|| value(int, frac));
+            }
+        }
+        Some(Self {
+            exposure_s: exposure?,
+            wavelength_a: wavelength?,
+        })
+    }
+
+    /// Same exposure and wavelength (to the millisecond / milli-ångström
+    /// the names encode).
+    pub fn matches(&self, other: &Self) -> bool {
+        (self.exposure_s - other.exposure_s).abs() < 5e-4
+            && (self.wavelength_a - other.wavelength_a).abs() < 5e-4
+    }
+
+    pub fn label(&self) -> String {
+        format!("{:.3} s, {:.3} Å", self.exposure_s, self.wavelength_a)
+    }
+}
+
 /// Run numbers from a manual exclusion list like `1,2,5-10` →
 /// {1, 2, 5, 6, 7, 8, 9, 10}. Whitespace is ignored; an empty text is an
 /// empty set.
@@ -504,6 +557,29 @@ impl MetaAnglesScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquisition_signature_from_names() {
+        let sig = AcqSignature::from_name("20260608_Sample1_CT_300_000s_0_700AngsMin").unwrap();
+        assert_eq!(sig, AcqSignature { exposure_s: 300.0, wavelength_a: 0.7 });
+        // File names repeat the folder tokens, with extra fields after.
+        let file = AcqSignature::from_name(
+            "20260608_Run_22758_Sample1_CT_300_000s_0_700AngsMin_Ang_000_000_1.tiff",
+        )
+        .unwrap();
+        assert!(file.matches(&sig));
+        let other = AcqSignature::from_name("20260617_OB__180_000s_2_800AngsMin").unwrap();
+        assert_eq!(other, AcqSignature { exposure_s: 180.0, wavelength_a: 2.8 });
+        assert!(!other.matches(&sig));
+        let short = AcqSignature::from_name("20260407_NoSample_ang_path_10_000s_0_700AngsMin")
+            .unwrap();
+        assert_eq!(short.exposure_s, 10.0);
+        assert!(!short.matches(&sig));
+        // Both tokens are required.
+        assert!(AcqSignature::from_name("20260608_Sample1_CT_300_000s").is_none());
+        assert!(AcqSignature::from_name("plain_folder").is_none());
+        assert_eq!(sig.label(), "300.000 s, 0.700 Å");
+    }
 
     #[test]
     fn detector_roots() {
