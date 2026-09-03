@@ -1064,7 +1064,7 @@ fn recon_ui(
                     .add_enabled(
                         available && on_disk && !busy,
                         egui::Button::new(format!(
-                            "🧮 Evaluate the {} reconstruction",
+                            "🔍 Evaluate the {} reconstruction",
                             algo.label
                         )),
                     )
@@ -6457,7 +6457,7 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let busy = view.tilt_calc.is_some() || view.tilt_apply.is_some();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!busy, egui::Button::new("🧮 Calculate the tilt"))
+            .add_enabled(!busy, egui::Button::new("📐 Calculate the tilt"))
             .clicked()
         {
             logger::log(format!(
@@ -6751,7 +6751,7 @@ fn bm3d_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                 ui.label(
                     RichText::new(
                         "the tool opens with the projections already loaded — denoise, \
-                         then press \"⏎ Return data to main application\" there to send \
+                         then press \"↩ Return data to main application\" there to send \
                          the result back here",
                     )
                     .weak()
@@ -6953,7 +6953,7 @@ fn stripes_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         ui.add(egui::DragValue::new(&mut y1).speed(speed).range(1..=h - 1));
         let busy = view.stripe_test_job.is_some() || view.stripe_apply_job.is_some();
         if ui
-            .add_enabled(any_enabled && !busy, egui::Button::new("🧪 Test on this band"))
+            .add_enabled(any_enabled && !busy, egui::Button::new("🔬 Test on this band"))
             .clicked()
         {
             logger::log(format!(
@@ -7357,7 +7357,7 @@ fn cor_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         ui.horizontal(|ui| {
             let busy = view.cor_job.is_some();
             if ui
-                .add_enabled(!busy, egui::Button::new("🧮 Calculate the center of rotation"))
+                .add_enabled(!busy, egui::Button::new("🎯 Calculate the center of rotation"))
                 .clicked()
             {
                 logger::log(format!(
