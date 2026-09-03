@@ -7349,8 +7349,10 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         clicked = Some(WbSection::Exclude);
     }
     ui.add_space(4.0);
-    let open = egui::CollapsingHeader::new(RichText::new("Save to HDF5").strong())
-        .open(Some(view.open_section == Some(WbSection::Save)))
+    let open = egui::CollapsingHeader::new(
+        RichText::new("Preparing data for next step").strong(),
+    )
+    .open(Some(view.open_section == Some(WbSection::Save)))
         .show(ui, |ui| {
             wb_save_ui(ui, session, view);
         });
@@ -7526,7 +7528,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 _ => String::new(),
             };
             ui.label(format!(
-                "{} of {total} projections will be saved (exclusions and coverage applied), plus {} ob images{dc_note}",
+                "{} of {total} projections will be handed to pre-processing (exclusions and coverage applied), plus {} ob images{dc_note}",
                 runs.len(),
                 view.ob.total_files()
             ));
@@ -7535,52 +7537,80 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
 
     let busy = view.process.is_some() || view.pending_save.is_some();
     let saving = view.save_job.is_some();
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                selection.is_ok() && !busy && !saving,
-                egui::Button::new("💾 Save to HDF5…"),
-            )
-            .on_hover_text(
-                "read the selected projections and write them to an HDF5 file — \
-                 optional, the Next button continues to pre-processing without saving",
-            )
-            .on_disabled_hover_text(if saving || busy {
-                "wait for the current read / write to finish"
-            } else {
-                "complete the selection first"
-            })
-            .clicked()
-        {
-            let default_name = view
-                .sample
-                .selected
-                .first()
-                .and_then(|(dir, ..)| dir.file_name())
-                .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
-                .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
-            let mut dialog = rfd::FileDialog::new()
-                .set_title("Save the white beam projections")
-                .add_filter("HDF5", &["h5", "hdf5"])
-                .set_file_name(default_name);
-            let start = dialog_start([
-                Some(session.ipts.path.join("shared")),
-                Some(session.ipts.path.clone()),
-            ]);
-            if let Some(dir) = start {
-                dialog = dialog.set_directory(dir);
+    ui.label(
+        RichText::new(
+            "the projections are read into memory when you click Next (or save them below); \
+             saving to HDF5 is optional",
+        )
+        .weak(),
+    );
+
+    // Optional: write the stack to an HDF5 file (its own sub-section, closed
+    // by default — most users go straight to Next).
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new("Save to HDF5 (optional)")
+        .id_salt("wb_save_hdf5_subsection")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    selection.is_ok() && !busy && !saving,
+                    egui::Button::new("💾 Save to HDF5…"),
+                )
+                .on_hover_text(
+                    "read the selected projections and write them to an HDF5 file",
+                )
+                .on_disabled_hover_text(if saving || busy {
+                    "wait for the current read / write to finish"
+                } else {
+                    "complete the selection first"
+                })
+                .clicked()
+            {
+                let default_name = view
+                    .sample
+                    .selected
+                    .first()
+                    .and_then(|(dir, ..)| dir.file_name())
+                    .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
+                    .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Save the white beam projections")
+                    .add_filter("HDF5", &["h5", "hdf5"])
+                    .set_file_name(default_name);
+                let start = dialog_start([
+                    Some(session.ipts.path.join("shared")),
+                    Some(session.ipts.path.clone()),
+                ]);
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.save_file() {
+                    remember_pick(&path);
+                    view.save_status = None;
+                    view.pending_save = Some(path);
+                    ctx.request_repaint();
+                }
             }
-            if let Some(path) = dialog.save_file() {
-                remember_pick(&path);
-                view.save_status = None;
-                view.pending_save = Some(path);
-                ctx.request_repaint();
+            });
+            if saving {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("writing HDF5…");
+                });
             }
-        }
-        ui.label(
-            RichText::new("optional — Next continues to pre-processing without saving").weak(),
-        );
-    });
+            match &view.save_status {
+                Some(Ok(msg)) => {
+                    ui.colored_label(ok_text(ui), format!("saved: {msg}"));
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
+                }
+                None => {}
+            }
+        });
+    ui.add_space(4.0);
 
     if let Some(output) = &view.processed {
         let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
@@ -7633,21 +7663,6 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                     Some(combine::stack_from_output(output, &meta, path));
             }
         }
-        if saving {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("writing HDF5…");
-            });
-        }
-    }
-    match &view.save_status {
-        Some(Ok(msg)) => {
-            ui.colored_label(ok_text(ui), format!("saved: {msg}"));
-        }
-        Some(Err(e)) => {
-            ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
-        }
-        None => {}
     }
 }
 
