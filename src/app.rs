@@ -844,6 +844,7 @@ fn send_run_notifications(
     settings: &crate::notify::Settings,
     ctx: &crate::notify::RunContext,
     result: &Result<crate::recon_run::RunStats, String>,
+    output_tail: &str,
 ) -> Vec<Result<String, String>> {
     use crate::notify;
     let mut status = Vec::new();
@@ -853,7 +854,7 @@ fn send_run_notifications(
             notify::send_mail(
                 &to,
                 &notify::email_subject(ctx, result),
-                &notify::email_body(ctx, result),
+                &notify::email_body(ctx, result, output_tail),
             )
             .map(|()| format!("email sent to {to}"))
         } else {
@@ -1624,7 +1625,13 @@ fn recon_ui(
                             }
                         }
                         if let Some(ctx) = &view.run_context {
-                            view.notify_status = send_run_notifications(&view.notify, ctx, &result);
+                            let output = view
+                                .run_output
+                                .as_ref()
+                                .map(|o| o.lock().unwrap().clone())
+                                .unwrap_or_default();
+                            view.notify_status =
+                                send_run_notifications(&view.notify, ctx, &result, &output);
                         }
                         view.run_result = Some(result);
                         view.run_job = None;
@@ -1791,14 +1798,45 @@ fn recon_ui(
                 // The settings are "in use" now — persist them, and keep a
                 // copy of everything the end-of-run notifications report.
                 crate::notify::save_settings(&view.notify);
+                let split_note = match &split_cap {
+                    Some(SplitCap::Gpu { cap, gpus, gib }) => format!(
+                        "GPU memory model: at most {cap} slices per job on {gpus} x {gib:.0} GB"
+                    ),
+                    Some(SplitCap::Unchecked(cap)) => format!(
+                        "GPU memory check SKIPPED by the user: at most {cap} slices per job"
+                    ),
+                    Some(SplitCap::Fixed(cap)) => format!("fixed cap of {cap} slices per job"),
+                    Some(SplitCap::TooWide { .. }) => "too wide for the GPU memory model".to_owned(),
+                    None => "no split (one job)".to_owned(),
+                };
+                let angles: Vec<f64> = view
+                    .stack
+                    .sample
+                    .iter()
+                    .filter_map(|p| p.angle_deg)
+                    .collect();
+                let angle_range = angles
+                    .iter()
+                    .copied()
+                    .fold(None, |acc: Option<(f64, f64)>, a| match acc {
+                        None => Some((a, a)),
+                        Some((lo, hi)) => Some((lo.min(a), hi.max(a))),
+                    });
                 view.run_context = Some(crate::notify::RunContext {
                     algo_label: algo.label.to_owned(),
                     params_json: params_json.clone(),
                     slice_from: from,
                     slice_to: to,
                     n_jobs: jobs.len(),
+                    jobs: jobs.clone(),
+                    split_note,
                     checkpoint: view.path.clone(),
                     metadata: view.stack.metadata.clone(),
+                    n_projections: view.stack.sample.len(),
+                    width: width_px as usize,
+                    height: h,
+                    angle_range,
+                    machine: crate::notify::MachineInfo::probe(),
                 });
                 let job = crate::recon_run::RunJob::start(
                     std::sync::Arc::clone(&view.stack),

@@ -79,9 +79,94 @@ pub struct RunContext {
     pub slice_from: usize,
     pub slice_to: usize,
     pub n_jobs: usize,
+    /// The slice-range jobs: (first slice, one past the last slice).
+    pub jobs: Vec<(usize, usize)>,
+    /// How the per-job slice cap was decided (GPU memory model, fixed cap,
+    /// check skipped by the user, no split).
+    pub split_note: String,
     pub checkpoint: PathBuf,
     /// The checkpoint's provenance: every pre-processing step and parameter.
     pub metadata: Vec<(String, String)>,
+    /// The data handed to the reconstruction.
+    pub n_projections: usize,
+    pub width: usize,
+    pub height: usize,
+    /// Smallest and largest projection angle (deg), when known.
+    pub angle_range: Option<(f64, f64)>,
+    /// The analysis machine as probed when the run started.
+    pub machine: MachineInfo,
+}
+
+/// One GPU as reported by nvidia-smi.
+#[derive(Clone, Debug, Default)]
+pub struct GpuInfo {
+    pub name: String,
+    pub total_mib: u64,
+    pub used_mib: u64,
+}
+
+/// The analysis machine the reconstruction runs on — what to look at when
+/// a run fails with an out-of-memory error.
+#[derive(Clone, Debug, Default)]
+pub struct MachineInfo {
+    pub hostname: String,
+    /// Every GPU nvidia-smi lists (empty: no nvidia-smi or no GPU).
+    pub gpus: Vec<GpuInfo>,
+    /// `CUDA_VISIBLE_DEVICES`, when set — jax only sees those.
+    pub cuda_visible_devices: Option<String>,
+    pub cpus: usize,
+    pub mem_total_kib: u64,
+    pub mem_available_kib: u64,
+}
+
+impl MachineInfo {
+    /// Probe nvidia-smi, /proc/meminfo and the environment (a few ms).
+    pub fn probe() -> Self {
+        let gpus = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=name,memory.total,memory.used",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.split(',').map(str::trim);
+                        let name = parts.next()?.to_owned();
+                        let total_mib = parts.next()?.parse().ok()?;
+                        let used_mib = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        Some(GpuInfo {
+                            name,
+                            total_mib,
+                            used_mib,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let mem_kib = |key: &str| -> u64 {
+            meminfo
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        Self {
+            hostname: hostname(),
+            gpus,
+            cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+            cpus: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
+            mem_total_kib: mem_kib("MemTotal:"),
+            mem_available_kib: mem_kib("MemAvailable:"),
+        }
+    }
 }
 
 /// ASCII only: a non-ASCII subject (an em dash, say) must be RFC
@@ -97,7 +182,13 @@ pub fn email_subject(ctx: &RunContext, result: &Result<RunStats, String>) -> Str
     }
 }
 
-pub fn email_body(ctx: &RunContext, result: &Result<RunStats, String>) -> String {
+/// The message body. `output_tail` is what the reconstruction process
+/// printed (stdout + stderr); its last lines are quoted when the run failed.
+pub fn email_body(
+    ctx: &RunContext,
+    result: &Result<RunStats, String>,
+    output_tail: &str,
+) -> String {
     let mut b = String::new();
     match result {
         Ok(stats) => {
@@ -143,9 +234,108 @@ pub fn email_body(ctx: &RunContext, result: &Result<RunStats, String>) -> String
                 ctx.slice_from, ctx.slice_to
             ));
             b.push_str(&format!("Error:          {e}\n"));
+            const TAIL_LINES: usize = 40;
+            let lines: Vec<&str> = output_tail.trim().lines().collect();
+            if !lines.is_empty() {
+                let skipped = lines.len().saturating_sub(TAIL_LINES);
+                b.push_str(&format!(
+                    "\nLast {} lines printed by the reconstruction{}:\n",
+                    lines.len().min(TAIL_LINES),
+                    if skipped > 0 {
+                        format!(" ({skipped} earlier lines not shown)")
+                    } else {
+                        String::new()
+                    }
+                ));
+                for line in &lines[skipped..] {
+                    b.push_str(&format!("  | {line}\n"));
+                }
+            }
         }
     }
     b.push_str(&format!("\nCheckpoint file: {}\n", ctx.checkpoint.display()));
+
+    // The data and how it was cut into jobs — the numbers that decide
+    // whether a job fits in memory.
+    let px = ctx.width * ctx.height;
+    b.push_str("\nData handed to the reconstruction:\n");
+    b.push_str(&format!(
+        "  Projections:        {}{}\n",
+        ctx.n_projections,
+        match ctx.angle_range {
+            Some((lo, hi)) => format!(" (angles {lo:.3} to {hi:.3} deg)"),
+            None => String::new(),
+        }
+    ));
+    b.push_str(&format!(
+        "  Image size:         {} x {} px (width x height), {} per image (float32)\n",
+        ctx.width,
+        ctx.height,
+        format_bytes(px as u64 * 4)
+    ));
+    b.push_str(&format!(
+        "  Whole stack:        {} in memory\n",
+        format_bytes((ctx.n_projections * px) as u64 * 4)
+    ));
+    b.push_str(&format!(
+        "  Slices requested:   {} to {} ({} slices)\n",
+        ctx.slice_from,
+        ctx.slice_to,
+        ctx.slice_to.saturating_sub(ctx.slice_from) + 1
+    ));
+    b.push_str(&format!("  Job split:          {}\n", ctx.split_note));
+    if !ctx.jobs.is_empty() {
+        let largest = ctx
+            .jobs
+            .iter()
+            .map(|(a, z)| z.saturating_sub(*a))
+            .max()
+            .unwrap_or(0);
+        b.push_str(&format!(
+            "  Jobs:               {} — largest {largest} slices, i.e. a {} x {largest} x {} \
+             sinogram block of {}\n",
+            ctx.jobs.len(),
+            ctx.n_projections,
+            ctx.width,
+            format_bytes((ctx.n_projections * largest * ctx.width) as u64 * 4)
+        ));
+        for (i, (a, z)) in ctx.jobs.iter().enumerate() {
+            b.push_str(&format!(
+                "    job {}: slices {a} to {} ({} slices)\n",
+                i + 1,
+                z.saturating_sub(1),
+                z.saturating_sub(*a)
+            ));
+        }
+    }
+
+    let m = &ctx.machine;
+    b.push_str(&format!("\nMachine ({}):\n", m.hostname));
+    if m.gpus.is_empty() {
+        b.push_str("  GPUs:               none found (nvidia-smi unavailable or no GPU)\n");
+    } else {
+        b.push_str(&format!("  GPUs:               {}\n", m.gpus.len()));
+        for (i, g) in m.gpus.iter().enumerate() {
+            b.push_str(&format!(
+                "    GPU {i}: {} — {:.1} GB total, {:.1} GB in use when the run started\n",
+                g.name,
+                g.total_mib as f64 / 1024.0,
+                g.used_mib as f64 / 1024.0
+            ));
+        }
+    }
+    b.push_str(&format!(
+        "  CUDA_VISIBLE_DEVICES: {}\n",
+        m.cuda_visible_devices
+            .as_deref()
+            .unwrap_or("not set (all GPUs visible)")
+    ));
+    b.push_str(&format!("  CPUs:               {}\n", m.cpus));
+    b.push_str(&format!(
+        "  RAM:                {:.0} GB total, {:.0} GB available when the run started\n",
+        m.mem_total_kib as f64 / 1024.0 / 1024.0,
+        m.mem_available_kib as f64 / 1024.0 / 1024.0
+    ));
 
     b.push_str(&format!("\nParameters used ({}):\n", ctx.algo_label));
     match serde_json::from_str::<serde_json::Value>(&ctx.params_json) {
@@ -271,8 +461,15 @@ mod tests {
             slice_from: 120,
             slice_to: 480,
             n_jobs: 3,
+            jobs: vec![(120, 250), (240, 370), (360, 481)],
+            split_note: "fixed cap of 50 slices per job".to_owned(),
             checkpoint: PathBuf::from("/SNS/VENUS/IPTS-1/shared/sample_step_reconstruction.h5"),
             metadata: vec![("normalization".to_owned(), "ob + pc".to_owned())],
+            n_projections: 361,
+            width: 2048,
+            height: 512,
+            angle_range: None,
+            machine: MachineInfo::default(),
         }
     }
 
@@ -317,7 +514,7 @@ mod tests {
 
     #[test]
     fn email_body_covers_stats_params_and_provenance() {
-        let body = email_body(&context(), &Ok(stats()));
+        let body = email_body(&context(), &Ok(stats()), "");
         for needle in [
             "1h 2m 5s",
             "/SNS/VENUS/IPTS-1/shared/recon",
@@ -328,7 +525,7 @@ mod tests {
         ] {
             assert!(body.contains(needle), "missing {needle:?} in:\n{body}");
         }
-        let failed = email_body(&context(), &Err("out of memory".to_owned()));
+        let failed = email_body(&context(), &Err("out of memory".to_owned()), "");
         assert!(failed.contains("FAILED"));
         assert!(failed.contains("out of memory"));
     }
@@ -353,4 +550,75 @@ mod tests {
         assert_eq!(read_settings(&file).email, "");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn sample_context() -> RunContext {
+        RunContext {
+            algo_label: "mbirjax".to_owned(),
+            params_json: r#"{"sharpness": 0.0}"#.to_owned(),
+            slice_from: 0,
+            slice_to: 1023,
+            n_jobs: 3,
+            jobs: vec![(0, 350), (340, 690), (680, 1024)],
+            split_note: "GPU memory check SKIPPED by the user: at most 500 slices per job"
+                .to_owned(),
+            checkpoint: PathBuf::from("/tmp/ct_step_pre_processing.h5"),
+            metadata: vec![("rebin".to_owned(), "2x2 (block mean), 4096x2048 -> 2048x1024".to_owned())],
+            n_projections: 500,
+            width: 2048,
+            height: 1024,
+            angle_range: Some((0.0, 359.5)),
+            machine: MachineInfo {
+                hostname: "bl10-analysis1".to_owned(),
+                gpus: vec![
+                    GpuInfo { name: "NVIDIA A100-PCIE-40GB".to_owned(), total_mib: 40960, used_mib: 1049 },
+                    GpuInfo { name: "NVIDIA A100-PCIE-40GB".to_owned(), total_mib: 40960, used_mib: 1 },
+                ],
+                cuda_visible_devices: None,
+                cpus: 112,
+                mem_total_kib: 1_583_385_848,
+                mem_available_kib: 1_033_412_740,
+            },
+        }
+    }
+
+    #[test]
+    fn failure_email_carries_the_diagnostics() {
+        let ctx = sample_context();
+        let output: String = (1..=50).map(|i| format!("line {i}\n")).collect::<String>()
+            + "jaxlib.xla_extension.XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory\n";
+        let body = email_body(&ctx, &Err("reconstruction failed (exit status: 1)".to_owned()), &output);
+        println!("{body}");
+        for needle in [
+            "Projections:        500 (angles 0.000 to 359.500 deg)",
+            "Image size:         2048 x 1024 px",
+            "Whole stack:        4.19 GB in memory",
+            "GPU memory check SKIPPED",
+            "Jobs:               3 — largest 350 slices",
+            "job 1: slices 0 to 349 (350 slices)",
+            "GPUs:               2",
+            "GPU 0: NVIDIA A100-PCIE-40GB — 40.0 GB total, 1.0 GB in use",
+            "CUDA_VISIBLE_DEVICES: not set",
+            "CPUs:               112",
+            "RAM:                1510 GB total, 986 GB available",
+            "Last 40 lines printed by the reconstruction (11 earlier lines not shown)",
+            "RESOURCE_EXHAUSTED: Out of memory",
+            "rebin: 2x2 (block mean)",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in:\n{body}");
+        }
+        assert!(!body.contains("| line 11\n"), "line 11 should be cut off");
+        assert!(body.contains("| line 12\n"));
+        // A success email carries the same data / machine sections, no tail.
+        let ok = email_body(&ctx, &Ok(RunStats {
+            output_folder: PathBuf::from("/tmp/out"),
+            n_files: 1024,
+            file_bytes: (1, 2),
+            total_bytes: 3,
+            total_seconds: 61.0,
+            job_times: vec![],
+        }), &output);
+        assert!(ok.contains("Machine (bl10-analysis1)"));
+        assert!(!ok.contains("lines printed by the reconstruction"));
+    }
 }
+
