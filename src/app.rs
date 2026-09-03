@@ -2052,7 +2052,7 @@ enum StackSection {
     Rotate,
     TiltCor,
     Log,
-    /// Last: n×n rebin of the normalized projections, for mbirjax.
+    /// Last: n×n rebin of the normalized projections.
     Rebin,
 }
 
@@ -2224,8 +2224,9 @@ struct StackView {
     crop_job: Option<CropJob>,
     crop_error: Option<String>,
 
-    // Rebin (n×n block mean) of the normalized projections — the last step,
-    // only there for mbirjax, which cannot fit full-frame data on the GPUs.
+    // Rebin (n×n block mean) of the normalized projections — the last step:
+    // smaller, faster reconstructions (and the only way full-frame data fits
+    // the GPUs for mbirjax).
     /// The factor applied to the current stack (restored from a loaded
     /// checkpoint's metadata too).
     rebin: Option<usize>,
@@ -5033,7 +5034,7 @@ fn stack_ui(
             ui,
             view,
             StackSection::Rebin,
-            "Rebin (mbirjax only)",
+            "Rebin (optional)",
             run_status(view.rebin.is_some()),
             &mut |ui, view| {
                 rebin_section_ui(ui, view);
@@ -7490,8 +7491,10 @@ fn tilt_tool_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
 /// handed over, and the returned region is applied to the sample AND the
 /// open beams.
 /// Rebin: n×n blocks of pixels averaged into one, on the normalized (and
-/// log-converted, tilt-corrected) sample projections. The last step, only
-/// there for mbirjax, whose GPU memory use grows with the projection width.
+/// log-converted, tilt-corrected) sample projections. The last step: a
+/// smaller volume reconstructs faster with every algorithm, and for mbirjax
+/// (whose GPU memory use grows with the projection width) it is the only
+/// way full-frame data fits.
 fn rebin_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     let ctx = ui.ctx().clone();
     if let Some(job) = &mut view.rebin_job {
@@ -7544,13 +7547,12 @@ fn rebin_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
     }
     ui.label(
         RichText::new(
-            "only for mbirjax: it runs on the GPU and its memory use grows with the width of \
-             the projections, so full-frame (4096 px wide) stacks do not fit, however few \
-             slices are reconstructed at a time. Rebinning averages every n×n block of \
-             pixels into one — n times narrower and shorter images, n² better statistics per \
-             pixel, n times coarser resolution. Run it last, on the normalized (and \
+            "rebinning averages every n×n block of pixels into one — n times narrower and \
+             shorter images, n² better statistics per pixel, n times coarser resolution, and \
+             a much smaller and faster reconstruction. Run it last, on the normalized (and \
              log-converted) projections; the center of rotation is rescaled with them. \
-             Skip it for the other algorithms.",
+             mbirjax in particular runs on the GPU and its memory use grows with the width \
+             of the projections: full-frame (4096 px wide) stacks do not fit without it.",
         )
         .weak(),
     );

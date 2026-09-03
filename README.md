@@ -90,12 +90,12 @@ never reused: a second export goes to `<step>_2/`, then `<step>_3/`, ….
 
 ## Rebin
 
-The **Rebin (mbirjax only)** section, last on the pre-processing screen,
+The **Rebin (optional)** section, last on the pre-processing screen,
 averages every n×n block of pixels (2×2 … 8×8) into one on the normalized
-(and log-converted) projections. The mbirjax reconstruction runs on the GPU
-and its memory use grows with the projection width: full-frame (4096 px
-wide) stacks do not fit, however few slices are reconstructed at a time —
-the other algorithms do not need the step. The factor is recorded in the
+(and log-converted) projections: a smaller, faster reconstruction with every
+algorithm. For mbirjax, which runs on the GPU with a memory use growing with
+the projection width, it is also the only way full-frame (4096 px wide)
+stacks fit, however few slices are reconstructed at a time. The factor is recorded in the
 checkpoint metadata (`rebin`), the center of rotation is rescaled with the
 pixels, and the step can be undone or re-run with another factor (always
 from the un-rebinned data) as long as no later step was applied on the
