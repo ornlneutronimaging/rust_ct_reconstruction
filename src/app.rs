@@ -2113,6 +2113,10 @@ struct StackView {
     /// Side-by-side before/after cleaning session in the TIFF viewer.
     clean_compare_job: Option<CompareJob>,
     clean_compare_error: Option<String>,
+    /// rust_tiff_viewer on the sample or OB images as they are now — to
+    /// decide whether the outlier removal is needed at all.
+    clean_view_job: Option<VisualizeJob>,
+    clean_view_error: Option<String>,
 
     // Ring artifact removal (bm3dornl tool).
     bm3d_job: Option<crate::bm3dornl::Bm3dJob>,
@@ -2229,14 +2233,89 @@ struct StackView {
     /// Path of the last pre-processing checkpoint save, handed to the
     /// reconstruction screen as the real checkpoint path.
     stack_saved_path: Option<PathBuf>,
-    /// Set by the "evaluate the reconstruction" button; the main loop picks
-    /// it up and switches screens.
+    /// What the last checkpoint save wrote: the stack (by identity) and the
+    /// center of rotation — to notice when the checkpoint on disk went
+    /// stale and Next has to write it again.
+    stack_saved_from: Option<(usize, Option<f64>)>,
+    /// Next was clicked without a current checkpoint on disk: one is being
+    /// written to the default location, continue when it lands.
+    auto_continue_recon: bool,
+    /// Set by the Next button once the checkpoint is on disk; the main
+    /// loop picks it up and switches screens.
     goto_recon: bool,
 }
 
 impl StackView {
     fn new(stack: LoadedStack) -> Self {
         Self::from_arc(std::sync::Arc::new(stack))
+    }
+
+    /// Identity of what a checkpoint save would write right now.
+    fn checkpoint_key(&self) -> (usize, Option<f64>) {
+        (
+            std::sync::Arc::as_ptr(&self.stack) as usize,
+            self.cor_result,
+        )
+    }
+
+    /// `true` when the checkpoint on disk holds the stack as it is now (the
+    /// last save succeeded and nothing changed since).
+    fn checkpoint_current(&self) -> bool {
+        matches!(self.stack_save_status, Some(Ok(_)))
+            && self.stack_saved_from == Some(self.checkpoint_key())
+    }
+
+    /// Where Next writes the checkpoint when the user did not save it
+    /// elsewhere: `<name>_step_pre_processing.h5` next to the loaded file
+    /// (or in the experiment's shared folder), never overwriting a file
+    /// that is already there.
+    fn default_checkpoint_path(&self) -> PathBuf {
+        let dir = dialog_start([
+            self.stack.path.parent().map(Path::to_path_buf),
+            ipts_shared_folder(&self.stack),
+        ])
+        .or_else(|| self.stack.path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+        let base = self
+            .stack
+            .path
+            .file_stem()
+            .map(|n| {
+                n.to_string_lossy()
+                    .trim_end_matches("_preprocessed")
+                    // The load tab's unsaved stacks carry a pseudo path.
+                    .trim_end_matches(" (not saved)")
+                    .to_owned()
+            })
+            .unwrap_or_else(|| "ct".to_owned());
+        let name = step_file_name(&base, "pre_processing");
+        let candidate = dir.join(&name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        let stem = name.trim_end_matches(".h5").to_owned();
+        (2..)
+            .map(|n| dir.join(format!("{stem}_{n}.h5")))
+            .find(|p| !p.exists())
+            .unwrap_or(candidate)
+    }
+
+    /// Kick off writing the pre-processing checkpoint to `path`.
+    fn start_checkpoint_save(&mut self, path: PathBuf) {
+        logger::log(format!(
+            "saving the pre-processing checkpoint to {} (cor: {:?})",
+            path.display(),
+            self.cor_result
+        ));
+        self.stack_save_status = None;
+        self.stack_saved_path = Some(path.clone());
+        self.stack_saved_from = Some(self.checkpoint_key());
+        self.stack_save_job = Some(StackSaveJob::start(
+            path,
+            std::sync::Arc::clone(&self.stack),
+            self.cor_result,
+            Vec::new(),
+        ));
     }
 
     fn from_arc(stack: std::sync::Arc<LoadedStack>) -> Self {
@@ -2253,6 +2332,8 @@ impl StackView {
             uncleaned: None,
             clean_compare_job: None,
             clean_compare_error: None,
+            clean_view_job: None,
+            clean_view_error: None,
             bm3d_job: None,
             bm3d_summary: None,
             bm3d_error: None,
@@ -2317,6 +2398,8 @@ impl StackView {
             stack_save_job: None,
             stack_save_status: None,
             stack_saved_path: None,
+            stack_saved_from: None,
+            auto_continue_recon: false,
             goto_recon: false,
         };
 
@@ -2449,6 +2532,9 @@ enum WbSection {
     Angles,
     DataToUse,
     Exclude,
+    /// "Save to HDF5 (optional)".
+    SaveHdf5,
+    /// "Preparing data for next step" — the hand-over to pre-processing.
     Save,
 }
 
@@ -2464,9 +2550,11 @@ struct WhiteBeamView {
     /// Dark-current picker, on the instruments that record one (MARS).
     /// Selecting folders is optional even there.
     dc: Option<MultiFolderPick>,
-    /// "Smart selection": whenever the sample folders change, pick the open
+    /// "Smart selection": whenever the sample folders change, only the open
     /// beam and dark current folders acquired with the same exposure time
-    /// and wavelength (per the folder naming convention) and drop the rest.
+    /// and wavelength (per the folder naming convention) stay selectable;
+    /// the others are disabled and dropped from the selection. Nothing is
+    /// selected automatically — the user picks among the matching ones.
     smart_selection: bool,
 
     // Projection angle retrieval.
@@ -2600,14 +2688,15 @@ impl WhiteBeamView {
         };
         let mut report = Vec::new();
         for pick in std::iter::once(&mut self.ob).chain(self.dc.iter_mut()) {
-            let (selected, removed) = pick.apply_smart(&signature);
+            let (matching, removed) = pick.apply_smart(&signature);
             report.push(format!(
-                "{} {} folder(s) selected, {removed} removed",
-                selected, pick.kind
+                "{matching} matching {} folder(s) selectable, {removed} with other settings \
+                 deselected",
+                pick.kind
             ));
         }
         logger::log(format!(
-            "smart selection ({}): {}",
+            "smart selection ({}): {} — pick the open beam / dark current by hand",
             signature.label(),
             report.join("; ")
         ));
@@ -2963,7 +3052,7 @@ struct MultiFolderPick {
     error: Option<String>,
     /// Smart selection in force: the sample's exposure / wavelength this
     /// picker is aligned with. Candidates with a different signature are
-    /// dimmed in the list.
+    /// disabled in the list.
     smart_filter: Option<AcqSignature>,
 }
 
@@ -3055,10 +3144,10 @@ impl MultiFolderPick {
             .and_then(|p| AcqSignature::from_name(&p.file_name()?.to_string_lossy()))
     }
 
-    /// Select every candidate folder whose name carries `signature`, and
-    /// drop the selected folders and files that carry a different one
-    /// (names without a signature are left alone). Returns how many
-    /// folders ended up selected and how many folders / files were dropped.
+    /// Drop the selected folders and files whose names carry a different
+    /// signature than `signature` (names without one are left alone);
+    /// nothing gets selected automatically. Returns how many candidate
+    /// folders match and how many folders / files were dropped.
     fn apply_smart(&mut self, signature: &AcqSignature) -> (usize, usize) {
         let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
         let mut removed = 0usize;
@@ -3087,25 +3176,20 @@ impl MultiFolderPick {
             keep
         });
         removed += before - self.files.len();
-        let wanted: Vec<PathBuf> = self
+        let matching = self
             .candidates
             .as_ref()
             .map(|dirs| {
                 dirs.iter()
                     .filter(|(_, dir)| {
-                        !self.is_selected(dir)
-                            && name_of(dir)
-                                .and_then(|n| AcqSignature::from_name(&n))
-                                .is_some_and(|s| s.matches(signature))
+                        name_of(dir)
+                            .and_then(|n| AcqSignature::from_name(&n))
+                            .is_some_and(|s| s.matches(signature))
                     })
-                    .map(|(_, dir)| dir.clone())
-                    .collect()
+                    .count()
             })
-            .unwrap_or_default();
-        for dir in wanted {
-            self.toggle(dir);
-        }
-        (self.selected.len(), removed)
+            .unwrap_or(0);
+        (matching, removed)
     }
 
     fn total_files(&self) -> usize {
@@ -3193,9 +3277,12 @@ impl MultiFolderPick {
         }
         if let Some(sig) = &self.smart_filter {
             ui.label(
-                RichText::new(format!("smart selection: folders acquired at {}", sig.label()))
-                    .size(11.0)
-                    .color(ok_text(ui)),
+                RichText::new(format!(
+                    "smart selection: only folders acquired at {} can be picked",
+                    sig.label()
+                ))
+                .size(11.0)
+                .color(ok_text(ui)),
             );
         }
         ui.add_space(4.0);
@@ -3217,22 +3304,27 @@ impl MultiFolderPick {
                         for (label, dir) in dirs {
                             let mut checked = self.is_selected(dir);
                             // Under smart selection, folders taken with
-                            // another exposure / wavelength are dimmed.
+                            // another exposure / wavelength are disabled;
+                            // the matching ones are left for the user to pick.
                             let mismatch = self.smart_filter.as_ref().and_then(|sig| {
                                 AcqSignature::from_name(label)
                                     .filter(|s| !s.matches(sig))
                                     .map(|s| s.label())
                             });
-                            let text = match &mismatch {
-                                Some(_) => RichText::new(label).weak(),
-                                None => RichText::new(label),
+                            let response = match &mismatch {
+                                Some(other) => ui
+                                    .add_enabled(
+                                        false,
+                                        egui::Checkbox::new(
+                                            &mut checked,
+                                            RichText::new(label).weak(),
+                                        ),
+                                    )
+                                    .on_disabled_hover_text(format!(
+                                        "acquired at {other} — not the sample's settings"
+                                    )),
+                                None => ui.checkbox(&mut checked, label),
                             };
-                            let mut response = ui.checkbox(&mut checked, text);
-                            if let Some(other) = mismatch {
-                                response = response.on_hover_text(format!(
-                                    "acquired at {other} — not the sample's settings"
-                                ));
-                            }
                             if response.changed() {
                                 toggled = Some(dir.clone());
                             }
@@ -4789,40 +4881,54 @@ fn stack_ui(
             Some(which)
         };
     }
-    // Checkpoint: save the pre-processed stack so a later session can load
-    // it and start directly at the reconstruction step.
-    if view.normalized {
-        ui.separator();
-        if let Some(job) = &mut view.stack_save_job {
-            match job.poll() {
-                Some(Ok(msg)) => {
-                    logger::log(format!("pre-processing checkpoint saved: {msg}"));
-                    if let Some(path) = &view.stack_saved_path {
-                        crate::recent::record_saved(path);
-                    }
-                    view.stack_save_status = Some(Ok(msg));
-                    view.stack_save_job = None;
+    // Preparing data for the next step: the reconstruction runs as separate
+    // programs that read the pre-processed stack from an HDF5 checkpoint, so
+    // the stack has to be on disk. Next writes it automatically when the
+    // user did not; saving by hand only chooses the file.
+    if let Some(job) = &mut view.stack_save_job {
+        match job.poll() {
+            Some(Ok(msg)) => {
+                logger::log(format!("pre-processing checkpoint saved: {msg}"));
+                if let Some(path) = &view.stack_saved_path {
+                    crate::recent::record_saved(path);
                 }
-                Some(Err(e)) => {
-                    logger::error(format!("saving the checkpoint failed: {e}"));
-                    view.stack_save_status = Some(Err(e));
-                    view.stack_save_job = None;
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("writing the checkpoint HDF5…");
-                    });
-                    ui.ctx().request_repaint_after(Duration::from_millis(300));
+                view.stack_save_status = Some(Ok(msg));
+                view.stack_save_job = None;
+                if view.auto_continue_recon {
+                    view.auto_continue_recon = false;
+                    view.goto_recon = true;
                 }
             }
+            Some(Err(e)) => {
+                logger::error(format!("saving the checkpoint failed: {e}"));
+                view.stack_save_status = Some(Err(e));
+                view.stack_save_job = None;
+                view.auto_continue_recon = false;
+            }
+            None => ui.ctx().request_repaint_after(Duration::from_millis(300)),
         }
-        let savable = view.log_converted;
-        if !savable {
+    }
+    let savable = view.normalized && view.log_converted;
+    let saving = view.stack_save_job.is_some();
+    let default_target = view.default_checkpoint_path();
+    if view.normalized {
+        ui.separator();
+        ui.label(RichText::new("Preparing data for next step").strong());
+        ui.label(
+            RichText::new(
+                "the reconstruction runs as separate programs (svmbir, mbirjax, …) that read \
+                 the pre-processed stack from an HDF5 file, so the stack has to be on disk \
+                 before continuing. The Next button (bottom right) writes that checkpoint for \
+                 you and continues; saving below is optional and only lets you choose the \
+                 file name and location. A checkpoint reopens later from the setup screen, \
+                 straight at the reconstruction.",
+            )
+            .weak(),
+        );
+        if !view.log_converted {
             ui.label(
                 RichText::new(
-                    "the log conversion (last section) is mandatory before saving or \
-                     evaluating the reconstruction",
+                    "the log conversion (last section) is mandatory before continuing",
                 )
                 .color(warn_text(ui)),
             );
@@ -4830,76 +4936,60 @@ fn stack_ui(
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    savable && view.stack_save_job.is_none(),
-                    egui::Button::new("💾 Save the pre-processed stack…"),
+                    savable && !saving && !view.auto_continue_recon,
+                    egui::Button::new("💾 Save the pre-processed stack… (optional)"),
                 )
                 .on_hover_text(
-                    "writes an HDF5 checkpoint (with the whole provenance, including the \
-                     center of rotation) that can be loaded later from the setup screen to \
-                     start directly at the reconstruction step",
+                    "choose where the HDF5 checkpoint (with the whole provenance, including \
+                     the center of rotation) is written; without this, Next writes it to the \
+                     default location",
                 )
                 .clicked()
             {
-                let default_name = view
-                    .stack
-                    .path
-                    .file_stem()
-                    .map(|n| {
-                        step_file_name(
-                            n.to_string_lossy().trim_end_matches("_preprocessed"),
-                            "pre_processing",
-                        )
-                    })
-                    .unwrap_or_else(|| "ct_step_pre_processing.h5".to_owned());
                 let mut dialog = rfd::FileDialog::new()
                     .set_title("Save the pre-processed stack")
                     .add_filter("HDF5", &["h5", "hdf5"])
-                    .set_file_name(default_name);
-                let start = dialog_start([
-                    view.stack.path.parent().map(Path::to_path_buf),
-                    ipts_shared_folder(&view.stack),
-                ]);
-                if let Some(dir) = start {
+                    .set_file_name(
+                        default_target
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "ct_step_pre_processing.h5".to_owned()),
+                    );
+                if let Some(dir) = default_target.parent() {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.save_file() {
                     remember_pick(&path);
-                    logger::log(format!(
-                        "saving the pre-processing checkpoint to {} (cor: {:?})",
-                        path.display(),
-                        view.cor_result
-                    ));
-                    view.stack_save_status = None;
-                    view.stack_saved_path = Some(path.clone());
-                    view.stack_save_job = Some(StackSaveJob::start(
-                        path,
-                        std::sync::Arc::clone(&view.stack),
-                        view.cor_result,
-                        Vec::new(),
-                    ));
+                    view.start_checkpoint_save(path);
                 }
             }
-            if ui
-                .add_enabled(
-                    matches!(view.stack_save_status, Some(Ok(_))),
-                    egui::Button::new("🚀 Reconstruction"),
-                )
-                .on_hover_text("continue to the reconstruction of the saved checkpoint")
-                .on_disabled_hover_text("save the pre-processed stack to HDF5 first")
-                .clicked()
-            {
-                view.goto_recon = true;
+            if !view.checkpoint_current() && !saving {
+                ui.label(
+                    RichText::new(format!("Next will write {}", default_target.display()))
+                        .weak()
+                        .size(11.0),
+                );
             }
-            ui.label(
-                RichText::new("loading a saved checkpoint later starts directly at the \
-                               reconstruction")
-                    .weak()
-                    .size(11.0),
-            );
         });
+        if saving {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if view.auto_continue_recon {
+                    "writing the checkpoint HDF5, then continuing to the reconstruction…"
+                } else {
+                    "writing the checkpoint HDF5…"
+                });
+            });
+        }
         match &view.stack_save_status {
             Some(Ok(msg)) => {
                 ui.colored_label(ok_text(ui), format!("saved: {msg}"));
+                if !view.checkpoint_current() && !saving {
+                    ui.colored_label(
+                        warn_text(ui),
+                        "the data changed since that save — Next writes a fresh checkpoint",
+                    );
+                }
             }
             Some(Err(e)) => {
                 ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
@@ -4908,21 +4998,35 @@ fn stack_ui(
         }
     }
     ui.add_space(24.0);
-    // The same bottom-right `Next` pill as the earlier screens, enabled once
-    // the pre-processed checkpoint was saved; it continues to the
-    // reconstruction exactly like the `🚀 Reconstruction` button.
-    let ready = matches!(view.stack_save_status, Some(Ok(_)));
+    // The same bottom-right `Next` pill as the earlier screens: available
+    // once the stack is normalized and log-converted. It writes the
+    // checkpoint to the default location when there is no current one, then
+    // continues to the reconstruction.
+    let ready = savable && !saving && !view.auto_continue_recon;
+    let hint = if !view.normalized {
+        "normalize the data first".to_owned()
+    } else if !view.log_converted {
+        "run the log conversion first (last section)".to_owned()
+    } else if saving {
+        "writing the checkpoint…".to_owned()
+    } else if view.checkpoint_current() {
+        "continue to the reconstruction of the saved checkpoint".to_owned()
+    } else {
+        format!(
+            "write the checkpoint to {} and continue to the reconstruction",
+            default_target.display()
+        )
+    };
     egui::Area::new(egui::Id::new("stack_next_button"))
         .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
         .show(ui.ctx(), |ui| {
-            let response = next_button_widget(ui, ready);
-            let response = if ready {
-                response.on_hover_text("continue to the reconstruction of the saved checkpoint")
-            } else {
-                response.on_hover_text("save the pre-processed stack to HDF5 first")
-            };
-            if response.clicked() {
-                view.goto_recon = true;
+            if next_button_widget(ui, ready).on_hover_text(hint).clicked() {
+                if view.checkpoint_current() {
+                    view.goto_recon = true;
+                } else {
+                    view.auto_continue_recon = true;
+                    view.start_checkpoint_save(default_target.clone());
+                }
             }
         });
     nav
@@ -5066,6 +5170,73 @@ fn clean_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
             return;
         }
     }
+
+    // Is the cleaning needed at all? Look at the images as they are now.
+    if let Some(job) = &mut view.clean_view_job {
+        match job.poll() {
+            Some(Ok(())) => {
+                logger::log("TIFF viewer closed");
+                view.clean_view_job = None;
+            }
+            Some(Err(e)) => {
+                logger::error(format!("viewing the images failed: {e}"));
+                view.clean_view_error = Some(e);
+                view.clean_view_job = None;
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("TIFF viewer is open");
+                });
+                ctx.request_repaint_after(Duration::from_millis(300));
+            }
+        }
+    }
+    if view.clean_view_job.is_none() {
+        let mut launch: Option<bool> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("not sure the outlier removal is needed? look at the images first:")
+                    .weak(),
+            );
+            if ui
+                .button("👁 View the sample images")
+                .on_hover_text(
+                    "opens the sample projections as they are now in rust_tiff_viewer \
+                     (single-image view) — look for hot pixels, dead pixels and streaks",
+                )
+                .clicked()
+            {
+                launch = Some(false);
+            }
+            if !view.stack.ob.is_empty()
+                && ui
+                    .button("👁 View the OB images")
+                    .on_hover_text(
+                        "opens the open beam images as they are now in rust_tiff_viewer \
+                         (single-image view)",
+                    )
+                    .clicked()
+            {
+                launch = Some(true);
+            }
+        });
+        if let Some(use_ob) = launch {
+            logger::log(format!(
+                "opening the TIFF viewer on the {} images (before outlier removal)",
+                if use_ob { "OB" } else { "sample" }
+            ));
+            view.clean_view_error = None;
+            view.clean_view_job = Some(VisualizeJob::start_part(
+                std::sync::Arc::clone(&view.stack),
+                use_ob,
+            ));
+        }
+    }
+    if let Some(e) = &view.clean_view_error {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+    ui.add_space(6.0);
 
     let settings = &mut view.clean_settings;
     ui.checkbox(&mut settings.in_house, "In-house (histogram)");
@@ -7412,6 +7583,8 @@ fn orientation_combo(
 }
 
 fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
+    // Background work first, whichever sections are open.
+    wb_tick(ui.ctx(), session, view);
     // Detector — it decides where the sample and OB folders are looked for,
     // so changing it rebuilds the pickers. MARS has a single camera layout,
     // so the selector only appears on VENUS.
@@ -7452,9 +7625,10 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         if ui
             .toggle_value(&mut view.smart_selection, "✨ Smart selection")
             .on_hover_text(
-                "when a sample folder is picked, select the open beam and dark current \
+                "when a sample folder is picked, only the open beam and dark current \
                  folders acquired with the same exposure time and wavelength (from the \
-                 folder names, e.g. 300_000s_0_700AngsMin) and drop the others",
+                 folder names, e.g. 300_000s_0_700AngsMin) stay selectable; the others \
+                 are disabled. You still pick the matching ones yourself",
             )
             .changed()
         {
@@ -7466,9 +7640,10 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         }
         ui.label(
             RichText::new(if view.smart_selection {
-                "on — open beam / dark current follow the sample's exposure time and wavelength"
+                "on — only the open beam / dark current folders matching the sample's \
+                 exposure time and wavelength can be picked"
             } else {
-                "off — pick the open beam / dark current folders by hand"
+                "off — every open beam / dark current folder can be picked"
             })
             .weak()
             .size(11.0),
@@ -7524,13 +7699,22 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
         clicked = Some(WbSection::Exclude);
     }
     ui.add_space(4.0);
+    let open = egui::CollapsingHeader::new(RichText::new("Save to HDF5 (optional)").strong())
+        .open(Some(view.open_section == Some(WbSection::SaveHdf5)))
+        .show(ui, |ui| {
+            wb_hdf5_ui(ui, session, view);
+        });
+    if open.header_response.clicked() {
+        clicked = Some(WbSection::SaveHdf5);
+    }
+    ui.add_space(4.0);
     let open = egui::CollapsingHeader::new(
         RichText::new("Preparing data for next step").strong(),
     )
     .open(Some(view.open_section == Some(WbSection::Save)))
-        .show(ui, |ui| {
-            wb_save_ui(ui, session, view);
-        });
+    .show(ui, |ui| {
+        wb_prepare_ui(ui, session, view);
+    });
     if open.header_response.clicked() {
         clicked = Some(WbSection::Save);
     }
@@ -7543,64 +7727,9 @@ fn white_beam_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView)
     }
 }
 
-/// Save the final selection (one image per projection, exclusions applied,
-/// increasing angle) in the same HDF5 layout as the TOF side, and hand it to
-/// pre-processing. Reading the projections into memory happens on demand:
-/// "Save to HDF5" and the Next button both trigger it when the stack is
-/// missing or stale, so the user never has to run it as a separate step.
-fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
-    let ctx = ui.ctx().clone();
-    // Fold finished background work into the view.
-    if let Some(scan) = &mut view.process {
-        if let Some(output) = scan.poll() {
-            let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
-            logger::log(format!(
-                "white beam stack read: {} projections (angles {}), {} ob images",
-                output.sample.len(),
-                match (angles.first(), angles.last()) {
-                    (Some(a), Some(b)) => format!("{a:.3} deg -> {b:.3} deg, increasing"),
-                    _ => "unknown".to_owned(),
-                },
-                output.ob.len()
-            ));
-            for e in &output.skipped {
-                logger::error(format!("white beam stack: {e}"));
-            }
-            view.processed = Some(std::sync::Arc::new(output));
-            view.process = None;
-            // A pending save / hand-over picks the stack up next frame.
-            ctx.request_repaint();
-        } else {
-            let done = scan.progress();
-            let frac = (done as f32 / scan.total_images.max(1) as f32).min(1.0);
-            ui.add(egui::ProgressBar::new(frac).text(format!(
-                "reading the projections: {done}/{} images",
-                scan.total_images
-            )));
-            ctx.request_repaint_after(Duration::from_millis(300));
-        }
-    }
-    if let Some(job) = &mut view.save_job {
-        match job.poll() {
-            Some(Ok(msg)) => {
-                logger::log(format!("saved white beam data: {msg}"));
-                if let Some(path) = &view.saved_path {
-                    crate::recent::record_saved(path);
-                }
-                view.save_status = Some(Ok(msg));
-                view.save_job = None;
-            }
-            Some(Err(e)) => {
-                logger::error(format!("saving white beam data failed: {e}"));
-                view.save_status = Some(Err(e));
-                view.save_job = None;
-            }
-            None => ctx.request_repaint_after(Duration::from_millis(300)),
-        }
-    }
-
-    // Everything recorded next to the data in the HDF5 file, and handed to
-    // pre-processing as the stack's provenance.
+/// Everything recorded next to the data in the HDF5 file, and handed to
+/// pre-processing as the stack's provenance.
+fn wb_save_meta(session: &Session, view: &WhiteBeamView) -> SaveMeta {
     let folder_list = |pick: &MultiFolderPick| {
         pick.selected
             .iter()
@@ -7627,7 +7756,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             mode.push_str(&format!(", upper threshold {:.4e}", view.threshold_max));
         }
     }
-    let meta = SaveMeta {
+    SaveMeta {
         instrument: session.instrument.name().to_owned(),
         ipts: session.ipts.name.clone(),
         acquisition_mode: session.mode.label().to_owned(),
@@ -7647,7 +7776,57 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         combine_mode: mode,
         selections_json: None,
         detector_offset_us: None,
-    };
+    }
+}
+
+/// Background work of the white beam load screen, polled every frame
+/// whichever section is open: the projection read, the HDF5 write, and the
+/// automatic read that "Save to HDF5" and Next trigger when the stack in
+/// memory is missing or stale — the user never runs the read as a
+/// separate step.
+fn wb_tick(ctx: &egui::Context, session: &Session, view: &mut WhiteBeamView) {
+    if let Some(scan) = &mut view.process {
+        if let Some(output) = scan.poll() {
+            let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
+            logger::log(format!(
+                "white beam stack read: {} projections (angles {}), {} ob images",
+                output.sample.len(),
+                match (angles.first(), angles.last()) {
+                    (Some(a), Some(b)) => format!("{a:.3} deg -> {b:.3} deg, increasing"),
+                    _ => "unknown".to_owned(),
+                },
+                output.ob.len()
+            ));
+            for e in &output.skipped {
+                logger::error(format!("white beam stack: {e}"));
+            }
+            view.processed = Some(std::sync::Arc::new(output));
+            view.process = None;
+            // A pending save / hand-over picks the stack up next frame.
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+    if let Some(job) = &mut view.save_job {
+        match job.poll() {
+            Some(Ok(msg)) => {
+                logger::log(format!("saved white beam data: {msg}"));
+                if let Some(path) = &view.saved_path {
+                    crate::recent::record_saved(path);
+                }
+                view.save_status = Some(Ok(msg));
+                view.save_job = None;
+                ctx.request_repaint();
+            }
+            Some(Err(e)) => {
+                logger::error(format!("saving white beam data failed: {e}"));
+                view.save_status = Some(Err(e));
+                view.save_job = None;
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(300)),
+        }
+    }
 
     // "Save to HDF5" or Next was clicked: both need the projections in
     // memory. Read them when they are not there (or when the selection
@@ -7669,17 +7848,13 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
         }
     }
     if view.process.is_none()
-        && let Some(output) = &view.processed
+        && let Some(output) = view.processed.clone()
     {
         if let Some(path) = view.pending_save.take() {
             logger::log(format!("saving white beam data to {}", path.display()));
             view.save_status = None;
             view.saved_path = Some(path.clone());
-            view.save_job = Some(SaveJob::start(
-                path,
-                std::sync::Arc::clone(output),
-                meta.clone(),
-            ));
+            view.save_job = Some(SaveJob::start(path, output, wb_save_meta(session, view)));
         }
         // Hand over after the write finished: pre-processing is told the
         // saved file is its checkpoint.
@@ -7688,7 +7863,28 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             view.preprocess_pending = 1;
         }
     }
+}
 
+/// The projection read's progress bar (shown in whichever section asked
+/// for the read).
+fn wb_read_progress(ui: &mut egui::Ui, view: &WhiteBeamView) {
+    if let Some(scan) = &view.process {
+        let done = scan.progress();
+        let frac = (done as f32 / scan.total_images.max(1) as f32).min(1.0);
+        ui.add(egui::ProgressBar::new(frac).text(format!(
+            "reading the projections: {done}/{} images",
+            scan.total_images
+        )));
+    }
+}
+
+/// One line on the final selection — `verb` says what happens to it — or
+/// on what is still missing. Returns the selection itself.
+fn wb_selection_summary(
+    ui: &mut egui::Ui,
+    view: &WhiteBeamView,
+    verb: &str,
+) -> Result<Vec<RunToCombine>, String> {
     let selection = view.final_selection();
     match &selection {
         Err(msg) => {
@@ -7703,90 +7899,104 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                 _ => String::new(),
             };
             ui.label(format!(
-                "{} of {total} projections will be handed to pre-processing (exclusions and coverage applied), plus {} ob images{dc_note}",
+                "{} of {total} projections will be {verb} (exclusions and coverage applied), \
+                 plus {} ob images{dc_note}",
                 runs.len(),
                 view.ob.total_files()
             ));
         }
     }
+    selection
+}
 
-    let busy = view.process.is_some() || view.pending_save.is_some();
-    let saving = view.save_job.is_some();
+/// "Save to HDF5 (optional)": write the final selection (one image per
+/// projection, exclusions applied, increasing angle) in the same HDF5
+/// layout as the TOF side. The projections are read into memory first when
+/// needed.
+fn wb_hdf5_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
+    let selection = wb_selection_summary(ui, view, "saved");
     ui.label(
         RichText::new(
-            "the projections are read into memory when you click Next (or save them below); \
-             saving to HDF5 is optional",
+            "optional: the file is a checkpoint that reopens later from the setup screen, \
+             straight at pre-processing. Continuing with Next does not need it",
         )
         .weak(),
     );
-
-    // Optional: write the stack to an HDF5 file (its own sub-section, closed
-    // by default — most users go straight to Next).
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new("Save to HDF5 (optional)")
-        .id_salt("wb_save_hdf5_subsection")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        selection.is_ok() && !busy && !saving,
-                        egui::Button::new("💾 Save to HDF5…"),
-                    )
-                    .on_hover_text(
-                        "read the selected projections and write them to an HDF5 file",
-                    )
-                    .on_disabled_hover_text(if saving || busy {
-                        "wait for the current read / write to finish"
-                    } else {
-                        "complete the selection first"
-                    })
-                    .clicked()
-                {
-                    let default_name = view
-                        .sample
-                        .selected
-                        .first()
-                        .and_then(|(dir, ..)| dir.file_name())
-                        .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
-                        .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
-                    let mut dialog = rfd::FileDialog::new()
-                        .set_title("Save the white beam projections")
-                        .add_filter("HDF5", &["h5", "hdf5"])
-                        .set_file_name(default_name);
-                    let start = dialog_start([
-                        Some(session.ipts.path.join("shared")),
-                        Some(session.ipts.path.clone()),
-                    ]);
-                    if let Some(dir) = start {
-                        dialog = dialog.set_directory(dir);
-                    }
-                    if let Some(path) = dialog.save_file() {
-                        remember_pick(&path);
-                        view.save_status = None;
-                        view.pending_save = Some(path);
-                        ctx.request_repaint();
-                    }
-                }
-            });
-            if saving {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("writing HDF5…");
-                });
-            }
-            match &view.save_status {
-                Some(Ok(msg)) => {
-                    ui.colored_label(ok_text(ui), format!("saved: {msg}"));
-                }
-                Some(Err(e)) => {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
-                }
-                None => {}
-            }
+    let busy = view.process.is_some() || view.pending_save.is_some();
+    let saving = view.save_job.is_some();
+    if ui
+        .add_enabled(
+            selection.is_ok() && !busy && !saving,
+            egui::Button::new("💾 Save to HDF5…"),
+        )
+        .on_hover_text("read the selected projections and write them to an HDF5 file")
+        .on_disabled_hover_text(if saving || busy {
+            "wait for the current read / write to finish"
+        } else {
+            "complete the selection first"
+        })
+        .clicked()
+    {
+        let default_name = view
+            .sample
+            .selected
+            .first()
+            .and_then(|(dir, ..)| dir.file_name())
+            .map(|n| step_file_name(&format!("{}_white_beam", n.to_string_lossy()), "load"))
+            .unwrap_or_else(|| "ct_white_beam_step_load.h5".to_owned());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save the white beam projections")
+            .add_filter("HDF5", &["h5", "hdf5"])
+            .set_file_name(default_name);
+        let start = dialog_start([
+            Some(session.ipts.path.join("shared")),
+            Some(session.ipts.path.clone()),
+        ]);
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.save_file() {
+            remember_pick(&path);
+            view.save_status = None;
+            view.pending_save = Some(path);
+            ui.ctx().request_repaint();
+        }
+    }
+    if view.pending_save.is_some() {
+        wb_read_progress(ui, view);
+    }
+    if saving {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("writing HDF5…");
         });
-    ui.add_space(4.0);
+    }
+    match &view.save_status {
+        Some(Ok(msg)) => {
+            ui.colored_label(ok_text(ui), format!("saved: {msg}"));
+        }
+        Some(Err(e)) => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("save failed: {e}"));
+        }
+        None => {}
+    }
+}
 
+/// "Preparing data for next step": what the Next button hands to
+/// pre-processing. Nothing to run here — Next reads the projections into
+/// memory (when they are not there yet) and continues.
+fn wb_prepare_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
+    let _ = wb_selection_summary(ui, view, "handed to pre-processing");
+    ui.label(
+        RichText::new(
+            "nothing to run here: the Next button (bottom right) reads the selected \
+             projections into memory and continues to pre-processing",
+        )
+        .weak(),
+    );
+    if view.auto_continue {
+        wb_read_progress(ui, view);
+    }
     if let Some(output) = &view.processed {
         let angles: Vec<f64> = output.sample.iter().filter_map(|p| p.angle_deg).collect();
         let dims = output
@@ -7815,7 +8025,7 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
             ui.colored_label(warn_text(ui), format!("skipped: {e}"));
         }
         // Draw the spinner one frame before the heavy stack copy, so the
-        // user sees the button did something.
+        // user sees the Next button did something.
         if view.preprocess_pending > 0 {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -7834,8 +8044,8 @@ fn wb_save_ui(ui: &mut egui::Ui, session: &Session, view: &mut WhiteBeamView) {
                         .join("shared")
                         .join("white_beam_combined (not saved).h5")
                 });
-                view.goto_preprocess =
-                    Some(combine::stack_from_output(output, &meta, path));
+                let meta = wb_save_meta(session, view);
+                view.goto_preprocess = Some(combine::stack_from_output(output, &meta, path));
             }
         }
     }

@@ -507,10 +507,16 @@ pub struct VisualizeJob {
 }
 
 impl VisualizeJob {
+    /// Show the sample projections.
     pub fn start(stack: Arc<LoadedStack>) -> Self {
+        Self::start_part(stack, false)
+    }
+
+    /// Show the sample (`use_ob` = false) or the open beam images.
+    pub fn start_part(stack: Arc<LoadedStack>, use_ob: bool) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_viewer(&stack));
+            let _ = tx.send(run_viewer(&stack, use_ob));
         });
         Self { rx }
     }
@@ -546,15 +552,20 @@ fn remove_dir_files(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-fn run_viewer(stack: &LoadedStack) -> Result<(), String> {
+fn run_viewer(stack: &LoadedStack, use_ob: bool) -> Result<(), String> {
     let base = scratch_dir(stack, "view")?;
-    let dir = base.join("normalized");
+    // The folder name is what the viewer displays above the stack.
+    let (dir, projections) = if use_ob {
+        (base.join("open_beam"), &stack.ob)
+    } else {
+        (base.join("sample"), &stack.sample)
+    };
     let cleanup = || {
         remove_dir_files(&dir);
         let _ = std::fs::remove_dir(&base);
     };
     let run = || -> Result<(), String> {
-        write_projection_tiffs(&dir, &stack.sample)?;
+        write_projection_tiffs(&dir, projections)?;
         let output = std::process::Command::new(TIFF_VIEWER_BIN)
             .arg(&dir)
             .arg("--single-image")
