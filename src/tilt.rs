@@ -37,6 +37,29 @@ impl TiltResult {
     pub fn axis_column(&self, row: f64, width: usize) -> f64 {
         (width as f64 - 1.0 - (self.slope * row + self.intercept)) / 2.0
     }
+
+    /// A tilt and axis shift set by hand (no fit): the slope / intercept
+    /// are the ones a fit would have produced for exactly these values on
+    /// an image `height` rows tall, so the preview and the correction
+    /// behave as for an estimated result. `rows_used` is 0.
+    pub fn manual(tilt_deg: f64, shift_px: i64, height: usize) -> Self {
+        // tilt = atan(m / 2)  and  shift = round(m·h/2 + q) / 2
+        let slope = 2.0 * tilt_deg.to_radians().tan();
+        let intercept = 2.0 * shift_px as f64 - slope * height as f64 * 0.5;
+        Self {
+            tilt_deg,
+            shift_px,
+            slope,
+            intercept,
+            rows_used: 0,
+            r2: f64::NAN,
+        }
+    }
+
+    /// `true` for a result typed in by the user rather than fitted.
+    pub fn is_manual(&self) -> bool {
+        self.rows_used == 0
+    }
 }
 
 /// neutompy `find_COR`: estimate the tilt and offset of the rotation axis
@@ -389,8 +412,14 @@ impl TiltApplyJob {
             metadata.push((
                 "tilt_correction".to_owned(),
                 format!(
-                    "tilt {:.4} deg, axis shift {} px, edge-padded (neutompy find_COR port)",
-                    result.tilt_deg, result.shift_px
+                    "tilt {:.4} deg, axis shift {} px, edge-padded ({})",
+                    result.tilt_deg,
+                    result.shift_px,
+                    if result.is_manual() {
+                        "set by hand"
+                    } else {
+                        "neutompy find_COR port"
+                    }
                 ),
             ));
             metadata.sort();
@@ -414,6 +443,21 @@ impl TiltApplyJob {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_result_matches_the_fit_relations() {
+        use super::TiltResult;
+        let r = TiltResult::manual(1.5, -7, 1000);
+        assert!(r.is_manual());
+        // The fit's own formulas reproduce the typed values.
+        assert!(((0.5 * r.slope).atan().to_degrees() - 1.5).abs() < 1e-9);
+        let middle = (r.slope * 1000.0 * 0.5 + r.intercept).round() as i64;
+        assert_eq!(middle.div_euclid(2), -7);
+        // The axis crosses the middle row at the center minus the shift.
+        let c = r.axis_column(500.0, 2048);
+        assert!((c - ((2048.0 - 1.0) / 2.0 + 7.0)).abs() < 1e-9, "got {c}");
+        assert!(!TiltResult::manual(0.0, 0, 10).slope.is_nan());
+    }
+
     use super::*;
 
     const W: usize = 96;

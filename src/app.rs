@@ -2616,6 +2616,10 @@ struct StackView {
     tilt_tex: Option<((usize, usize, bool, u64), egui::TextureHandle)>,
     tilt_calc: Option<TiltCalcJob>,
     tilt_result: Option<TiltResult>,
+    /// Tilt (deg) and axis shift (px) typed in by the user — prefilled
+    /// from the last estimate, applied with "Use these values".
+    tilt_manual_deg: f64,
+    tilt_manual_shift: i64,
     tilt_apply: Option<TiltApplyJob>,
     tilt_applied: Option<TiltResult>,
     tilt_error: Option<String>,
@@ -2813,6 +2817,8 @@ impl StackView {
             tilt_tex: None,
             tilt_calc: None,
             tilt_result: None,
+            tilt_manual_deg: 0.0,
+            tilt_manual_shift: 0,
             tilt_apply: None,
             tilt_applied: None,
             tilt_error: None,
@@ -6534,6 +6540,8 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
                     result.tilt_deg, result.shift_px, result.rows_used, result.r2
                 ));
                 view.tilt_result = Some(result);
+                view.tilt_manual_deg = result.tilt_deg;
+                view.tilt_manual_shift = result.shift_px;
                 view.tilt_preview_corrected = true;
                 view.tilt_error = None;
                 view.tilt_calc = None;
@@ -6780,13 +6788,78 @@ fn tilt_section_ui(ui: &mut egui::Ui, view: &mut StackView) {
         }
         if let Some(result) = &view.tilt_result {
             ui.label(
-                RichText::new(format!(
-                    "tilt: {:.4}° — axis shift: {} px ({} rows fitted after trimming, \
-                     R² = {:.4})",
-                    result.tilt_deg, result.shift_px, result.rows_used, result.r2
-                ))
+                RichText::new(if result.is_manual() {
+                    format!(
+                        "tilt: {:.4}° — axis shift: {} px (set by hand)",
+                        result.tilt_deg, result.shift_px
+                    )
+                } else {
+                    format!(
+                        "tilt: {:.4}° — axis shift: {} px ({} rows fitted after trimming, \
+                         R² = {:.4})",
+                        result.tilt_deg, result.shift_px, result.rows_used, result.r2
+                    )
+                })
                 .strong(),
             );
+        }
+    });
+    // Or type the values in: the estimate can be off on a sample with few
+    // features, and the tilt is sometimes known from the instrument.
+    ui.horizontal(|ui| {
+        ui.label("Or set it by hand — tilt:");
+        let speed = drag_speed(ui, 0.01);
+        ui.add(
+            egui::DragValue::new(&mut view.tilt_manual_deg)
+                .speed(speed)
+                .range(-45.0..=45.0)
+                .fixed_decimals(4)
+                .suffix("°"),
+        )
+        .on_hover_text(
+            "rotation of the axis with respect to the vertical, in degrees (positive = \
+             clockwise on the image, as the estimate reports it)",
+        );
+        ui.label("axis shift:");
+        let speed = drag_speed(ui, 1.0);
+        ui.add(
+            egui::DragValue::new(&mut view.tilt_manual_shift)
+                .speed(speed)
+                .range(-(w as i64)..=w as i64)
+                .suffix(" px"),
+        )
+        .on_hover_text(
+            "horizontal shift of the rotation axis from the detector center, in pixels \
+             (0 keeps the columns where they are — the center of rotation step below \
+             handles a plain offset)",
+        );
+        let same = view.tilt_result.is_some_and(|r| {
+            r.tilt_deg == view.tilt_manual_deg && r.shift_px == view.tilt_manual_shift
+        });
+        if ui
+            .add_enabled(!busy && !same, egui::Button::new("Use these values"))
+            .on_hover_text(
+                "take this tilt and shift as the correction to apply (the preview shows \
+                 the resulting axis)",
+            )
+            .on_disabled_hover_text(if same {
+                "these are the values already in use"
+            } else {
+                "wait for the running step to finish"
+            })
+            .clicked()
+        {
+            logger::log(format!(
+                "tilt set by hand: {:.4} deg, axis shift {} px",
+                view.tilt_manual_deg, view.tilt_manual_shift
+            ));
+            view.tilt_result = Some(TiltResult::manual(
+                view.tilt_manual_deg,
+                view.tilt_manual_shift,
+                h,
+            ));
+            view.tilt_preview_corrected = true;
+            view.tilt_error = None;
         }
     });
 
