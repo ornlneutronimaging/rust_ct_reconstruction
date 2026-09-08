@@ -214,6 +214,58 @@ pub fn run_number(folder_name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The acquisition settings encoded in VENUS TOF folder names:
+/// `..._5_260C_5_200AngsMin` is a 5.260 C proton charge per run at a
+/// 5.200 Å minimum wavelength. The open beam folder that goes with a sample
+/// folder is the one taken with the same pair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TofSignature {
+    pub proton_charge_c: f64,
+    pub wavelength_a: f64,
+}
+
+impl TofSignature {
+    /// Parse the `<int>_<frac>C` and `<int>_<frac>Angs[Min]` token pairs of a
+    /// folder name; `None` unless both are present.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let stem = name.rsplit('/').next().unwrap_or(name);
+        let tokens: Vec<&str> = stem.split('_').collect();
+        let all_digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+        let value = |int: &str, frac: &str| -> Option<f64> {
+            all_digits(int).then(|| format!("{int}.{frac}").parse().ok()).flatten()
+        };
+        let mut charge = None;
+        let mut wavelength = None;
+        for pair in tokens.windows(2) {
+            let (int, next) = (pair[0], pair[1]);
+            if let Some(frac) = next.strip_suffix("AngsMin").or_else(|| next.strip_suffix("Angs"))
+                && all_digits(frac)
+            {
+                wavelength = wavelength.or_else(|| value(int, frac));
+            } else if let Some(frac) = next.strip_suffix('C')
+                && all_digits(frac)
+            {
+                charge = charge.or_else(|| value(int, frac));
+            }
+        }
+        Some(Self {
+            proton_charge_c: charge?,
+            wavelength_a: wavelength?,
+        })
+    }
+
+    /// Same proton charge and wavelength (to the millicoulomb /
+    /// milli-ångström the names encode).
+    pub fn matches(&self, other: &Self) -> bool {
+        (self.proton_charge_c - other.proton_charge_c).abs() < 5e-4
+            && (self.wavelength_a - other.wavelength_a).abs() < 5e-4
+    }
+
+    pub fn label(&self) -> String {
+        format!("{:.3} C, {:.3} Å", self.proton_charge_c, self.wavelength_a)
+    }
+}
+
 /// `<nexus_dir>/<instrument>_<run>.nxs.h5`, e.g.
 /// `/SNS/VENUS/IPTS-37118/nexus/VENUS_19085.nxs.h5`.
 pub fn nexus_file_path(nexus_dir: &Path, instrument: &str, run: u32) -> PathBuf {
@@ -506,6 +558,27 @@ impl ViewerJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tof_signature_from_names() {
+        let sig = TofSignature::from_name("20260418_01_cell_nCT_5_260C_5_200AngsMin").unwrap();
+        assert_eq!(sig, TofSignature { proton_charge_c: 5.26, wavelength_a: 5.2 });
+        let ob = TofSignature::from_name("20260418_OB__5_260C_5_200AngsMin").unwrap();
+        assert!(ob.matches(&sig));
+        let other = TofSignature::from_name("20260417_OB__0_875C_5_200AngsMin").unwrap();
+        assert_eq!(other, TofSignature { proton_charge_c: 0.875, wavelength_a: 5.2 });
+        assert!(!other.matches(&sig));
+        // Run folders repeat the tokens, with more fields after.
+        let run = TofSignature::from_name(
+            "20260430_Run_19686_OB_RT_1_393C_0_000AngsMin_ob_0",
+        )
+        .unwrap();
+        assert_eq!(run, TofSignature { proton_charge_c: 1.393, wavelength_a: 0.0 });
+        // White beam names (exposure in s) carry no proton charge.
+        assert!(TofSignature::from_name("20260608_Sample1_CT_300_000s_0_700AngsMin").is_none());
+        assert!(TofSignature::from_name("plain_folder").is_none());
+    }
+
 
     #[test]
     fn parse_selections_document() {

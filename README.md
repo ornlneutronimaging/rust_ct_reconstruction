@@ -42,7 +42,22 @@ the data is looked for under the experiment:
 Both sections list the folders found at their root (with a Browse fallback);
 selecting one inventories, on a background thread with progress, the images
 (full paths) of each subfolder — one per projection angle for a sample, one
-per run for open beams — and shows the per-folder and total counts.
+per run for open beams — and shows the per-folder and total counts. Several
+sample folders can be selected at the same time (checkboxes in the list, or a
+multi-folder Browse dialog): their projections are put together as one
+dataset, in selection order, and every selected folder is recorded in the
+HDF5 file (`sample_folder`, `;`-separated). Runs sharing an angle across
+folders follow the duplicate-angle policy of the combine step (best
+statistics, or merged).
+
+The **✨ Smart selection** toggle (on by default) reads the proton charge and
+minimum wavelength encoded in the folder names (`..._5_260C_5_200AngsMin` is
+5.260 C per run at 5.200 Å): whenever the sample selection changes, only the
+open beam folders acquired with the same pair stay selectable, the others are
+greyed out (hover shows their settings) and a mismatching open beam already
+picked is deselected. Nothing is selected automatically — you still pick the
+open beam yourself. Folders whose names carry no such tokens are left alone,
+and the toggle can be switched off to pick any open beam.
 
 Once both are selected, the selection summary (number of projections, sample
 / OB / nexus folders, detector) is logged and a preprocessing pass runs in
@@ -52,7 +67,10 @@ dataset `entry/proton_charge`, pC → C — same rules as the Python pipeline,
 run number parsed from the `Run_<n>` part of the folder name). The sample
 and OB proton charges are then drawn on one plot (charge in C vs run number)
 so mismatched beam conditions stand out; rejections and missing proton
-charges are flagged in the UI and the log.
+charges are flagged in the UI and the log. Hovering a point shows its run
+number, type, proton charge, whether it is kept, and the run folder name. The
+run-number axis is ticked as densely as the width allows (1, 2, 5 × 10ⁿ
+steps), with the labels tilted 45° when they would overlap.
 
 Note: the until-July-2025 tpx1 layout currently maps to the same folders as
 the post-August one (adjust `Detector::images_subdir` in `src/tof.rs` when

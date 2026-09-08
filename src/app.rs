@@ -24,7 +24,7 @@ use crate::tilt::{CorJob, TiltApplyJob, TiltCalcJob, TiltResult};
 pub use crate::session::{Mode, Session};
 use crate::tof::{
     self, CombineSpec, Detector, FolderScan, ImageFolder, PreprocessResult, PreprocessScan,
-    RunInfo, ViewerJob,
+    RunInfo, TofSignature, ViewerJob,
 };
 use crate::white_beam::{
     self, AcqSignature, AngleSource, ImageIntensity, IntensityScan, MetaAnglesScan, WbDetector,
@@ -3953,12 +3953,21 @@ struct TofView {
     /// User override of the frame orientation on load (`None` = Timepix,
     /// see [`TofView::orientation`]).
     orientation_override: Option<OrientDetector>,
+    /// Several sample folders can be selected: a scan split over several
+    /// acquisitions, or angle ranges taken separately, are put together.
     sample: FolderPick,
     ob: FolderPick,
-    /// The (sample, OB) pair whose selection summary was already written to
-    /// the log, so the summary is logged (and preprocessing started) once per
-    /// completed pair.
-    summary_logged: Option<(PathBuf, PathBuf)>,
+    /// "Smart selection": whenever the sample folders change, only the open
+    /// beam folders acquired with the same proton charge and wavelength (per
+    /// the folder naming convention, `..._5_260C_5_200AngsMin`) stay
+    /// selectable; the others are disabled and a mismatching pick is
+    /// dropped. Nothing is selected automatically — the user picks among
+    /// the matching ones.
+    smart_selection: bool,
+    /// The (sample folders, OB) pair whose selection summary was already
+    /// written to the log, so the summary is logged (and preprocessing
+    /// started) once per completed pair.
+    summary_logged: Option<(Vec<PathBuf>, PathBuf)>,
     /// Preprocessing pass in flight (empty-run rejection + proton charges).
     preprocess: Option<PreprocessScan>,
     preprocessed: Option<PreprocessResult>,
@@ -4013,7 +4022,8 @@ impl TofView {
 
     fn with_detector(detector: Detector, session: &Session) -> Self {
         let sample =
-            FolderPick::new("sample", detector.ct_root(&session.ipts.path), &session.ipts.path);
+            FolderPick::new("sample", detector.ct_root(&session.ipts.path), &session.ipts.path)
+                .multi();
         let ob =
             FolderPick::new("open beam", detector.ob_root(&session.ipts.path), &session.ipts.path);
         logger::log(format!(
@@ -4035,6 +4045,7 @@ impl TofView {
             orientation_override: session.orientation_override,
             sample,
             ob,
+            smart_selection: true,
             summary_logged: None,
             preprocess: None,
             preprocessed: None,
@@ -4061,6 +4072,37 @@ impl TofView {
         }
     }
 
+    /// Smart selection: align the open beam pick with the sample's proton
+    /// charge and wavelength. Called whenever the sample selection changes
+    /// (and when the toggle is switched on); with the toggle off it only
+    /// clears the highlighting.
+    fn apply_smart_selection(&mut self) {
+        let signature = if self.smart_selection {
+            self.sample.signature()
+        } else {
+            None
+        };
+        self.ob.smart_filter = signature;
+        if !self.smart_selection {
+            return;
+        }
+        let Some(signature) = signature else {
+            if !self.sample.picked.is_empty() {
+                logger::error(
+                    "smart selection: no proton charge / wavelength in the sample folder name \
+                     — open beam left as it is",
+                );
+            }
+            return;
+        };
+        let (matching, removed) = self.ob.apply_smart(&signature);
+        logger::log(format!(
+            "smart selection ({}): {matching} matching open beam folder(s) selectable, \
+             {removed} with other settings deselected — pick the open beam by hand",
+            signature.label()
+        ));
+    }
+
     /// The first sample run going to the next step (band + manual filters),
     /// used to visualize the TOF profile.
     fn first_kept_sample_run(&self) -> Option<&RunInfo> {
@@ -4073,8 +4115,20 @@ impl TofView {
     }
 }
 
-/// Selection of one folder (sample or open beam) under a fixed root, plus the
-/// background inventory of the images inside each of its subfolders.
+/// One folder picked in a [`FolderPick`], with the background inventory of
+/// the images inside each of its subfolders.
+struct PickedFolder {
+    path: PathBuf,
+    scan: Option<FolderScan>,
+    folders: Option<Vec<ImageFolder>>,
+    error: Option<String>,
+}
+
+/// Selection of folders (sample or open beam) under a fixed root, plus the
+/// background inventory of the images inside each of their subfolders. In
+/// `multi` mode several folders can be picked at once (a CT scan split over
+/// several acquisitions); otherwise picking a folder replaces the previous
+/// one.
 struct FolderPick {
     /// "sample" or "open beam" — used in headings and log lines.
     kind: &'static str,
@@ -4085,10 +4139,14 @@ struct FolderPick {
     /// falls back to when nothing more specific exists.
     ipts: PathBuf,
     candidates: Result<Vec<PathBuf>, String>,
-    selected: Option<PathBuf>,
-    scan: Option<FolderScan>,
-    folders: Option<Vec<ImageFolder>>,
-    error: Option<String>,
+    /// Several folders can be selected at the same time.
+    multi: bool,
+    /// The picked folders, in selection order.
+    picked: Vec<PickedFolder>,
+    /// Smart selection in force: the sample's proton charge / wavelength
+    /// this picker is aligned with. Candidates with a different signature
+    /// are disabled in the list.
+    smart_filter: Option<TofSignature>,
 }
 
 impl FolderPick {
@@ -4100,42 +4158,152 @@ impl FolderPick {
             browse_start: ipts.join("shared"),
             ipts: ipts.to_path_buf(),
             candidates,
-            selected: None,
-            scan: None,
-            folders: None,
-            error: None,
+            multi: false,
+            picked: Vec::new(),
+            smart_filter: None,
         }
     }
 
+    /// The proton charge / wavelength signature of the selection, from the
+    /// first picked folder's name.
+    fn signature(&self) -> Option<TofSignature> {
+        self.picked
+            .first()
+            .and_then(|p| TofSignature::from_name(&p.path.file_name()?.to_string_lossy()))
+    }
+
+    /// Drop the picked folders whose names carry a different signature than
+    /// `signature` (names without one are left alone); nothing gets selected
+    /// automatically. Returns how many candidate folders match and how many
+    /// picks were dropped.
+    fn apply_smart(&mut self, signature: &TofSignature) -> (usize, usize) {
+        let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let mismatch = |p: &Path| {
+            name_of(p)
+                .and_then(|n| TofSignature::from_name(&n))
+                .is_some_and(|s| !s.matches(signature))
+        };
+        let stale: Vec<PathBuf> = self
+            .picked
+            .iter()
+            .filter(|p| mismatch(&p.path))
+            .map(|p| p.path.clone())
+            .collect();
+        for path in &stale {
+            logger::log(format!(
+                "{} folder deselected (smart selection): {}",
+                self.kind,
+                path.display()
+            ));
+            self.picked.retain(|p| &p.path != path);
+        }
+        let matching = self
+            .candidates
+            .as_ref()
+            .map(|dirs| {
+                dirs.iter()
+                    .filter(|dir| {
+                        name_of(dir)
+                            .and_then(|n| TofSignature::from_name(&n))
+                            .is_some_and(|s| s.matches(signature))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        (matching, stale.len())
+    }
+
+    /// Allow several folders to be selected at once.
+    fn multi(mut self) -> Self {
+        self.multi = true;
+        self
+    }
+
+    /// The selected folder paths, in selection order.
+    fn selected(&self) -> Vec<PathBuf> {
+        self.picked.iter().map(|p| p.path.clone()).collect()
+    }
+
+    /// The first selected folder (the only one outside `multi` mode).
+    fn first_selected(&self) -> Option<&PathBuf> {
+        self.picked.first().map(|p| &p.path)
+    }
+
+    fn is_selected(&self, path: &Path) -> bool {
+        self.picked.iter().any(|p| p.path == path)
+    }
+
+    /// The inventory of every selected folder, concatenated in selection
+    /// order — `None` while nothing is selected, a scan is still running or
+    /// one of them failed.
+    fn folders(&self) -> Option<Vec<&ImageFolder>> {
+        if self.picked.is_empty() {
+            return None;
+        }
+        let mut all = Vec::new();
+        for p in &self.picked {
+            all.extend(p.folders.as_ref()?.iter());
+        }
+        Some(all)
+    }
+
+    /// Add `path` to the selection (replacing the previous one outside
+    /// `multi` mode) and start its inventory.
     fn select(&mut self, path: PathBuf) {
+        if self.is_selected(&path) {
+            return;
+        }
         logger::log(format!("{} folder selected: {}", self.kind, path.display()));
-        self.selected = Some(path.clone());
-        self.folders = None;
-        self.error = None;
-        self.scan = Some(FolderScan::start(path));
+        if !self.multi {
+            self.picked.clear();
+        }
+        self.picked.push(PickedFolder {
+            scan: Some(FolderScan::start(path.clone())),
+            path,
+            folders: None,
+            error: None,
+        });
+    }
+
+    fn deselect(&mut self, path: &Path) {
+        if self.is_selected(path) {
+            logger::log(format!("{} folder deselected: {}", self.kind, path.display()));
+            self.picked.retain(|p| p.path != path);
+        }
+    }
+
+    /// Multi mode: flip the selection of `path`; single mode: select it.
+    fn toggle(&mut self, path: PathBuf) {
+        if self.multi && self.is_selected(&path) {
+            self.deselect(&path);
+        } else {
+            self.select(path);
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
-        let Some(scan) = &mut self.scan else { return };
-        match scan.poll() {
-            Some(Ok(folders)) => {
-                let images: usize = folders.iter().map(|f| f.images.len()).sum();
-                logger::log(format!(
-                    "{} inventory of {}: {} folders, {} images",
-                    self.kind,
-                    scan.root.display(),
-                    folders.len(),
-                    images
-                ));
-                self.folders = Some(folders);
-                self.scan = None;
+        for p in &mut self.picked {
+            let Some(scan) = &mut p.scan else { continue };
+            match scan.poll() {
+                Some(Ok(folders)) => {
+                    let images: usize = folders.iter().map(|f| f.images.len()).sum();
+                    logger::log(format!(
+                        "{} inventory of {}: {} folders, {} images",
+                        self.kind,
+                        scan.root.display(),
+                        folders.len(),
+                        images
+                    ));
+                    p.folders = Some(folders);
+                    p.scan = None;
+                }
+                Some(Err(e)) => {
+                    logger::error(format!("{} inventory failed: {e}", self.kind));
+                    p.error = Some(e);
+                    p.scan = None;
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(200)),
             }
-            Some(Err(e)) => {
-                logger::error(format!("{} inventory failed: {e}", self.kind));
-                self.error = Some(e);
-                self.scan = None;
-            }
-            None => ctx.request_repaint_after(Duration::from_millis(200)),
         }
     }
 
@@ -4146,9 +4314,26 @@ impl FolderPick {
         };
         ui.label(RichText::new(heading).size(16.0).strong());
         ui.label(RichText::new(self.root.display().to_string()).weak().size(11.0));
+        if self.multi {
+            ui.label(
+                RichText::new("several folders can be selected — their projections are put together")
+                    .weak()
+                    .size(11.0),
+            );
+        }
+        if let Some(sig) = &self.smart_filter {
+            ui.label(
+                RichText::new(format!(
+                    "smart selection: only folders acquired at {} can be picked",
+                    sig.label()
+                ))
+                .size(11.0)
+                .color(ok_text(ui)),
+            );
+        }
         ui.add_space(4.0);
 
-        let mut clicked = None;
+        let mut toggled = None;
         match &self.candidates {
             Err(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -4168,49 +4353,152 @@ impl FolderPick {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| dir.display().to_string());
-                                let is_selected = self.selected.as_deref() == Some(dir);
-                                if ui.selectable_label(is_selected, name).clicked() {
-                                    clicked = Some(dir.clone());
+                                let mut checked = self.is_selected(dir);
+                                // Under smart selection, folders taken with
+                                // another proton charge / wavelength are
+                                // disabled; the matching ones are left for
+                                // the user to pick.
+                                let mismatch = self.smart_filter.as_ref().and_then(|sig| {
+                                    TofSignature::from_name(&name)
+                                        .filter(|s| !s.matches(sig))
+                                        .map(|s| s.label())
+                                });
+                                let response = match (&mismatch, self.multi) {
+                                    (Some(other), multi) => {
+                                        let label = RichText::new(name).weak();
+                                        let response = if multi {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Checkbox::new(&mut checked, label),
+                                            )
+                                        } else {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::selectable(checked, label),
+                                            )
+                                        };
+                                        response.on_disabled_hover_text(format!(
+                                            "acquired at {other} — not the sample's settings"
+                                        ))
+                                    }
+                                    (None, true) => ui.checkbox(&mut checked, name),
+                                    (None, false) => ui.selectable_label(checked, name),
+                                };
+                                if (self.multi && response.changed())
+                                    || (!self.multi && response.clicked())
+                                {
+                                    toggled = Some(dir.clone());
                                 }
                             }
                         });
                     });
             }
         }
-        if let Some(dir) = clicked {
-            self.select(dir);
+        if let Some(dir) = toggled {
+            self.toggle(dir);
         }
 
-        if ui.button("📂 Browse…").clicked() {
-            let mut dialog = rfd::FileDialog::new().set_title(format!("Select the {} folder", self.kind));
-            // Start in the experiment's shared folder; fall back to the
-            // detector data root, then the experiment folder itself.
-            let start = dialog_start([
-                Some(self.browse_start.clone()),
-                Some(self.root.clone()),
-                self.root.parent().map(PathBuf::from),
-                Some(self.ipts.clone()),
-            ]);
-            if let Some(dir) = start {
-                dialog = dialog.set_directory(dir);
+        ui.horizontal(|ui| {
+            if ui.button("📂 Browse…").clicked() {
+                let mut dialog = rfd::FileDialog::new().set_title(format!(
+                    "Select the {} folder{}",
+                    self.kind,
+                    if self.multi { "(s)" } else { "" }
+                ));
+                // Start in the experiment's shared folder; fall back to the
+                // detector data root, then the experiment folder itself.
+                let start = dialog_start([
+                    Some(self.browse_start.clone()),
+                    Some(self.root.clone()),
+                    self.root.parent().map(PathBuf::from),
+                    Some(self.ipts.clone()),
+                ]);
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
+                }
+                if self.multi {
+                    if let Some(paths) = dialog.pick_folders() {
+                        for path in paths {
+                            remember_pick(&path);
+                            self.select(path);
+                        }
+                    }
+                } else if let Some(path) = dialog.pick_folder() {
+                    remember_pick(&path);
+                    self.select(path);
+                }
             }
-            if let Some(path) = dialog.pick_folder() {
-                remember_pick(&path);
-                self.select(path);
+            if self.multi
+                && !self.picked.is_empty()
+                && ui
+                    .button("Clear")
+                    .on_hover_text("deselect every folder")
+                    .clicked()
+            {
+                logger::log(format!("{} selection cleared", self.kind));
+                self.picked.clear();
             }
-        }
+        });
 
         ui.add_space(6.0);
-        if let Some(scan) = &self.scan {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("inventorying folders… {}/{}", scan.done, scan.total));
-            });
+        // Folders picked outside the candidate list (Browse) are not visible
+        // above; in multi mode list every pick so each can be removed.
+        if self.multi && !self.picked.is_empty() {
+            let mut remove: Option<PathBuf> = None;
+            ui.label(
+                RichText::new(format!("{} folder(s) selected", self.picked.len())).strong(),
+            );
+            for p in &self.picked {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("deselect this folder")
+                        .clicked()
+                    {
+                        remove = Some(p.path.clone());
+                    }
+                    let name = p
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.path.display().to_string());
+                    let status = match (&p.scan, &p.folders, &p.error) {
+                        (Some(scan), ..) => {
+                            ui.spinner();
+                            format!("{}/{}", scan.done, scan.total)
+                        }
+                        (_, Some(folders), _) => format!(
+                            "{} folders, {} images",
+                            folders.len(),
+                            folders.iter().map(|f| f.images.len()).sum::<usize>()
+                        ),
+                        (_, _, Some(_)) => "failed".to_owned(),
+                        _ => String::new(),
+                    };
+                    ui.label(RichText::new(format!("{name} — {status}")).size(12.0))
+                        .on_hover_text(p.path.display().to_string());
+                });
+            }
+            if let Some(path) = remove {
+                self.deselect(&path);
+            }
+            ui.add_space(4.0);
         }
-        if let Some(e) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
+
+        for p in &self.picked {
+            if let Some(scan) = &p.scan
+                && !self.multi
+            {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("inventorying folders… {}/{}", scan.done, scan.total));
+                });
+            }
+            if let Some(e) = &p.error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
         }
-        if let Some(folders) = &self.folders {
+        if let Some(folders) = self.folders() {
             let images: usize = folders.iter().map(|f| f.images.len()).sum();
             ui.label(
                 RichText::new(format!("{} folders — {} images", folders.len(), images))
@@ -9827,17 +10115,24 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
     view.ob.poll(&ctx);
 
     // Both selections made and inventoried: log the selection summary, once
-    // per (sample, OB) pair.
-    if let (Some(sample_folders), Some(sample_path), Some(ob_path)) = (
-        view.sample.folders.as_ref(),
-        view.sample.selected.as_ref(),
-        view.ob.selected.as_ref(),
-    ) && view.ob.folders.is_some()
-    {
-        let pair = (sample_path.clone(), ob_path.clone());
+    // per (sample folders, OB) pair.
+    if let (Some(sample_folders), Some(ob_folders), Some(ob_path)) = (
+        view.sample.folders(),
+        view.ob.folders(),
+        view.ob.first_selected(),
+    ) {
+        let pair = (view.sample.selected(), ob_path.clone());
         if view.summary_logged.as_ref() != Some(&pair) {
             logger::log(format!("Number of projections: {}", sample_folders.len()));
-            logger::log(format!("Sample folder: {}", pair.0.display()));
+            match pair.0.as_slice() {
+                [single] => logger::log(format!("Sample folder: {}", single.display())),
+                several => {
+                    logger::log(format!("Sample folders: {} put together", several.len()));
+                    for dir in several {
+                        logger::log(format!("  - {}", dir.display()));
+                    }
+                }
+            }
             logger::log(format!("OB folder: {}", pair.1.display()));
             logger::log(format!(
                 "Nexus folder: {}",
@@ -9852,12 +10147,8 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
             view.processed = None;
             view.save_status = None;
             view.preprocess = Some(PreprocessScan::start(
-                sample_folders.iter().map(ImageFolder::summary).collect(),
-                view.ob
-                    .folders
-                    .as_ref()
-                    .map(|f| f.iter().map(ImageFolder::summary).collect())
-                    .unwrap_or_default(),
+                sample_folders.iter().map(|f| f.summary()).collect(),
+                ob_folders.iter().map(|f| f.summary()).collect(),
                 session.ipts.path.join("nexus"),
                 session.instrument.name().to_owned(),
             ));
@@ -9902,8 +10193,10 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
         if detector != view.detector {
             logger::log(format!("TOF detector changed: {}", detector.label()));
             let orientation_override = view.orientation_override;
+            let smart_selection = view.smart_selection;
             *view = TofView::with_detector(detector, session);
             view.orientation_override = orientation_override;
+            view.smart_selection = smart_selection;
         }
         ui.separator();
         let auto = view.orientation();
@@ -9913,10 +10206,44 @@ fn tof_ui(ui: &mut egui::Ui, session: &Session, view: &mut TofView) {
     ui.separator();
     ui.add_space(10.0);
 
+    ui.horizontal(|ui| {
+        if ui
+            .toggle_value(&mut view.smart_selection, "✨ Smart selection")
+            .on_hover_text(
+                "when a sample folder is picked, only the open beam folders acquired with \
+                 the same proton charge and wavelength (from the folder names, e.g. \
+                 5_260C_5_200AngsMin) stay selectable; the others are disabled. You still \
+                 pick the matching one yourself",
+            )
+            .changed()
+        {
+            logger::log(format!(
+                "smart selection {}",
+                if view.smart_selection { "on" } else { "off" }
+            ));
+            view.apply_smart_selection();
+        }
+        ui.label(
+            RichText::new(if view.smart_selection {
+                "on — only the open beam folders matching the sample's proton charge and \
+                 wavelength can be picked"
+            } else {
+                "off — every open beam folder can be picked"
+            })
+            .weak()
+            .size(11.0),
+        );
+    });
+    ui.add_space(6.0);
+
+    let sample_before = view.sample.selected();
     ui.columns(2, |cols| {
         view.sample.ui(&mut cols[0]);
         view.ob.ui(&mut cols[1]);
     });
+    if view.sample.selected() != sample_before && view.smart_selection {
+        view.apply_smart_selection();
+    }
 
     ui.add_space(10.0);
     if let Some(scan) = &view.preprocess {
@@ -10127,11 +10454,15 @@ fn process_section_ui(
         let to_combine = |kept: &[&RunInfo]| -> Vec<RunToCombine> {
             kept.iter()
                 .filter_map(|r| {
-                    let folders = match r.path.parent() == view.sample.selected.as_deref() {
-                        true => view.sample.folders.as_deref(),
-                        false => view.ob.folders.as_deref(),
+                    let from_sample = r
+                        .path
+                        .parent()
+                        .is_some_and(|parent| view.sample.is_selected(parent));
+                    let folders = match from_sample {
+                        true => view.sample.folders(),
+                        false => view.ob.folders(),
                     }?;
-                    folders.iter().find(|f| f.name == r.name).map(|f| RunToCombine {
+                    folders.iter().find(|f| f.path == r.path).map(|f| RunToCombine {
                         name: r.name.clone(),
                         run_number: r.run_number,
                         images: f.images.clone(),
@@ -10204,14 +10535,14 @@ fn process_section_ui(
             orientation: view.orientation().orientation(),
             sample_folder: view
                 .sample
-                .selected
-                .as_deref()
+                .selected()
+                .iter()
                 .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+                .collect::<Vec<_>>()
+                .join("; "),
             ob_folder: view
                 .ob
-                .selected
-                .as_deref()
+                .first_selected()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             dc_folder: None,
@@ -10235,8 +10566,7 @@ fn process_section_ui(
             {
                 let default_name = view
                     .sample
-                    .selected
-                    .as_deref()
+                    .first_selected()
                     .and_then(|p| p.file_name())
                     .map(|n| step_file_name(&format!("{}_combined", n.to_string_lossy()), "load"))
                     .unwrap_or_else(|| "ct_combined_step_load.h5".to_owned());
@@ -10659,17 +10989,40 @@ fn proton_charge_section(ui: &mut egui::Ui, view: &mut TofView) {
         return;
     };
 
-    fn points(runs: &[RunInfo], keep: impl Fn(&RunInfo) -> bool) -> Vec<[f64; 2]> {
-        runs.iter()
-            .filter(|r| !r.rejected_empty && keep(r))
-            .filter_map(|r| Some([r.run_number? as f64, r.proton_charge_c?]))
-            .collect()
+    /// One plotted run, kept around for the hover readout.
+    #[derive(Clone)]
+    struct PcDot {
+        run: u32,
+        pc: f64,
+        kind: &'static str,
+        kept: bool,
+        name: String,
     }
     let selection = *range;
-    let sample_in = points(&result.sample, |r| pc_in_range(r, selection));
-    let sample_out = points(&result.sample, |r| !pc_in_range(r, selection));
-    let ob_in = points(&result.ob, |r| pc_in_range(r, selection));
-    let ob_out = points(&result.ob, |r| !pc_in_range(r, selection));
+    let dots: Vec<PcDot> = [("sample", &result.sample), ("ob", &result.ob)]
+        .into_iter()
+        .flat_map(|(kind, runs)| {
+            runs.iter().filter(|r| !r.rejected_empty).filter_map(move |r| {
+                Some(PcDot {
+                    run: r.run_number?,
+                    pc: r.proton_charge_c?,
+                    kind,
+                    kept: pc_in_range(r, selection),
+                    name: r.name.clone(),
+                })
+            })
+        })
+        .collect();
+    let points = |kind: &str, kept: bool| -> Vec<[f64; 2]> {
+        dots.iter()
+            .filter(|d| d.kind == kind && d.kept == kept)
+            .map(|d| [d.run as f64, d.pc])
+            .collect()
+    };
+    let sample_in = points("sample", true);
+    let sample_out = points("sample", false);
+    let ob_in = points("ob", true);
+    let ob_out = points("ob", false);
 
     ui.add_space(4.0);
     ui.label(RichText::new("Proton charge per run (C)").strong());
@@ -10683,35 +11036,84 @@ fn proton_charge_section(ui: &mut egui::Ui, view: &mut TofView) {
             &mut view.pc_drag_upper,
         );
         let band = Color32::from_rgb(120, 200, 120);
-        egui_plot::Plot::new("proton_charge_plot")
-            .height(PLOT_HEIGHT)
-            .x_axis_label("run number")
-            .y_axis_label("proton charge (C)")
-            .legend(egui_plot::Legend::default())
-            .show(ui, |plot_ui| {
-                plot_ui.hline(egui_plot::HLine::new("selection", selection.0).color(band).width(1.0));
-                plot_ui.hline(egui_plot::HLine::new("selection", selection.1).color(band).width(1.0));
-                plot_ui.points(
-                    egui_plot::Points::new("sample", sample_in)
-                        .radius(3.5)
-                        .color(Color32::from_rgb(100, 170, 255)),
-                );
-                plot_ui.points(
-                    egui_plot::Points::new("ob", ob_in)
-                        .radius(3.5)
-                        .color(Color32::from_rgb(255, 160, 70)),
-                );
-                plot_ui.points(
-                    egui_plot::Points::new("excluded", sample_out)
-                        .radius(3.0)
-                        .color(Color32::from_gray(110)),
-                );
-                plot_ui.points(
-                    egui_plot::Points::new("excluded", ob_out)
-                        .radius(3.0)
-                        .color(Color32::from_gray(110)),
-                );
-            });
+        ui.vertical(|ui| {
+            let mut hovered: Option<PcDot> = None;
+            // The x axis is drawn by hand below the plot (run-number ticks,
+            // tilted when they would overlap); egui_plot only keeps the
+            // matching grid lines.
+            let plot_response = egui_plot::Plot::new("proton_charge_plot")
+                .height(PLOT_HEIGHT)
+                .y_axis_label("proton charge (C)")
+                .show_axes([false, true])
+                .grid_spacing(RUN_GRID_MIN_PX..=300.0)
+                .x_grid_spacer(|input| {
+                    let step = run_tick_step(input.base_step_size / RUN_GRID_MIN_PX as f64);
+                    run_ticks(input.bounds, step)
+                        .map(|value| egui_plot::GridMark { value, step_size: step })
+                        .collect()
+                })
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    plot_ui.hline(
+                        egui_plot::HLine::new("selection", selection.0).color(band).width(1.0),
+                    );
+                    plot_ui.hline(
+                        egui_plot::HLine::new("selection", selection.1).color(band).width(1.0),
+                    );
+                    plot_ui.points(
+                        egui_plot::Points::new("sample", sample_in)
+                            .radius(3.5)
+                            .color(Color32::from_rgb(100, 170, 255)),
+                    );
+                    plot_ui.points(
+                        egui_plot::Points::new("ob", ob_in)
+                            .radius(3.5)
+                            .color(Color32::from_rgb(255, 160, 70)),
+                    );
+                    plot_ui.points(
+                        egui_plot::Points::new("excluded", sample_out)
+                            .radius(3.0)
+                            .color(Color32::from_gray(110)),
+                    );
+                    plot_ui.points(
+                        egui_plot::Points::new("excluded", ob_out)
+                            .radius(3.0)
+                            .color(Color32::from_gray(110)),
+                    );
+                    // Closest dot within 14 px of the pointer, for the readout.
+                    if let Some(pointer) = plot_ui.pointer_coordinate() {
+                        let transform = plot_ui.transform();
+                        let pointer_pos = transform.position_from_point(&pointer);
+                        let mut best_d2 = 14.0f32 * 14.0;
+                        for dot in &dots {
+                            let screen = transform.position_from_point(&egui_plot::PlotPoint::new(
+                                dot.run as f64,
+                                dot.pc,
+                            ));
+                            let d2 = screen.distance_sq(pointer_pos);
+                            if d2 < best_d2 {
+                                best_d2 = d2;
+                                hovered = Some(dot.clone());
+                            }
+                        }
+                    }
+                });
+            if let Some(dot) = &hovered {
+                plot_response.response.on_hover_ui_at_pointer(|ui| {
+                    ui.label(RichText::new(format!("run {}", dot.run)).strong());
+                    ui.label(format!("{}: {:.4} C", dot.kind, dot.pc));
+                    if dot.kept {
+                        ui.label(RichText::new("kept").color(ok_text(ui)));
+                    } else {
+                        ui.label(
+                            RichText::new("excluded — outside the selection").color(warn_text(ui)),
+                        );
+                    }
+                    ui.label(RichText::new(&dot.name).weak().size(11.0));
+                });
+            }
+            run_axis_ui(ui, &plot_response.transform, "run number");
+        });
     });
 
     let selection = *view.pc_range.as_ref().unwrap();
@@ -10733,6 +11135,93 @@ fn proton_charge_section(ui: &mut egui::Ui, view: &mut TofView) {
     } else {
         ui.label(line);
     }
+}
+
+/// Smallest pixel distance between two run-number grid lines / ticks.
+const RUN_GRID_MIN_PX: f32 = 26.0;
+
+/// A "nice" integer tick step (1, 2, 5 × 10ⁿ) at least `values_per_px ×
+/// RUN_GRID_MIN_PX` run numbers wide — the densest ticks that keep
+/// `RUN_GRID_MIN_PX` between them.
+fn run_tick_step(values_per_px: f64) -> f64 {
+    let target = (values_per_px * RUN_GRID_MIN_PX as f64).max(1.0);
+    let magnitude = 10f64.powf(target.log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * magnitude)
+        .find(|step| *step >= target - 1e-9)
+        .unwrap_or(magnitude * 10.0)
+}
+
+/// Every multiple of `step` inside `bounds` (inclusive).
+fn run_ticks(bounds: (f64, f64), step: f64) -> impl Iterator<Item = f64> {
+    let first = (bounds.0 / step).ceil() as i64;
+    let last = (bounds.1 / step).floor() as i64;
+    (first..=last).map(move |k| k as f64 * step)
+}
+
+/// A hand-painted x axis under a plot whose own x axis is hidden: one tick
+/// per run-number grid line (same spacing rule as the grid), labels drawn
+/// horizontally when they fit between ticks and tilted 45° otherwise, and
+/// the axis title underneath.
+fn run_axis_ui(ui: &mut egui::Ui, transform: &egui_plot::PlotTransform, title: &str) {
+    const STRIP_HEIGHT: f32 = 58.0;
+    let frame = *transform.frame();
+    let (strip, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(frame.width()), STRIP_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(strip.union(frame));
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+    let tick_stroke = ui.visuals().widgets.noninteractive.fg_stroke;
+
+    let values_per_px = transform.dvalue_dpos()[0].abs();
+    if !values_per_px.is_finite() || values_per_px <= 0.0 {
+        return;
+    }
+    let step = run_tick_step(values_per_px);
+    let bounds = transform.bounds();
+    let spacing_px = (step / values_per_px) as f32;
+    let labels: Vec<(f32, std::sync::Arc<egui::Galley>)> = run_ticks((bounds.min()[0], bounds.max()[0]), step)
+        .map(|value| {
+            let x = transform.position_from_point_x(value);
+            let galley = ui.fonts_mut(|f| {
+                f.layout_no_wrap(format!("{}", value.round() as i64), font.clone(), text_color)
+            });
+            (x, galley)
+        })
+        .collect();
+    let widest = labels
+        .iter()
+        .map(|(_, g)| g.size().x)
+        .fold(0.0f32, f32::max);
+    let tilted = widest + 6.0 > spacing_px;
+
+    let top = strip.top();
+    for (x, galley) in labels {
+        if x < frame.left() - 0.5 || x > frame.right() + 0.5 {
+            continue;
+        }
+        painter.line_segment([egui::pos2(x, top), egui::pos2(x, top + 4.0)], tick_stroke);
+        if tilted {
+            // Right end of the label under the tick, text running down-left.
+            painter.add(
+                egui::epaint::TextShape::new(egui::pos2(x + 2.0, top + 7.0), galley, text_color)
+                    .with_angle_and_anchor(-std::f32::consts::FRAC_PI_4, egui::Align2::RIGHT_TOP),
+            );
+        } else {
+            let size = galley.size();
+            painter.galley(egui::pos2(x - size.x / 2.0, top + 6.0), galley, text_color);
+        }
+    }
+    painter.text(
+        egui::pos2(frame.center().x, strip.bottom()),
+        egui::Align2::CENTER_BOTTOM,
+        title,
+        egui::TextStyle::Body.resolve(ui.style()),
+        text_color,
+    );
 }
 
 /// A custom-painted vertical two-handle range slider; returns `true` when a
@@ -11051,6 +11540,38 @@ impl eframe::App for CtApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_axis_tests {
+    use super::{RUN_GRID_MIN_PX, run_tick_step, run_ticks};
+
+    #[test]
+    fn tick_step_is_nice_and_dense_enough() {
+        // One run per pixel → the step must cover RUN_GRID_MIN_PX pixels.
+        let step = run_tick_step(1.0);
+        assert!(step >= RUN_GRID_MIN_PX as f64);
+        assert_eq!(step, 50.0);
+        // Zoomed in far: never finer than one run.
+        assert_eq!(run_tick_step(0.001), 1.0);
+        assert_eq!(run_tick_step(0.1), 5.0);
+        // Thousands of runs across the plot.
+        assert_eq!(run_tick_step(10.0), 500.0);
+        for v in [0.01, 0.37, 2.2, 15.0, 123.0] {
+            let step = run_tick_step(v);
+            let mantissa = step / 10f64.powf(step.log10().floor());
+            assert!([1.0, 2.0, 5.0].iter().any(|m| (mantissa - m).abs() < 1e-9), "{step}");
+            assert!(step >= v * RUN_GRID_MIN_PX as f64 - 1e-9);
+        }
+    }
+
+    #[test]
+    fn ticks_cover_the_bounds_inclusively() {
+        let ticks: Vec<f64> = run_ticks((19683.2, 19701.0), 5.0).collect();
+        assert_eq!(ticks, vec![19685.0, 19690.0, 19695.0, 19700.0]);
+        assert_eq!(run_ticks((10.0, 10.0), 1.0).collect::<Vec<_>>(), vec![10.0]);
+        assert!(run_ticks((10.1, 10.9), 1.0).next().is_none());
     }
 }
 
