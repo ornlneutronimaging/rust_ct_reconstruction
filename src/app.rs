@@ -412,6 +412,42 @@ struct ReconView {
     run_context: Option<crate::notify::RunContext>,
     /// Outcome of each notification sent for the last run.
     notify_status: Vec<Result<String, String>>,
+    /// Reducing the data right here when it is too wide for the GPU
+    /// (mbirjax): the rebin factor offered, the job in flight, and the
+    /// outcome of the last reduction.
+    reduce_rebin_factor: usize,
+    reduce_job: Option<ReduceJob>,
+    reduce_status: Option<Result<String, String>>,
+}
+
+/// A data reduction started from the reconstruction screen: the rebin or
+/// the crop tool on the in-memory stack, then the reduced stack written to
+/// a NEW checkpoint next to the current one (the file the evaluators and a
+/// later session read), which then backs the screen.
+enum ReduceJob {
+    Rebin(RebinJob),
+    Crop(CropJob),
+    /// Writing the reduced stack: (job, the stack, its center, the target).
+    Save(StackSaveJob, std::sync::Arc<LoadedStack>, Option<f64>, PathBuf),
+}
+
+/// Where a reduced checkpoint goes: next to the current file, the stem
+/// tagged with the reduction (`_rebin2x2`, `_crop`) before the step marker.
+fn reduced_checkpoint_path(current: &Path, tag: &str) -> PathBuf {
+    let dir = current
+        .parent()
+        .filter(|p| p.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let stem = current
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ct".to_owned());
+    let mut base = stem.as_str();
+    for suffix in ["_step_load", "_step_pre_processing", "_step_reconstruction"] {
+        base = base.trim_end_matches(suffix);
+    }
+    dir.join(step_file_name(&format!("{base}_{tag}"), "pre_processing"))
 }
 
 impl ReconView {
@@ -451,6 +487,9 @@ impl ReconView {
             notify: crate::notify::load_settings(),
             run_context: None,
             notify_status: Vec::new(),
+            reduce_rebin_factor: 2,
+            reduce_job: None,
+            reduce_status: None,
         };
         if let Some((_, json)) = view
             .stack
@@ -1174,6 +1213,246 @@ fn send_run_notifications(
 /// The reconstruction screen: evaluate the algorithms (optional), then pick
 /// the one to use for the full reconstruction; returns the requested
 /// navigation.
+/// What a finished reduction step leads to (computed while the job is
+/// borrowed, applied afterwards).
+enum ReduceNext {
+    Keep,
+    /// Write this reduced stack (with its center) to the target checkpoint.
+    Save(std::sync::Arc<LoadedStack>, Option<f64>, PathBuf),
+    Done(Result<String, String>),
+}
+
+/// Fold a finished reduction job (rebin / crop / save) into the view.
+fn poll_reduce_job(view: &mut ReconView, ctx: &egui::Context) {
+    let Some(job) = view.reduce_job.as_mut() else {
+        return;
+    };
+    ctx.request_repaint_after(Duration::from_millis(300));
+    let current_cor = view.cor;
+    let current_path = view.path.clone();
+    let next = match job {
+        ReduceJob::Rebin(job) => match job.poll() {
+            Some(mut rebinned) => {
+                let n = job.factor;
+                let cor = current_cor.map(|c| rebin::rebin_center(c, n));
+                rebinned.center_of_rotation = cor;
+                let target = reduced_checkpoint_path(&current_path, &format!("rebin{n}x{n}"));
+                rebinned.path = target.clone();
+                logger::log(format!(
+                    "reconstruction screen: rebin {n}x{n} applied — writing {}",
+                    target.display()
+                ));
+                ReduceNext::Save(std::sync::Arc::new(rebinned), cor, target)
+            }
+            None => ReduceNext::Keep,
+        },
+        ReduceJob::Crop(job) => match job.poll() {
+            Some(Ok(Some((rect, mut cropped)))) => {
+                // A crop is a pure translation in x: the center follows.
+                let cor = current_cor
+                    .map(|c| c - rect.x as f64)
+                    .filter(|c| *c >= 0.0 && *c < rect.width as f64);
+                cropped.center_of_rotation = cor;
+                let target = reduced_checkpoint_path(&current_path, "crop");
+                cropped.path = target.clone();
+                logger::log(format!(
+                    "reconstruction screen: crop x={}, y={}, {}x{} applied — writing {}",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    target.display()
+                ));
+                ReduceNext::Save(std::sync::Arc::new(cropped), cor, target)
+            }
+            Some(Ok(None)) => {
+                logger::log("reconstruction screen: crop tool closed without a region");
+                ReduceNext::Done(Ok(
+                    "the crop tool was closed without a region — nothing changed".to_owned(),
+                ))
+            }
+            Some(Err(e)) => ReduceNext::Done(Err(format!("crop failed: {e}"))),
+            None => ReduceNext::Keep,
+        },
+        ReduceJob::Save(job, stack, cor, target) => match job.poll() {
+            Some(Ok(msg)) => {
+                view.stack = std::sync::Arc::clone(stack);
+                view.path = target.clone();
+                view.cor = *cor;
+                view.preview_tex = None;
+                view.split_jobs = 0;
+                view.run_result = None;
+                view.settings_save_status = None;
+                logger::log(format!("reconstruction screen now works on {msg}"));
+                ReduceNext::Done(Ok(format!(
+                    "reduced data saved as a new checkpoint — this screen, the evaluators \
+                     and the reconstruction now use it: {msg}{}",
+                    match cor {
+                        Some(c) => format!("; center of rotation {c:.2} px"),
+                        None => String::new(),
+                    }
+                )))
+            }
+            Some(Err(e)) => ReduceNext::Done(Err(format!(
+                "saving the reduced checkpoint failed: {e}"
+            ))),
+            None => ReduceNext::Keep,
+        },
+    };
+    match next {
+        ReduceNext::Keep => {}
+        ReduceNext::Save(stack, cor, target) => {
+            view.reduce_job = Some(ReduceJob::Save(
+                StackSaveJob::start(
+                    target.clone(),
+                    std::sync::Arc::clone(&stack),
+                    cor,
+                    Vec::new(),
+                ),
+                stack,
+                cor,
+                target,
+            ));
+        }
+        ReduceNext::Done(result) => {
+            if let Err(e) = &result {
+                logger::error(format!("reconstruction screen data reduction: {e}"));
+            }
+            view.reduce_status = Some(result);
+            view.reduce_job = None;
+        }
+    }
+}
+
+/// Under the "too wide for the GPU" message: rebin or crop the data right
+/// here. The reduced stack is written as a NEW checkpoint next to the
+/// current one and the screen switches to it.
+fn reduce_data_ui(ui: &mut egui::Ui, view: &mut ReconView, algo_key: &str) {
+    let (w, h) = view
+        .stack
+        .sample
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((0, 0));
+    let views = view.stack.sample.len();
+    ui.add_space(4.0);
+    ui.label(RichText::new("Reduce the data here").strong().size(12.0));
+    ui.label(
+        RichText::new(
+            "the reduced stack is written as a new checkpoint next to the current one \
+             (the current file is kept) and this screen switches to it, so the \
+             evaluators and the reconstruction use the reduced data; the center of \
+             rotation follows the pixels",
+        )
+        .weak()
+        .size(11.0),
+    );
+    let busy = view.reduce_job.is_some()
+        || view.run_job.is_some()
+        || view.optimizer_job.is_some()
+        || view.reload_job.is_some();
+    let fit_note = |n: usize| -> (bool, String) {
+        let (rw, rh) = rebin::rebinned_size(w, h, n);
+        match split_cap_for(algo_key, rw, views, None) {
+            Some(SplitCap::TooWide { .. }) => (false, format!("{rw}x{rh} px — still too wide")),
+            Some(cap) => match cap.cap() {
+                Some(cap) => (true, format!("{rw}x{rh} px — fits, up to {cap} slices per job")),
+                None => (true, format!("{rw}x{rh} px")),
+            },
+            None => (true, format!("{rw}x{rh} px")),
+        }
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label("rebin:");
+        let n = view.reduce_rebin_factor;
+        egui::ComboBox::from_id_salt("reduce_rebin")
+            .selected_text(format!("{n}x{n} -> {}", fit_note(n).1))
+            .show_ui(ui, |ui| {
+                for f in rebin::FACTORS {
+                    ui.selectable_value(
+                        &mut view.reduce_rebin_factor,
+                        f,
+                        format!("{f}x{f} -> {}", fit_note(f).1),
+                    );
+                }
+            });
+        let (fits, _) = fit_note(view.reduce_rebin_factor);
+        if ui
+            .add_enabled(
+                !busy && fits && w > 0,
+                egui::Button::new(format!("▶ Rebin {n}x{n} and continue")),
+            )
+            .on_hover_text(
+                "average every n×n block of pixels into one (same as the pre-processing \
+                 rebin step), save the result as a new checkpoint and work on it",
+            )
+            .on_disabled_hover_text(if fits {
+                "wait for the running job to finish"
+            } else {
+                "this factor is still too wide — pick a larger one, or crop first"
+            })
+            .clicked()
+        {
+            logger::log(format!(
+                "reconstruction screen: rebinning {n}x{n} ({w}x{h} px, {views} projections)"
+            ));
+            view.reduce_status = None;
+            view.reduce_job = Some(ReduceJob::Rebin(RebinJob::start(
+                std::sync::Arc::clone(&view.stack),
+                n,
+            )));
+        }
+        ui.label("or");
+        if ui
+            .add_enabled(!busy && w > 0, egui::Button::new("✂ Crop…"))
+            .on_hover_text(
+                "open the crop tool on a sub-sample of the projections, apply the region \
+                 to the whole stack (sample and open beams), save the result as a new \
+                 checkpoint and work on it",
+            )
+            .clicked()
+        {
+            logger::log(format!(
+                "reconstruction screen: opening the crop tool ({w}x{h} px, {views} projections)"
+            ));
+            view.reduce_status = None;
+            view.reduce_job = Some(ReduceJob::Crop(CropJob::start(
+                std::sync::Arc::clone(&view.stack),
+                None,
+            )));
+        }
+    });
+    match &view.reduce_job {
+        Some(ReduceJob::Rebin(job)) => {
+            let done = job.done();
+            let frac = (done as f32 / job.total.max(1) as f32).min(1.0);
+            ui.add(egui::ProgressBar::new(frac).text(format!(
+                "rebinning {0}x{0}: {done}/{1} images",
+                job.factor, job.total
+            )));
+        }
+        Some(ReduceJob::Crop(_)) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    "crop tool is open — draw the region and press '↩ Return to main \
+                     application'",
+                );
+            });
+        }
+        Some(ReduceJob::Save(_, _, _, target)) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("writing {}…", target.display()));
+            });
+        }
+        None => {}
+    }
+    if let Some(Err(e)) = &view.reduce_status {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+}
+
 fn recon_ui(
     ui: &mut egui::Ui,
     view: &mut ReconView,
@@ -1242,6 +1521,11 @@ fn recon_ui(
         ))
         .strong(),
     );
+    if view.reduce_job.is_none()
+        && let Some(Ok(msg)) = &view.reduce_status
+    {
+        ui.colored_label(ok_text(ui), msg);
+    }
     ui.add_space(6.0);
     egui::CollapsingHeader::new(RichText::new("Provenance").strong())
         .default_open(false)
@@ -1283,6 +1567,7 @@ fn recon_ui(
             }
         }
     }
+    poll_reduce_job(view, &ctx);
     if let Some(job) = &mut view.reload_job {
         match job.poll() {
             Some(Ok(stack)) => {
@@ -1623,6 +1908,7 @@ fn recon_ui(
                                 if *gpus == 1 { "" } else { "s" }
                             ),
                         );
+                        reduce_data_ui(ui, view, algo.key);
                     } else if let Some(cap) = split_cap.as_ref().and_then(SplitCap::cap) {
                         ui.add_space(6.0);
                         let reason = match &split_cap {
@@ -11626,6 +11912,98 @@ mod algo_doc_tests {
             }
             assert!(param_doc(algo.key, algo.center_key).is_some(), "{} center", algo.key);
         }
+    }
+}
+
+#[cfg(test)]
+mod reduced_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn reduced_path_tags_the_stem_before_the_step_marker() {
+        let cur = Path::new("/tmp/run_step_pre_processing.h5");
+        assert_eq!(
+            reduced_checkpoint_path(cur, "rebin2x2"),
+            PathBuf::from("/tmp/run_rebin2x2_step_pre_processing.h5")
+        );
+        let cur = Path::new("/tmp/run_step_reconstruction.h5");
+        assert_eq!(
+            reduced_checkpoint_path(cur, "crop"),
+            PathBuf::from("/tmp/run_crop_step_pre_processing.h5")
+        );
+        // Reducing twice keeps stacking tags, never overwriting the source.
+        let cur = Path::new("/tmp/run_rebin2x2_step_pre_processing.h5");
+        assert_eq!(
+            reduced_checkpoint_path(cur, "crop"),
+            PathBuf::from("/tmp/run_rebin2x2_crop_step_pre_processing.h5")
+        );
+    }
+}
+
+#[cfg(test)]
+mod reduce_job_tests {
+    use super::*;
+
+    fn synthetic_stack(dir: &Path, n: usize, h: usize, w: usize) -> LoadedStack {
+        let sample = (0..n)
+            .map(|i| crate::combine::Projection {
+                name: format!("p{i}"),
+                run_number: Some(i as u32),
+                angle_deg: Some(i as f64),
+                n_images_used: 1,
+                height: h,
+                width: w,
+                mean: (0..h * w).map(|k| (k % 7) as f32).collect(),
+                total_counts: 0.0,
+            })
+            .collect();
+        LoadedStack {
+            path: dir.join("synthetic_step_pre_processing.h5"),
+            sample,
+            ob: Vec::new(),
+            dc: Vec::new(),
+            metadata: vec![
+                ("processing_stage".to_owned(), "preprocessed".to_owned()),
+                ("log_conversion".to_owned(), "yes".to_owned()),
+            ],
+            center_of_rotation: Some(30.5),
+        }
+    }
+
+    #[test]
+    fn rebin_from_the_recon_screen_writes_a_new_checkpoint_and_switches_to_it() {
+        let dir = std::env::temp_dir().join(format!("reduce_job_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut view = ReconView::new(synthetic_stack(&dir, 3, 8, 64), Some(30.5));
+        let source = view.path.clone();
+        view.reduce_job = Some(ReduceJob::Rebin(RebinJob::start(
+            std::sync::Arc::clone(&view.stack),
+            2,
+        )));
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        while view.reduce_job.is_some() {
+            assert!(started.elapsed().as_secs() < 60, "reduction did not finish");
+            poll_reduce_job(&mut view, &ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let target = dir.join("synthetic_rebin2x2_step_pre_processing.h5");
+        assert!(matches!(&view.reduce_status, Some(Ok(_))), "{:?}", view.reduce_status);
+        assert_eq!(view.path, target);
+        assert!(target.is_file());
+        assert!(!source.is_file(), "the source is never written by a reduction");
+        let first = view.stack.sample.first().unwrap();
+        assert_eq!((first.width, first.height), (32, 4));
+        // (30.5 + 0.5) / 2 - 0.5
+        assert!((view.cor.unwrap() - 15.0).abs() < 1e-9);
+        // The file round-trips with the rebin recorded and the routing stage.
+        let back = combine::load_hdf5(&target).unwrap();
+        assert!((back.center_of_rotation.unwrap() - 15.0).abs() < 1e-9);
+        let meta = |k: &str| back.metadata.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(meta("processing_stage").as_deref(), Some("preprocessed"));
+        assert_eq!(meta("rebin").as_deref(), Some("2x2 (block mean), 64x8 -> 32x4"));
+        assert_eq!(meta("log_conversion").as_deref(), Some("yes"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
