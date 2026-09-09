@@ -522,7 +522,7 @@ impl SplitCap {
 
 /// The GPUs mbirjax will use: (count, smallest per-GPU memory in MiB),
 /// probed through nvidia-smi once per app run.
-fn gpu_inventory() -> Option<(usize, u64)> {
+pub fn gpu_inventory() -> Option<(usize, u64)> {
     fn probe() -> Option<(usize, u64)> {
         let out = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
@@ -552,7 +552,7 @@ fn gpu_inventory() -> Option<(usize, u64)> {
 /// memory (~93% of the card). Coefficients beyond 4 GPUs are clamped to
 /// the measured n=4 values (conservative — the S-independent working set
 /// barely shrinks with more GPUs).
-fn mbirjax_max_slices(width: usize, views: usize, n_gpus: usize, min_mib: u64) -> f64 {
+pub fn mbirjax_max_slices(width: usize, views: usize, n_gpus: usize, min_mib: u64) -> f64 {
     let (a, b) = match n_gpus {
         0 | 1 => (7500.0, 16.0),
         2 => (7300.0, 10.0),
