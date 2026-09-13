@@ -66,10 +66,25 @@ fn main() -> eframe::Result<()> {
         "CT Reconstruction",
         native_options,
         Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
             cc.egui_ctx.set_theme(ct_reconstruction::theme::load());
             cc.egui_ctx
                 .set_zoom_factor(ct_reconstruction::zoom::load());
             Ok(Box::new(CtApp::new()))
         }),
     )
+}
+
+/// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph
+/// for the arrows (→ ← ↑ ↓), bullets and similar symbols used in the labels,
+/// which then show up as squares; the bundled monospace font Hack has them,
+/// so it is appended as the last fallback of the proportional family.
+fn install_fonts(ctx: &eframe::egui::Context) {
+    let mut fonts = eframe::egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&eframe::egui::FontFamily::Proportional) {
+        if !family.iter().any(|f| f == "Hack") {
+            family.push("Hack".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
